@@ -148,8 +148,14 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     let source: 'live_api' | 'archived_report' | 'platform_only' = viciError ? 'platform_only' : 'live_api';
     if (conn.apiUser) {
       try {
-        const html = await fetchAgentStatusDetail(conn, q.dateFrom, q.dateTo);
-        const parsed = parseAgentStatusDetail(html);
+        // live table first; empty/absent means the range was archived — retry
+        // with the archive search the way VICIdial's own report page does
+        let parsed;
+        try {
+          parsed = parseAgentStatusDetail(await fetchAgentStatusDetail(conn, q.dateFrom, q.dateTo, false));
+        } catch {
+          parsed = parseAgentStatusDetail(await fetchAgentStatusDetail(conn, q.dateFrom, q.dateTo, true));
+        }
         for (const pr of parsed.rows) {
           if (!pr.user) continue;
           const r = ensure(pr.user);

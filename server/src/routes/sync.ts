@@ -40,6 +40,10 @@ export async function syncRoutes(app: FastifyInstance): Promise<void> {
         active: d.active,
         sourceMode: d.sourceMode,
         lastSeenAt: d.lastSeenAt,
+        timezone: d.timezone,
+        tzOffsetMin: d.tzOffsetMin,
+        clockDriftSec: d.clockDriftSec,
+        timeCheckedAt: d.timeCheckedAt,
         lastJob: lastJob ?? null,
         cursors: cursors.filter((c) => c.dialerServerId === d.id),
       });

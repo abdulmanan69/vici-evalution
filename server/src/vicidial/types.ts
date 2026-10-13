@@ -52,6 +52,8 @@ export interface DialerConnection {
   name: string;
   baseUrl: string;
   timezone: string;
+  /** set when the dialer's measured clock disagrees with the configured zone */
+  measuredOffsetMin?: number;
   sourceMode: 'api' | 'db' | 'hybrid';
   apiUser?: string;
   apiPass?: string;

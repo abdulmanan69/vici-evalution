@@ -18,7 +18,13 @@ import { config } from '../config.js';
 import { toConnection } from './credentials.js';
 import { ViciApiClient } from './apiClient.js';
 import { ViciDbClient } from './dbClient.js';
-import { localToUtc, utcToLocalString } from './timezone.js';
+import {
+  currentOffsetMin,
+  localToUtc,
+  offsetLocalToUtc,
+  utcToLocalString,
+  utcToOffsetLocalString,
+} from './timezone.js';
 import { decideMatch, DEFAULT_MATCH_OPTIONS, normalizePhone, type CloserCandidate } from './matcher.js';
 import { resolveMeaning, transition, type MappingRow } from './queueLogic.js';
 import type { DialerConnection, ViciCallRow } from './types.js';
@@ -53,6 +59,41 @@ export async function runDialerSync(
   const conn = toConnection(dialer);
   const stats: SyncStats = { notes: [] };
   const notes = stats.notes as string[];
+
+  // Auto time check: read the dialer's own clock every sync, record offset
+  // and drift, and prefer the measured offset when the configured timezone
+  // disagrees — call timestamps stay correct even with a wrong zone setting.
+  if (conn.apiUser) {
+    try {
+      const t = await new ViciApiClient(conn).serverTime();
+      const nowMs = Date.now();
+      const driftSec = t.epoch != null ? Math.round(t.epoch - nowMs / 1000) : null;
+      let measuredOffsetMin: number | null = null;
+      if (t.localTime) {
+        const asUtcMs = Date.parse(`${t.localTime.replace(' ', 'T')}Z`);
+        // snap to 15 min to shed request latency and sub-minute drift
+        measuredOffsetMin = Math.round((asUtcMs - nowMs) / 60_000 / 15) * 15;
+      }
+      await db
+        .update(dialerServers)
+        .set({ tzOffsetMin: measuredOffsetMin, clockDriftSec: driftSec, timeCheckedAt: new Date() })
+        .where(eq(dialerServers.id, conn.id));
+      if (measuredOffsetMin != null) {
+        const cfgOffset = currentOffsetMin(conn.timezone);
+        if (Math.abs(cfgOffset - measuredOffsetMin) > 5) {
+          conn.measuredOffsetMin = measuredOffsetMin;
+          notes.push(
+            `timezone mismatch: dialer clock is UTC${fmtOffset(measuredOffsetMin)} but configured zone '${conn.timezone}' is UTC${fmtOffset(cfgOffset)} — using the dialer's measured offset for this sync`,
+          );
+        }
+      }
+      if (driftSec != null && Math.abs(driftSec) > 90) {
+        notes.push(`dialer clock drifts ${driftSec}s from platform time — fix NTP on the dialer`);
+      }
+    } catch (err) {
+      notes.push(`dialer time check failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   const [job] = await db
     .insert(syncJobs)
@@ -108,6 +149,14 @@ export async function runDialerSync(
   }
 }
 
+function fmtOffset(min: number): string {
+  const sign = min < 0 ? '-' : '+';
+  const abs = Math.abs(min);
+  const h = Math.floor(abs / 60);
+  const m = abs % 60;
+  return `${sign}${h}${m ? `:${String(m).padStart(2, '0')}` : ''}`;
+}
+
 /** Connectivity check used by the admin "test connection" button. */
 export async function testDialerConnection(dialerServerId: string): Promise<{
   api: { ok: boolean; detail: string };
@@ -117,14 +166,39 @@ export async function testDialerConnection(dialerServerId: string): Promise<{
   if (!dialer) throw new Error('Dialer not found');
   const conn = toConnection(dialer);
 
-  const result = {
+  const result: {
+    api: { ok: boolean; detail: string };
+    db: { ok: boolean; detail: string };
+    time: null | {
+      dialerLocalTime: string | null;
+      platformUtc: string;
+      measuredOffsetMin: number | null;
+      configuredOffsetMin: number;
+      driftSec: number | null;
+      timezoneMatches: boolean;
+    };
+  } = {
     api: { ok: false, detail: 'No API credentials configured' },
     db: { ok: false, detail: 'No DB credentials configured' },
+    time: null,
   };
   if (conn.apiUser) {
     try {
-      const version = await new ViciApiClient(conn).version();
-      result.api = { ok: true, detail: version };
+      const t = await new ViciApiClient(conn).serverTime();
+      result.api = { ok: true, detail: t.raw };
+      const nowMs = Date.now();
+      const measuredOffsetMin = t.localTime
+        ? Math.round((Date.parse(`${t.localTime.replace(' ', 'T')}Z`) - nowMs) / 60_000 / 15) * 15
+        : null;
+      const configuredOffsetMin = currentOffsetMin(conn.timezone);
+      result.time = {
+        dialerLocalTime: t.localTime,
+        platformUtc: new Date().toISOString(),
+        measuredOffsetMin,
+        configuredOffsetMin,
+        driftSec: t.epoch != null ? Math.round(t.epoch - nowMs / 1000) : null,
+        timezoneMatches: measuredOffsetMin == null || Math.abs(configuredOffsetMin - measuredOffsetMin) <= 5,
+      };
     } catch (err) {
       result.api = { ok: false, detail: err instanceof Error ? err.message : String(err) };
     }
@@ -536,6 +610,17 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
   const notes = stats.notes as string[];
   const now = new Date();
 
+  // local<->UTC through the dialer's measured clock offset when the
+  // configured zone was detected as wrong (set by the time check above)
+  const toLocalStr = (d: Date): string =>
+    conn.measuredOffsetMin != null
+      ? utcToOffsetLocalString(d, conn.measuredOffsetMin)
+      : utcToLocalString(d, conn.timezone);
+  const toUtcDate = (s: string): Date =>
+    conn.measuredOffsetMin != null
+      ? offsetLocalToUtc(s, conn.measuredOffsetMin)
+      : localToUtc(s, conn.timezone);
+
   // --- campaigns ---
   try {
     const camps = await api.campaignsList();
@@ -565,12 +650,7 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
   const rosterRows: Array<Record<string, string>> = [];
   try {
     const rosterStart = new Date(now.getTime() - (full ? 7 : 1) * 24 * 3600 * 1000);
-    rosterRows.push(
-      ...(await api.agentStatsExport(
-        utcToLocalString(rosterStart, conn.timezone),
-        utcToLocalString(now, conn.timezone),
-      )),
-    );
+    rosterRows.push(...(await api.agentStatsExport(toLocalStr(rosterStart), toLocalStr(now))));
   } catch (err) {
     notes.push(`agent_stats_export failed: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -615,7 +695,7 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
   }
 
   // --- recording scan: incremental = today+yesterday, full = backfill window ---
-  const todayLocal = utcToLocalString(now, conn.timezone).slice(0, 10);
+  const todayLocal = toLocalStr(now).slice(0, 10);
   const dayCount = full ? Math.min(config.SYNC_HISTORICAL_DAYS, API_FULL_BACKFILL_DAYS) : 2;
   const days: string[] = [];
   for (let i = dayCount - 1; i >= 0; i -= 1) days.push(localDateMinus(todayLocal, i));
@@ -642,7 +722,7 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
           continue;
         }
         dayRows.push({
-          startTime: localToUtc(n.startTimeLocal, conn.timezone),
+          startTime: toUtcDate(n.startTimeLocal),
           user: n.user,
           recordingId: n.recordingId,
           leadId: n.leadId,

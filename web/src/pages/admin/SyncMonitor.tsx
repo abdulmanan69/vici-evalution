@@ -12,8 +12,18 @@ interface DialerStatus {
   active: boolean;
   sourceMode: string;
   lastSeenAt: string | null;
+  timezone: string;
+  tzOffsetMin: number | null;
+  clockDriftSec: number | null;
+  timeCheckedAt: string | null;
   lastJob: SyncJob | null;
   cursors: { stream: string; lastTimestamp: string | null }[];
+}
+
+function fmtOffset(min: number): string {
+  const sign = min < 0 ? '-' : '+';
+  const abs = Math.abs(min);
+  return `UTC${sign}${Math.floor(abs / 60)}${abs % 60 ? `:${String(abs % 60).padStart(2, '0')}` : ''}`;
 }
 
 export function SyncMonitorPage() {
@@ -71,6 +81,23 @@ export function SyncMonitorPage() {
               </div>
               <div className="mt-2 text-2xs text-ink-2">
                 Last successful contact: <span className="font-mono">{fmtDateTime(s.lastSeenAt)}</span>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-2 text-2xs text-ink-2">
+                <span>
+                  Dialer clock:{' '}
+                  {s.tzOffsetMin != null ? (
+                    <span className="font-mono">{fmtOffset(s.tzOffsetMin)}</span>
+                  ) : (
+                    'not checked yet'
+                  )}
+                  {s.timeCheckedAt && <span className="text-ink-3"> · checked {fmtDateTime(s.timeCheckedAt)}</span>}
+                </span>
+                {s.clockDriftSec != null &&
+                  (Math.abs(s.clockDriftSec) > 90 ? (
+                    <span className="chip bg-amber-soft text-amber-line">drift {s.clockDriftSec}s</span>
+                  ) : (
+                    <span className="chip bg-good-soft text-good">clock in sync</span>
+                  ))}
               </div>
               {s.lastJob && (
                 <div className="mt-1 flex items-center gap-2 text-2xs">

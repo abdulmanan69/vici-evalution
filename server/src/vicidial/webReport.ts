@@ -29,6 +29,7 @@ export async function fetchAgentStatusDetail(
   conn: DialerConnection,
   dateFrom: string, // YYYY-MM-DD dialer-local
   dateTo: string,
+  searchArchived: boolean,
 ): Promise<string> {
   if (!conn.apiUser || !conn.apiPass) {
     throw new Error('No API credentials configured');
@@ -41,7 +42,9 @@ export async function fetchAgentStatusDetail(
   u.searchParams.append('user_group[]', '--ALL--');
   u.searchParams.set('shift', 'ALL');
   u.searchParams.set('report_display_type', 'TEXT');
-  u.searchParams.set('search_archived_data', 'checked');
+  // only set for archived dates: with the flag on, dialers that have NOT yet
+  // archived a date return an empty table for it
+  if (searchArchived) u.searchParams.set('search_archived_data', 'checked');
   u.searchParams.set('SUBMIT', 'SUBMIT');
 
   const res = await request(u.toString(), {

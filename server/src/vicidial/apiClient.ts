@@ -55,6 +55,29 @@ export class ViciApiClient {
   }
 
   /**
+   * The dialer's own clock, from the version line
+   * (DATE: local datetime, EPOCH: unix seconds, TZNOW: current UTC offset
+   * in hours including DST). Used to auto-check timezone config and drift.
+   */
+  async serverTime(): Promise<{
+    localTime: string | null;
+    epoch: number | null;
+    tzNowHours: number | null;
+    raw: string;
+  }> {
+    const line = await this.version();
+    const date = line.match(/DATE:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/)?.[1] ?? null;
+    const epoch = line.match(/EPOCH:\s*(\d+)/)?.[1];
+    const tznow = line.match(/TZNOW:\s*(-?\d+(?:\.\d+)?)/)?.[1];
+    return {
+      localTime: date,
+      epoch: epoch ? Number(epoch) : null,
+      tzNowHours: tznow ? Number(tznow) : null,
+      raw: line,
+    };
+  }
+
+  /**
    * recording_lookup for one lead or one agent+date. Returns rows keyed by the
    * header names the server itself reports.
    *

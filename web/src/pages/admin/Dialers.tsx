@@ -25,6 +25,19 @@ interface DialerForm {
   recordingAuthPass: string;
 }
 
+interface TestResult {
+  api: { ok: boolean; detail: string };
+  db: { ok: boolean; detail: string };
+  time: null | {
+    dialerLocalTime: string | null;
+    platformUtc: string;
+    measuredOffsetMin: number | null;
+    configuredOffsetMin: number;
+    driftSec: number | null;
+    timezoneMatches: boolean;
+  };
+}
+
 const EMPTY: DialerForm = {
   name: '',
   baseUrl: '',
@@ -50,7 +63,7 @@ export function DialersPage() {
   const [editing, setEditing] = useState<Dialer | 'new' | null>(null);
   const [form, setForm] = useState<DialerForm>(EMPTY);
   const [error, setError] = useState<string | null>(null);
-  const [testResult, setTestResult] = useState<Record<string, { api: { ok: boolean; detail: string }; db: { ok: boolean; detail: string } }>>({});
+  const [testResult, setTestResult] = useState<Record<string, TestResult>>({});
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['dialers', companyId],
@@ -110,8 +123,7 @@ export function DialersPage() {
   });
 
   const test = useMutation({
-    mutationFn: (id: string) =>
-      api<{ api: { ok: boolean; detail: string }; db: { ok: boolean; detail: string } }>(`/dialers/${id}/test`, { method: 'POST' }),
+    mutationFn: (id: string) => api<TestResult>(`/dialers/${id}/test`, { method: 'POST' }),
     onSuccess: (res, id) => setTestResult((prev) => ({ ...prev, [id]: res })),
   });
 
@@ -183,6 +195,22 @@ export function DialersPage() {
                     <div className={`rounded-md px-3 py-2 ${t.db.ok ? 'bg-good-soft text-good' : 'bg-bad-soft text-bad'}`}>
                       <strong>Read-only MySQL:</strong> {t.db.detail}
                     </div>
+                    {t.time && (
+                      <div
+                        className={`rounded-md px-3 py-2 md:col-span-2 ${
+                          t.time.timezoneMatches && (t.time.driftSec == null || Math.abs(t.time.driftSec) <= 90)
+                            ? 'bg-good-soft text-good'
+                            : 'bg-amber-soft text-amber-line'
+                        }`}
+                      >
+                        <strong>Clock check:</strong> dialer time{' '}
+                        <span className="font-mono">{t.time.dialerLocalTime ?? '?'}</span> · platform (UTC){' '}
+                        <span className="font-mono">{t.time.platformUtc.slice(0, 19).replace('T', ' ')}</span>
+                        {t.time.driftSec != null && <> · drift {t.time.driftSec}s</>}
+                        {!t.time.timezoneMatches &&
+                          ' · configured timezone does not match the dialer clock — sync auto-corrects using the measured offset'}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>

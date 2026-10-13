@@ -40,6 +40,26 @@ export function localToUtc(localStr: string, timeZone: string): Date {
   return new Date(utc);
 }
 
+/** Current offset of an IANA zone in minutes east of UTC. */
+export function currentOffsetMin(timeZone: string, at: Date = new Date()): number {
+  return Math.round(tzOffsetMs(at, timeZone) / 60_000);
+}
+
+/** UTC Date -> 'YYYY-MM-DD HH:MM:SS' at a FIXED offset (minutes east of UTC). */
+export function utcToOffsetLocalString(date: Date, offsetMin: number): string {
+  const d = new Date(date.getTime() + offsetMin * 60_000);
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
+
+/** 'YYYY-MM-DD HH:MM:SS' at a FIXED offset -> UTC Date. */
+export function offsetLocalToUtc(localStr: string, offsetMin: number): Date {
+  const m = localStr.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/);
+  if (!m) throw new Error(`Unparseable timestamp: ${localStr}`);
+  const [, y, mo, d, h, mi, s] = m.map(Number) as unknown as number[];
+  return new Date(Date.UTC(y, mo - 1, d, h, mi, s) - offsetMin * 60_000);
+}
+
 /** UTC Date -> 'YYYY-MM-DD HH:MM:SS' rendered in `timeZone` (for MySQL WHERE bounds). */
 export function utcToLocalString(date: Date, timeZone: string): string {
   const dtf = new Intl.DateTimeFormat('en-CA', {

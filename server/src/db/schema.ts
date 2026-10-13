@@ -124,6 +124,11 @@ export const dialerServers = pgTable(
     recordingAuthPassEnc: text('recording_auth_pass_enc'),
     // VICIdial logs are stored in server-local time; needed to normalize to UTC
     timezone: text('timezone').notNull().default('UTC'),
+    // measured from the dialer's own clock on every sync (version API call):
+    // minutes east of UTC, clock drift vs platform time, and when checked
+    tzOffsetMin: integer('tz_offset_min'),
+    clockDriftSec: integer('clock_drift_sec'),
+    timeCheckedAt: timestamp('time_checked_at', { withTimezone: true }),
     active: boolean('active').notNull().default(true),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
