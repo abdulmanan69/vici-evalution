@@ -75,7 +75,13 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
 
     reply.status(upstream.statusCode);
     const h = upstream.headers;
-    reply.header('content-type', (h['content-type'] as string) ?? 'audio/mpeg');
+    // VICIdial recording webservers often send application/forcedownload,
+    // which <audio> refuses — derive a real audio type from the extension.
+    const upstreamType = (h['content-type'] as string | undefined)?.toLowerCase();
+    const ext = rec.filename.toLowerCase().split('.').pop();
+    const extType =
+      ext === 'wav' ? 'audio/wav' : ext === 'ogg' ? 'audio/ogg' : ext === 'gsm' ? 'audio/gsm' : 'audio/mpeg';
+    reply.header('content-type', upstreamType?.startsWith('audio/') ? upstreamType : extType);
     reply.header('accept-ranges', (h['accept-ranges'] as string) ?? 'bytes');
     if (h['content-length']) reply.header('content-length', h['content-length'] as string);
     if (h['content-range']) reply.header('content-range', h['content-range'] as string);
