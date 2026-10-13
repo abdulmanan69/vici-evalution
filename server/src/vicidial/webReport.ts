@@ -107,6 +107,131 @@ export function parseAgentStatusDetail(html: string): AgentStatusDetail {
   return { statuses, rows };
 }
 
+// ---------------------------------------------------------------------------
+// user_stats.php per-call exports — the exact call log, no DB access needed.
+// Verified live: file_download=5 (outbound), 6 (inbound closer), 9 (manual):
+//   "","#","DATE/TIME","LENGTH","STATUS","PHONE","CAMPAIGN","GROUP","LIST","LEAD","HANGUP REASON"
+//   "","#","DATE/TIME","LENGTH","STATUS","PHONE","IN-GROUP","WAIT(S)","AGENT(S)","LIST","LEAD","HANGUP REASON"
+// ---------------------------------------------------------------------------
+
+export type UserStatsKind = 'outbound' | 'closer' | 'manual';
+
+export interface UserStatsCall {
+  kind: UserStatsKind;
+  dateTimeLocal: string; // 'YYYY-MM-DD HH:MM:SS' dialer-local
+  lengthSec: number | null;
+  status: string | null;
+  phone: string | null;
+  /** outbound/manual: campaign id; closer: in-group id */
+  campaignOrGroup: string | null;
+  listId: number | null;
+  leadId: number | null;
+  hangupReason: string | null;
+}
+
+const USER_STATS_DOWNLOADS: Array<{ n: number; kind: UserStatsKind }> = [
+  { n: 5, kind: 'outbound' },
+  { n: 6, kind: 'closer' },
+  { n: 9, kind: 'manual' },
+];
+
+/** Exact per-call rows for one agent over a dialer-local date range. */
+export async function fetchUserStatsCalls(
+  conn: DialerConnection,
+  agentUser: string,
+  dateFrom: string,
+  dateTo: string,
+  searchArchived: boolean,
+): Promise<UserStatsCall[]> {
+  if (!conn.apiUser || !conn.apiPass) throw new Error('No API credentials configured');
+  const all: UserStatsCall[] = [];
+  for (const { n, kind } of USER_STATS_DOWNLOADS) {
+    const u = new URL(`${conn.baseUrl}/vicidial/user_stats.php`);
+    u.searchParams.set('DB', '0');
+    u.searchParams.set('user', agentUser);
+    u.searchParams.set('begin_date', dateFrom);
+    u.searchParams.set('end_date', dateTo);
+    if (searchArchived) u.searchParams.set('search_archived_data', 'checked');
+    u.searchParams.set('file_download', String(n));
+    const res = await request(u.toString(), {
+      headers: {
+        authorization: 'Basic ' + Buffer.from(`${conn.apiUser}:${conn.apiPass}`).toString('base64'),
+      },
+      headersTimeout: 20_000,
+      bodyTimeout: 90_000,
+    });
+    const body = await res.body.text();
+    if (res.statusCode !== 200) throw new Error(`user_stats export HTTP ${res.statusCode}`);
+    all.push(...parseUserStatsCsv(body, kind));
+  }
+  return all;
+}
+
+/** Pure CSV parser for the user_stats export format. Unit-tested. */
+export function parseUserStatsCsv(csv: string, kind: UserStatsKind): UserStatsCall[] {
+  const lines = csv.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  const headerIdx = lines.findIndex((l) => /"DATE\/TIME"/i.test(l));
+  if (headerIdx === -1) return [];
+  const header = splitCsv(lines[headerIdx]).map((h) => h.toUpperCase());
+  const col = (name: string) => header.findIndex((h) => h === name);
+  const iDate = col('DATE/TIME');
+  const iLen = col('LENGTH');
+  const iStatus = col('STATUS');
+  const iPhone = col('PHONE');
+  const iCamp = header.findIndex((h) => h === 'CAMPAIGN' || h === 'IN-GROUP');
+  const iList = col('LIST');
+  const iLead = col('LEAD');
+  const iHang = col('HANGUP REASON');
+
+  const rows: UserStatsCall[] = [];
+  for (const line of lines.slice(headerIdx + 1)) {
+    const cells = splitCsv(line);
+    const dt = cells[iDate];
+    if (!dt || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(dt)) continue;
+    const num = (v: string | undefined) => (v !== undefined && /^\d+$/.test(v.trim()) ? Number(v) : null);
+    rows.push({
+      kind,
+      dateTimeLocal: dt,
+      lengthSec: num(cells[iLen]),
+      status: cells[iStatus]?.trim().toUpperCase() || null,
+      phone: cells[iPhone]?.trim() || null,
+      campaignOrGroup: iCamp >= 0 ? cells[iCamp]?.trim() || null : null,
+      listId: num(cells[iList]),
+      leadId: num(cells[iLead]),
+      hangupReason: iHang >= 0 ? cells[iHang]?.trim() || null : null,
+    });
+  }
+  return rows;
+}
+
+function splitCsv(line: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inQ = false;
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (inQ) {
+      if (ch === '"' && line[i + 1] === '"') {
+        cur += '"';
+        i += 1;
+      } else if (ch === '"') {
+        inQ = false;
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      inQ = true;
+    } else if (ch === ',') {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
 function splitRow(line: string): string[] {
   const cells = line.split('|').map((c) => c.trim());
   // leading/trailing pipes produce empty first/last cells

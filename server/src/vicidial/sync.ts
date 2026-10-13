@@ -28,13 +28,9 @@ import {
 import { decideMatch, DEFAULT_MATCH_OPTIONS, normalizePhone, type CloserCandidate } from './matcher.js';
 import { resolveMeaning, transition, type MappingRow } from './queueLogic.js';
 import type { DialerConnection, ViciCallRow } from './types.js';
-import {
-  assignLegSources,
-  normalizeRecordingRow,
-  phoneFromFilename,
-  syntheticUniqueId,
-  type ApiRecordingRow,
-} from './apiDerive.js';
+import { normalizeRecordingRow } from './apiDerive.js';
+import { fetchUserStatsCalls, type UserStatsCall } from './webReport.js';
+import { sha256 } from '../lib/crypto.js';
 
 export interface SyncStats {
   [key: string]: number | string[] | undefined;
@@ -590,7 +586,6 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
 // API-only ingestion (no MySQL access)
 // ---------------------------------------------------------------------------
 const API_AGENT_CAP = 300;
-const API_LEAD_LOOKUP_CAP = 800;
 const API_FULL_BACKFILL_DAYS = 14;
 
 function localDateMinus(todayLocal: string, minusDays: number): string {
@@ -599,11 +594,12 @@ function localDateMinus(todayLocal: string, minusDays: number): string {
 }
 
 /**
- * 'api' source mode: call records are synthesized from recording_lookup rows
- * (one recording = one call leg) and lead_all_info (status = the lead's
- * latest disposition, phone number). Fronter vs closer leg comes from the
- * agent classification on the Agents page, falling back to time order per
- * lead. Everything is idempotent via synthetic uniqueids (rec-<recording_id>).
+ * 'api' source mode: call records come from the dialer's own per-agent call
+ * exports (user_stats.php file_download 5/6/9 — verified live), which carry
+ * the EXACT per-call disposition, phone, campaign/in-group, list and lead id
+ * for outbound, inbound-closer and manual calls. Recordings come from
+ * recording_lookup and are linked to those calls by lead + start time.
+ * Everything is idempotent via deterministic synthetic uniqueids.
  */
 async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: boolean): Promise<void> {
   const api = new ViciApiClient(conn);
@@ -686,7 +682,6 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
   stats.agents = rosterCount;
 
   const agentRows = await db.select().from(viciAgents).where(eq(viciAgents.dialerServerId, conn.id));
-  const roleByUser = new Map(agentRows.map((a) => [a.viciUser, a.agentRole] as const));
   const idByUser = new Map(agentRows.map((a) => [a.viciUser, a.id] as const));
   let scanUsers = agentRows.filter((a) => a.active).map((a) => a.viciUser);
   if (scanUsers.length > API_AGENT_CAP) {
@@ -694,203 +689,247 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
     scanUsers = scanUsers.slice(0, API_AGENT_CAP);
   }
 
-  // --- recording scan: incremental = today+yesterday, full = backfill window ---
+  // --- exact per-call log: user_stats exports, chunked to stay under the
+  // 10k-row export cap; incremental = today+yesterday, full = backfill window ---
   const todayLocal = toLocalStr(now).slice(0, 10);
   const dayCount = full ? Math.min(config.SYNC_HISTORICAL_DAYS, API_FULL_BACKFILL_DAYS) : 2;
-  const days: string[] = [];
-  for (let i = dayCount - 1; i >= 0; i -= 1) days.push(localDateMinus(todayLocal, i));
+  const chunks: Array<{ from: string; to: string }> = [];
+  for (let i = dayCount - 1; i >= 0; i -= 2) {
+    chunks.push({ from: localDateMinus(todayLocal, i), to: localDateMinus(todayLocal, Math.max(i - 1, 0)) });
+  }
 
-  const leadCache = new Map<number, Record<string, string> | null>();
-  let lookups = 0;
+  const campMap = new Map<string, string>();
+  for (const c of await db
+    .select({ id: campaigns.id, cid: campaigns.viciCampaignId })
+    .from(campaigns)
+    .where(eq(campaigns.dialerServerId, conn.id))) {
+    campMap.set(c.cid, c.id);
+  }
+  const groupMap = new Map<string, string>();
+  for (const g of await db
+    .select({ id: ingroups.id, gid: ingroups.viciGroupId })
+    .from(ingroups)
+    .where(eq(ingroups.dialerServerId, conn.id))) {
+    groupMap.set(g.gid, g.id);
+  }
+  const ensureIngroup = async (gid: string | null): Promise<string | null> => {
+    if (!gid) return null;
+    const hit = groupMap.get(gid);
+    if (hit) return hit;
+    const [row] = await db
+      .insert(ingroups)
+      .values({ companyId: conn.companyId, dialerServerId: conn.id, viciGroupId: gid, name: gid, syncedAt: new Date() })
+      .onConflictDoUpdate({
+        target: [ingroups.dialerServerId, ingroups.viciGroupId],
+        set: { syncedAt: new Date() },
+      })
+      .returning({ id: ingroups.id });
+    groupMap.set(gid, row.id);
+    return row.id;
+  };
+
   let callsImported = 0;
+  let callsRefreshed = 0;
   let recsImported = 0;
-  let skipped = 0;
+  let recsLinked = 0;
+  let exportErrors = 0;
 
-  for (const day of days) {
-    const dayRows: ApiRecordingRow[] = [];
+  for (const chunk of chunks) {
     for (const user of scanUsers) {
-      let raw: Array<Record<string, string>>;
+      let callRows: UserStatsCall[];
       try {
-        raw = await api.recordingLookup({ agentUser: user, date: day });
+        callRows = await fetchUserStatsCalls(conn, user, chunk.from, chunk.to, false);
+        if (callRows.length === 0 && chunk.to < todayLocal) {
+          // fully-past chunks may have been archived by the dialer's nightly job
+          callRows = await fetchUserStatsCalls(conn, user, chunk.from, chunk.to, true);
+        }
       } catch {
-        continue; // transient failure or agent with no recordings — next cycle retries
+        exportErrors += 1;
+        continue; // transient — retried next cycle
       }
-      for (const r of raw) {
-        const n = normalizeRecordingRow(r);
-        if (!n.startTimeLocal || !n.user || !n.filename) {
-          skipped += 1;
+
+      // deterministic uid per call row — repeated imports stay idempotent
+      const prepared = callRows.map((r) => ({
+        r,
+        uid: `us-${sha256(`${conn.id}|${user}|${r.kind}|${r.dateTimeLocal}|${r.phone ?? ''}|${r.leadId ?? ''}`).slice(0, 29)}`,
+      }));
+      const existingByUid = new Map<string, string>();
+      if (prepared.length > 0) {
+        for (const c of await db
+          .select({ id: calls.id, uid: calls.viciUniqueId })
+          .from(calls)
+          .where(and(eq(calls.dialerServerId, conn.id), inArray(calls.viciUniqueId, prepared.map((p) => p.uid))))) {
+          if (c.uid) existingByUid.set(c.uid, c.id);
+        }
+      }
+
+      const imported: Array<{ id: string; callDate: Date; leadId: number | null }> = [];
+      for (const { r, uid } of prepared) {
+        const callDate = toUtcDate(r.dateTimeLocal);
+        const source = r.kind === 'closer' ? ('vicidial_closer_log' as const) : ('vicidial_log' as const);
+        const campaignId = r.kind !== 'closer' ? (campMap.get(r.campaignOrGroup ?? '') ?? null) : null;
+        const ingroupId = r.kind === 'closer' ? await ensureIngroup(r.campaignOrGroup) : null;
+        const rawPayload = { derivedFrom: 'user_stats_export', kind: r.kind, hangupReason: r.hangupReason };
+
+        const existingId = existingByUid.get(uid);
+        let callId: string;
+        if (existingId) {
+          // dispositions get corrected after the fact — refresh them
+          await db
+            .update(calls)
+            .set({
+              status: r.status,
+              lengthSec: r.lengthSec,
+              phoneNumber: r.phone,
+              campaignId,
+              ingroupId,
+              listId: r.listId,
+              raw: rawPayload,
+              lastSyncedAt: new Date(),
+            })
+            .where(eq(calls.id, existingId));
+          callId = existingId;
+          callsRefreshed += 1;
+        } else {
+          const inserted = await db
+            .insert(calls)
+            .values({
+              companyId: conn.companyId,
+              dialerServerId: conn.id,
+              source,
+              viciLeadId: r.leadId,
+              viciUniqueId: uid,
+              campaignId,
+              ingroupId,
+              viciAgentId: idByUser.get(user) ?? null,
+              viciUserRaw: user,
+              phoneNumber: r.phone,
+              callDate,
+              lengthSec: r.lengthSec,
+              status: r.status,
+              listId: r.listId,
+              raw: rawPayload,
+            })
+            .onConflictDoNothing()
+            .returning({ id: calls.id });
+          if (inserted.length === 0) continue; // raced — next cycle refreshes it
+          callId = inserted[0].id;
+          callsImported += 1;
+        }
+        imported.push({ id: callId, callDate, leadId: r.leadId });
+      }
+
+      // recordings for this agent over the chunk's days, linked to those calls
+      const chunkDays = chunk.from === chunk.to ? [chunk.from] : [chunk.from, chunk.to];
+      for (const day of chunkDays) {
+        let recRaw: Array<Record<string, string>>;
+        try {
+          recRaw = await api.recordingLookup({ agentUser: user, date: day });
+        } catch {
           continue;
         }
-        dayRows.push({
-          startTime: toUtcDate(n.startTimeLocal),
-          user: n.user,
-          recordingId: n.recordingId,
-          leadId: n.leadId,
-          lengthSec: n.lengthSec,
-          locationUrl: n.locationUrl,
-          filename: n.filename,
-        });
-      }
-    }
-
-    // group per lead so transfer legs are classified together
-    const byLead = new Map<string, ApiRecordingRow[]>();
-    for (const r of dayRows) {
-      const key = r.leadId != null ? `l:${r.leadId}` : `f:${r.filename}`;
-      const list = byLead.get(key);
-      if (list) list.push(r);
-      else byLead.set(key, [r]);
-    }
-    const entries: Array<{ row: ApiRecordingRow; source: 'vicidial_log' | 'vicidial_closer_log'; inferred: boolean }> = [];
-    for (const rows of byLead.values()) {
-      entries.push(...assignLegSources(rows, (u) => roleByUser.get(u) ?? 'unknown'));
-    }
-
-    // pre-select existing synthesized calls so a later reclassification
-    // (fronter<->closer) updates the row instead of duplicating it
-    const uids = entries.map((e) => syntheticUniqueId(e.row));
-    const existingByUid = new Map<string, { id: string }>();
-    if (uids.length > 0) {
-      for (const c of await db
-        .select({ id: calls.id, uid: calls.viciUniqueId })
-        .from(calls)
-        .where(and(eq(calls.dialerServerId, conn.id), inArray(calls.viciUniqueId, uids)))) {
-        if (c.uid) existingByUid.set(c.uid, { id: c.id });
-      }
-    }
-
-    for (const { row, source, inferred } of entries) {
-      let leadInfo: Record<string, string> | null = null;
-      if (row.leadId != null) {
-        if (leadCache.has(row.leadId)) {
-          leadInfo = leadCache.get(row.leadId) ?? null;
-        } else if (lookups < API_LEAD_LOOKUP_CAP) {
-          lookups += 1;
-          try {
-            leadInfo = await api.leadAllInfo(row.leadId);
-          } catch {
-            leadInfo = null;
+        for (const rr of recRaw) {
+          const n = normalizeRecordingRow(rr);
+          if (!n.startTimeLocal || !n.filename) continue;
+          const startTime = toUtcDate(n.startTimeLocal);
+          // best call: same lead within 15 min beats nearest start within 2 min
+          let bestId: string | null = null;
+          let bestScore = Infinity;
+          for (const c of imported) {
+            const delta = Math.abs(c.callDate.getTime() - startTime.getTime());
+            const sameLead = n.leadId != null && c.leadId === n.leadId;
+            if (delta > (sameLead ? 15 * 60_000 : 2 * 60_000)) continue;
+            const score = sameLead ? delta : delta + 10 * 60_000;
+            if (score < bestScore) {
+              bestScore = score;
+              bestId = c.id;
+            }
           }
-          leadCache.set(row.leadId, leadInfo);
+          if (bestId) recsLinked += 1;
+          await upsertRecordingByEitherKey(
+            conn,
+            { recordingId: n.recordingId, leadId: n.leadId, filename: n.filename, locationUrl: n.locationUrl, startTime, lengthSec: n.lengthSec },
+            bestId,
+          );
+          recsImported += 1;
         }
       }
-      const status = leadInfo?.status ? leadInfo.status.trim().toUpperCase() : null;
-      const phone = leadInfo?.phone_number?.trim() || phoneFromFilename(row.filename);
-      const listId = leadInfo?.list_id && /^\d+$/.test(leadInfo.list_id) ? Number(leadInfo.list_id) : null;
-      const uid = syntheticUniqueId(row);
-      const rawPayload = {
-        derivedFrom: 'api_recording_lookup',
-        inferredLeg: inferred,
-        recording: { recording_id: row.recordingId, filename: row.filename },
-        lead_status: status,
-      };
-
-      let callId: string;
-      const existing = existingByUid.get(uid);
-      if (existing) {
-        await db
-          .update(calls)
-          .set({
-            source,
-            status,
-            phoneNumber: phone,
-            lengthSec: row.lengthSec,
-            viciAgentId: idByUser.get(row.user) ?? null,
-            viciUserRaw: row.user,
-            listId,
-            raw: rawPayload,
-            lastSyncedAt: new Date(),
-          })
-          .where(eq(calls.id, existing.id));
-        callId = existing.id;
-      } else {
-        const inserted = await db
-          .insert(calls)
-          .values({
-            companyId: conn.companyId,
-            dialerServerId: conn.id,
-            source,
-            viciLeadId: row.leadId,
-            viciUniqueId: uid,
-            viciAgentId: idByUser.get(row.user) ?? null,
-            viciUserRaw: row.user,
-            phoneNumber: phone,
-            callDate: row.startTime,
-            lengthSec: row.lengthSec,
-            status,
-            listId,
-            raw: rawPayload,
-          })
-          .onConflictDoNothing()
-          .returning({ id: calls.id });
-        if (inserted.length === 0) continue; // raced — next cycle refreshes it
-        callId = inserted[0].id;
-        existingByUid.set(uid, { id: callId });
-        callsImported += 1;
-      }
-
-      // A recording can resurface under the same recording_id with a changed
-      // filename (re-encodes, archive moves) — match on EITHER key so neither
-      // unique constraint can fail the whole sync job.
-      const [existingRec] = await db
-        .select({ id: recordings.id })
-        .from(recordings)
-        .where(
-          and(
-            eq(recordings.dialerServerId, conn.id),
-            or(
-              eq(recordings.filename, row.filename),
-              row.recordingId != null ? eq(recordings.viciRecordingId, row.recordingId) : sql`false`,
-            ),
-          ),
-        )
-        .limit(1);
-      if (existingRec) {
-        await db
-          .update(recordings)
-          .set({
-            callId,
-            viciRecordingId: row.recordingId,
-            viciLeadId: row.leadId,
-            filename: row.filename,
-            locationUrl: row.locationUrl,
-            lengthSec: row.lengthSec,
-            status: row.locationUrl ? 'available' : 'pending',
-            updatedAt: new Date(),
-          })
-          .where(eq(recordings.id, existingRec.id));
-      } else {
-        await db
-          .insert(recordings)
-          .values({
-            companyId: conn.companyId,
-            dialerServerId: conn.id,
-            callId,
-            viciRecordingId: row.recordingId,
-            viciLeadId: row.leadId,
-            filename: row.filename,
-            locationUrl: row.locationUrl,
-            startTime: row.startTime,
-            lengthSec: row.lengthSec,
-            status: row.locationUrl ? 'available' : 'pending',
-            raw: { source: 'recording_lookup' },
-          })
-          .onConflictDoNothing();
-      }
-      recsImported += 1;
     }
   }
 
   stats.api_calls_imported = callsImported;
+  stats.api_calls_refreshed = callsRefreshed;
   stats.api_recordings = recsImported;
-  stats.api_lead_lookups = lookups;
-  if (skipped > 0) stats.api_rows_skipped = skipped;
-  if (lookups >= API_LEAD_LOOKUP_CAP) {
-    notes.push('lead lookup cap reached — remaining dispositions fill in on the next cycles');
-  }
+  stats.api_recordings_linked = recsLinked;
+  if (exportErrors > 0) stats.api_export_errors = exportErrors;
   notes.push(
-    'API mode: call dispositions come from the lead status (latest dispo per lead); per-call XFER history is not exposed by the Non-Agent API.',
+    "API mode: per-call dispositions come from the dialer's own per-agent call exports (exact log — outbound, inbound closer and manual legs).",
   );
+}
+
+/**
+ * A recording can resurface under the same recording_id with a changed
+ * filename (re-encodes, archive moves) — match on EITHER unique key so
+ * neither constraint can fail a sync job. callId null leaves any existing
+ * link untouched.
+ */
+async function upsertRecordingByEitherKey(
+  conn: DialerConnection,
+  row: {
+    recordingId: number | null;
+    leadId: number | null;
+    filename: string;
+    locationUrl: string | null;
+    startTime: Date | null;
+    lengthSec: number | null;
+  },
+  callId: string | null,
+): Promise<void> {
+  const [existingRec] = await db
+    .select({ id: recordings.id })
+    .from(recordings)
+    .where(
+      and(
+        eq(recordings.dialerServerId, conn.id),
+        or(
+          eq(recordings.filename, row.filename),
+          row.recordingId != null ? eq(recordings.viciRecordingId, row.recordingId) : sql`false`,
+        ),
+      ),
+    )
+    .limit(1);
+  if (existingRec) {
+    await db
+      .update(recordings)
+      .set({
+        ...(callId ? { callId } : {}),
+        viciRecordingId: row.recordingId,
+        viciLeadId: row.leadId,
+        filename: row.filename,
+        locationUrl: row.locationUrl,
+        lengthSec: row.lengthSec,
+        status: row.locationUrl ? 'available' : 'pending',
+        updatedAt: new Date(),
+      })
+      .where(eq(recordings.id, existingRec.id));
+  } else {
+    await db
+      .insert(recordings)
+      .values({
+        companyId: conn.companyId,
+        dialerServerId: conn.id,
+        callId,
+        viciRecordingId: row.recordingId,
+        viciLeadId: row.leadId,
+        filename: row.filename,
+        locationUrl: row.locationUrl,
+        startTime: row.startTime,
+        lengthSec: row.lengthSec,
+        status: row.locationUrl ? 'available' : 'pending',
+        raw: { source: 'recording_lookup' },
+      })
+      .onConflictDoNothing();
+  }
 }
 
 // ---------------------------------------------------------------------------
