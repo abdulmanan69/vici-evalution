@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNull, lte, or, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lte, ne, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { db } from '../db/client.js';
 import {
@@ -119,6 +119,7 @@ export async function runDialerSync(
     await buildTransfers(conn, stats);
     await matchPendingTransfers(conn.companyId, stats);
     await updateQueueStatuses(conn.companyId, stats);
+    await closeSalesByLead(conn.companyId, stats);
 
     await db
       .update(dialerServers)
@@ -588,6 +589,10 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
 const API_AGENT_CAP = 300;
 const API_FULL_BACKFILL_DAYS = 14;
 
+function userStatsKey(r: UserStatsCall): string {
+  return `${r.kind}|${r.dateTimeLocal}|${r.phone ?? ''}|${r.leadId ?? ''}`;
+}
+
 function localDateMinus(todayLocal: string, minusDays: number): string {
   const [y, m, d] = todayLocal.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d - minusDays)).toISOString().slice(0, 10);
@@ -741,9 +746,20 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
       let callRows: UserStatsCall[];
       try {
         callRows = await fetchUserStatsCalls(conn, user, chunk.from, chunk.to, false);
-        if (callRows.length === 0 && chunk.to < todayLocal) {
-          // fully-past chunks may have been archived by the dialer's nightly job
-          callRows = await fetchUserStatsCalls(conn, user, chunk.from, chunk.to, true);
+        if (chunk.from < todayLocal) {
+          // Archived days MUST also be fetched with the archive flag and
+          // merged: the live export still returns some sections (manual
+          // calls) for archived days, so "empty means archived" is wrong —
+          // outbound and closer legs only appear in the archive search.
+          try {
+            const archivedRows = await fetchUserStatsCalls(conn, user, chunk.from, chunk.to, true);
+            const seen = new Set(callRows.map(userStatsKey));
+            for (const r of archivedRows) {
+              if (!seen.has(userStatsKey(r))) callRows.push(r);
+            }
+          } catch {
+            exportErrors += 1; // archived half missing — next cycle retries
+          }
         }
       } catch {
         exportErrors += 1;
@@ -1249,6 +1265,128 @@ async function matchPendingTransfers(companyId: string, stats: SyncStats): Promi
   stats.match_unmatched = unmatched;
 }
 
+/** Distinct disposition codes the company maps to 'sale' (any scope). */
+function saleCodesOf(mappings: MappingRow[]): string[] {
+  return [...new Set(mappings.filter((m) => m.active && m.meaning === 'sale').map((m) => m.dispositionCode.trim().toUpperCase()))];
+}
+
+async function saleCallExistsForLead(
+  companyId: string,
+  mappings: MappingRow[],
+  dialerServerId: string,
+  viciLeadId: number | null,
+): Promise<boolean> {
+  if (viciLeadId == null) return false;
+  const codes = saleCodesOf(mappings);
+  if (codes.length === 0) return false;
+  const rows = await db
+    .select({ dialerServerId: calls.dialerServerId, campaignId: calls.campaignId, status: calls.status })
+    .from(calls)
+    .where(
+      and(
+        eq(calls.companyId, companyId),
+        eq(calls.dialerServerId, dialerServerId),
+        eq(calls.viciLeadId, viciLeadId),
+        eq(calls.isMock, false),
+        inArray(calls.status, codes),
+      ),
+    )
+    .limit(5);
+  return rows.some(
+    (r) =>
+      resolveMeaning(mappings, {
+        dialerServerId: r.dialerServerId,
+        campaignId: r.campaignId,
+        dispositionCode: r.status,
+      }) === 'sale',
+  );
+}
+
+/**
+ * A sale can land on a different leg than the matched closer call: a manual
+ * callback days later, another closer, an inbound re-dial — the user's real
+ * workflow. Any call whose disposition maps to 'sale' closes the lead's most
+ * recent still-open transfer on the same dialer.
+ */
+async function closeSalesByLead(companyId: string, stats: SyncStats): Promise<void> {
+  const mappings = await companyMappings(companyId);
+  const codes = saleCodesOf(mappings);
+  if (codes.length === 0) return;
+  const windowStart = new Date(
+    Date.now() - Math.max(config.RETENTION_DAYS || 7, 7) * 24 * 3600 * 1000,
+  );
+
+  const saleCalls = await db
+    .select({
+      id: calls.id,
+      dialerServerId: calls.dialerServerId,
+      campaignId: calls.campaignId,
+      viciLeadId: calls.viciLeadId,
+      status: calls.status,
+      callDate: calls.callDate,
+    })
+    .from(calls)
+    .where(
+      and(
+        eq(calls.companyId, companyId),
+        eq(calls.isMock, false),
+        gte(calls.callDate, windowStart),
+        inArray(calls.status, codes),
+        sql`${calls.viciLeadId} is not null`,
+      ),
+    )
+    .orderBy(calls.callDate)
+    .limit(20_000);
+
+  let closed = 0;
+  for (const c of saleCalls) {
+    const meaning = resolveMeaning(mappings, {
+      dialerServerId: c.dialerServerId,
+      campaignId: c.campaignId,
+      dispositionCode: c.status,
+    });
+    if (meaning !== 'sale') continue;
+    const [t] = await db
+      .select()
+      .from(transfers)
+      .where(
+        and(
+          eq(transfers.companyId, companyId),
+          eq(transfers.dialerServerId, c.dialerServerId),
+          eq(transfers.viciLeadId, c.viciLeadId!),
+          ne(transfers.queueStatus, 'closed'),
+          eq(transfers.isMock, false),
+          // the sale call must come after (or within minutes of) the transfer
+          lte(transfers.xferTime, new Date(c.callDate.getTime() + 10 * 60_000)),
+        ),
+      )
+      .orderBy(desc(transfers.xferTime))
+      .limit(1);
+    if (!t) continue;
+    await db
+      .update(transfers)
+      .set({
+        queueStatus: 'closed',
+        saleDisposition: c.status,
+        closedAt: c.callDate,
+        closerCallId: t.closerCallId ?? c.id,
+        closerLeadId: t.closerLeadId ?? c.viciLeadId,
+        matchStatus: 'matched',
+        matchMethod: t.closerCallId ? t.matchMethod : 'sale-lead',
+        updatedAt: new Date(),
+      })
+      .where(eq(transfers.id, t.id));
+    await db.insert(transferEvents).values({
+      transferId: t.id,
+      fromStatus: t.queueStatus,
+      toStatus: 'closed',
+      reason: `sale disposition '${c.status}' on this lead (call of ${c.callDate.toISOString()})`,
+    });
+    closed += 1;
+  }
+  if (closed > 0) stats.sales_closed_by_lead = closed;
+}
+
 async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise<void> {
   const mappings = await companyMappings(companyId);
   const rows = await db
@@ -1257,6 +1395,7 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
       closerStatus: calls.status,
       closerDialerId: calls.dialerServerId,
       closerIngroupId: calls.ingroupId,
+      closerDate: calls.callDate,
     })
     .from(transfers)
     .innerJoin(calls, eq(transfers.closerCallId, calls.id))
@@ -1287,12 +1426,23 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
       closerMeaning: meaning,
     });
     if (!result.changed) continue;
+    if (result.regression) {
+      // the sale may live on ANOTHER call of the same lead (manual callback,
+      // different closer) — only regress when no sale call exists at all
+      const saleElsewhere = await saleCallExistsForLead(
+        companyId,
+        mappings,
+        row.transfer.dialerServerId,
+        row.transfer.viciLeadId,
+      );
+      if (saleElsewhere) continue;
+    }
     await db
       .update(transfers)
       .set({
         queueStatus: result.next,
         saleDisposition: result.next === 'closed' ? row.closerStatus : null,
-        closedAt: result.next === 'closed' ? new Date() : null,
+        closedAt: result.next === 'closed' ? row.closerDate : null,
         updatedAt: new Date(),
       })
       .where(eq(transfers.id, row.transfer.id));
