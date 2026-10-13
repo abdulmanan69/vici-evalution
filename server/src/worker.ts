@@ -42,6 +42,7 @@ async function enqueueActiveDialers(): Promise<void> {
 /** Re-check recordings that have no URL yet or recently went missing. */
 async function checkPendingRecordings(): Promise<void> {
   const cutoff = new Date(Date.now() - config.RECORDING_RETRY_MINUTES * 60 * 1000);
+  // never-checked rows, plus previously failed ones (checkAttempts > 0) due a retry
   const rows = await db
     .select()
     .from(recordings)
@@ -49,8 +50,8 @@ async function checkPendingRecordings(): Promise<void> {
       and(
         eq(recordings.status, 'available'),
         eq(recordings.isMock, false),
-        sql`${recordings.lastCheckedAt} is null`,
         lt(recordings.checkAttempts, 5),
+        sql`(${recordings.lastCheckedAt} is null or (${recordings.checkAttempts} > 0 and ${recordings.lastCheckedAt} < ${cutoff}))`,
       ),
     )
     .limit(100);
@@ -80,7 +81,8 @@ async function checkPendingRecordings(): Promise<void> {
       .update(recordings)
       .set({
         status: ok ? 'available' : rec.checkAttempts + 1 >= 5 ? 'missing' : 'available',
-        checkAttempts: rec.checkAttempts + 1,
+        // success resets the counter so verified rows are not re-polled
+        checkAttempts: ok ? 0 : rec.checkAttempts + 1,
         lastCheckedAt: new Date(),
         updatedAt: new Date(),
       })

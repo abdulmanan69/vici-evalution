@@ -92,7 +92,7 @@ export function Layout({ children }: { children: ReactNode }) {
               Q
             </div>
             <div>
-              <div className="font-display text-sm font-700 font-bold leading-tight">VICIdial QA</div>
+              <div className="font-display text-sm font-bold leading-tight">VICIdial QA</div>
               <div className="text-2xs text-ink-3">Call quality console</div>
             </div>
           </div>

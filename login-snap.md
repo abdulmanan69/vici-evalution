@@ -1,0 +1,14 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - generic [ref=e6]: Q
+    - generic [ref=e7]:
+      - generic [ref=e8]: VICIdial QA
+      - generic [ref=e9]: Call quality console
+  - generic [ref=e10]:
+    - generic [ref=e11]:
+      - generic [ref=e12]: Email
+      - textbox "Email" [ref=e13]: admin@example.com
+    - generic [ref=e14]:
+      - generic [ref=e15]: Password
+      - textbox "Password" [active] [ref=e16]: ChangeMe123!
+    - button "Sign in" [ref=e17] [cursor=pointer]
