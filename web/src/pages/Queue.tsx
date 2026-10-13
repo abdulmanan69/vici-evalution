@@ -8,7 +8,7 @@ import { useCompanyScope } from '../components/Layout';
 import { Chip, EmptyState, ErrorState, Loading, PageHeader, Pagination, fmtDateTime, fmtDuration } from '../components/ui';
 
 const TITLES: Record<string, { title: string; subtitle: string }> = {
-  transfer: { title: 'Transfers', subtitle: 'Fronter calls dispositioned as a transfer' },
+  transfer: { title: 'Transfers', subtitle: 'Every call a fronter transferred — the full log, with each call’s current state' },
   unclosed: { title: 'Unclosed', subtitle: 'Reached a closer but not yet a configured sale' },
   closed: { title: 'Closed', subtitle: 'Closer disposition explicitly mapped to sale' },
 };
@@ -117,6 +117,7 @@ export function QueuePage() {
             <thead className="border-b border-ink/10">
               <tr>
                 <th className="th">Transferred</th>
+                {status === 'transfer' && <th className="th">State</th>}
                 <th className="th">Phone</th>
                 <th className="th">Fronter</th>
                 <th className="th">Campaign</th>
@@ -131,6 +132,11 @@ export function QueuePage() {
               {data.items.map((row) => (
                 <tr key={row.transfer.id} className="hover:bg-bg/60">
                   <td className="td font-mono text-2xs">{fmtDateTime(row.transfer.xferTime)}</td>
+                  {status === 'transfer' && (
+                    <td className="td">
+                      <Chip value={row.transfer.queueStatus} />
+                    </td>
+                  )}
                   <td className="td font-mono">{row.transfer.phoneNumber ?? '—'}</td>
                   <td className="td">
                     <div className="font-medium">{row.fronterAgentName ?? row.fronterCall.viciUserRaw ?? '—'}</div>

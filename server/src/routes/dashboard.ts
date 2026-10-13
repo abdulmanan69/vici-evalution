@@ -52,17 +52,18 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
     // daily trend: transfers vs closed, bucketed in the requested timezone so
     // day counts line up with what people see on their own clock
     const tz = q.tz ?? 'UTC';
-    const dayExpr = sql`date_trunc('day', ${transfers.xferTime} AT TIME ZONE ${tz})`;
     const trend = await db
       .select({
-        day: sql<string>`to_char(${dayExpr}, 'YYYY-MM-DD')`,
+        day: sql<string>`to_char(date_trunc('day', ${transfers.xferTime} AT TIME ZONE ${tz}), 'YYYY-MM-DD')`,
         total: count(),
         closed: sql<number>`count(*) filter (where ${transfers.queueStatus} = 'closed')`,
       })
       .from(transfers)
       .where(and(...tWhere))
-      .groupBy(dayExpr)
-      .orderBy(dayExpr);
+      // ordinal grouping: the tz bind parameter would otherwise appear as two
+      // different placeholders in SELECT vs GROUP BY and Postgres rejects it
+      .groupBy(sql`1`)
+      .orderBy(sql`1`);
 
     const totals: Record<string, number> = { transfer: 0, unclosed: 0, closed: 0 };
     for (const row of byQueue) totals[row.queueStatus] = row.n;

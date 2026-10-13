@@ -44,7 +44,13 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const q = listQuery.parse(req.query);
     const scope = companyScope(req, q.companyId);
 
-    const where: SQL[] = [eq(transfers.queueStatus, status as 'transfer' | 'unclosed' | 'closed')];
+    // The Transfer section is the full log of fronter transfers — every
+    // transferred call regardless of what happened downstream. Unclosed and
+    // Closed are the state-filtered views.
+    const where: SQL[] =
+      status === 'transfer'
+        ? []
+        : [eq(transfers.queueStatus, status as 'unclosed' | 'closed')];
     if (scope) where.push(eq(transfers.companyId, scope));
     if (q.dialerServerId) where.push(eq(transfers.dialerServerId, q.dialerServerId));
     if (q.campaignId) where.push(eq(fronterCall.campaignId, q.campaignId));
