@@ -1,0 +1,137 @@
+import { useState } from 'react';
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { PlayCircle } from 'lucide-react';
+import { api } from '../../api/client';
+import type { PageMeta, SyncJob } from '../../api/types';
+import { useCompanyScope } from '../../components/Layout';
+import { Chip, ErrorState, Loading, PageHeader, Pagination, fmtDateTime } from '../../components/ui';
+
+interface DialerStatus {
+  dialerServerId: string;
+  name: string;
+  active: boolean;
+  sourceMode: string;
+  lastSeenAt: string | null;
+  lastJob: SyncJob | null;
+  cursors: { stream: string; lastTimestamp: string | null }[];
+}
+
+export function SyncMonitorPage() {
+  const { companyId } = useCompanyScope();
+  const queryClient = useQueryClient();
+  const [page, setPage] = useState(1);
+
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['sync-status', companyId],
+    queryFn: () => api<{ statuses: DialerStatus[] }>('/sync/status', { query: { companyId: companyId || undefined } }),
+    refetchInterval: 15_000, // live view while syncs run
+  });
+
+  const { data: jobs } = useQuery({
+    queryKey: ['sync-jobs', companyId, page],
+    queryFn: () =>
+      api<{ jobs: { job: SyncJob; dialerName: string }[]; meta: PageMeta }>('/sync/jobs', {
+        query: { companyId: companyId || undefined, page, pageSize: 25 },
+      }),
+    placeholderData: keepPreviousData,
+    refetchInterval: 15_000,
+  });
+
+  const runAll = useMutation({
+    mutationFn: () => api('/sync/run', { method: 'POST', body: { companyId: companyId || undefined } }),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['sync-jobs'] }),
+  });
+
+  return (
+    <div>
+      <PageHeader
+        title="Sync monitor"
+        subtitle="Per-dialer synchronization health, cursors and job history — refreshes every 15s"
+        actions={
+          <button className="btn-primary" onClick={() => runAll.mutate()} disabled={runAll.isPending}>
+            <PlayCircle size={14} /> Sync all active dialers
+          </button>
+        }
+      />
+
+      {isLoading ? (
+        <Loading />
+      ) : isError || !data ? (
+        <ErrorState message="Sync status could not load." onRetry={() => void refetch()} />
+      ) : (
+        <div className="grid gap-3 md:grid-cols-2">
+          {data.statuses.map((s) => (
+            <div key={s.dialerServerId} className="card p-4">
+              <div className="flex items-center justify-between">
+                <span className="font-display font-bold">{s.name}</span>
+                <div className="flex gap-1.5">
+                  <span className="chip bg-bg text-ink-2">{s.sourceMode}</span>
+                  <Chip value={s.active ? 'active' : 'disabled'} label={s.active ? 'active' : 'inactive'} />
+                </div>
+              </div>
+              <div className="mt-2 text-2xs text-ink-2">
+                Last successful contact: <span className="font-mono">{fmtDateTime(s.lastSeenAt)}</span>
+              </div>
+              {s.lastJob && (
+                <div className="mt-1 flex items-center gap-2 text-2xs">
+                  <Chip value={s.lastJob.status} />
+                  <span className="font-mono text-ink-3">
+                    {s.lastJob.jobType} · {fmtDateTime(s.lastJob.createdAt)}
+                  </span>
+                </div>
+              )}
+              {s.lastJob?.error && (
+                <div className="mt-2 rounded-md bg-bad-soft px-2 py-1.5 font-mono text-2xs text-bad">{s.lastJob.error}</div>
+              )}
+              {s.cursors.length > 0 && (
+                <div className="mt-2 space-y-0.5">
+                  {s.cursors.map((c) => (
+                    <div key={c.stream} className="flex justify-between font-mono text-2xs text-ink-3">
+                      <span>{c.stream}</span>
+                      <span>{fmtDateTime(c.lastTimestamp)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+          {data.statuses.length === 0 && (
+            <p className="text-sm text-ink-2">No dialers in scope. Add one under Dialer servers.</p>
+          )}
+        </div>
+      )}
+
+      {jobs && (
+        <div className="card mt-4 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="border-b border-ink/10">
+              <tr>
+                <th className="th">Queued</th>
+                <th className="th">Dialer</th>
+                <th className="th">Type</th>
+                <th className="th">Status</th>
+                <th className="th">Result</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-ink/5">
+              {jobs.jobs.map(({ job, dialerName }) => (
+                <tr key={job.id} className="hover:bg-bg/60">
+                  <td className="td font-mono text-2xs">{fmtDateTime(job.createdAt)}</td>
+                  <td className="td">{dialerName}</td>
+                  <td className="td font-mono text-2xs">{job.jobType}</td>
+                  <td className="td">
+                    <Chip value={job.status} />
+                  </td>
+                  <td className="td max-w-md truncate font-mono text-2xs text-ink-2">
+                    {job.error ?? (job.stats ? JSON.stringify(job.stats) : '—')}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <Pagination meta={jobs.meta} onPage={setPage} />
+        </div>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,53 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply antialiased;
+  }
+  body {
+    @apply bg-bg text-ink font-sans text-sm;
+  }
+  h1,
+  h2,
+  h3 {
+    @apply font-display;
+  }
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand ring-offset-1;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-surface rounded-lg shadow-card;
+  }
+  .btn {
+    @apply inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+  .btn-primary {
+    @apply btn bg-brand text-white hover:bg-brand-dark;
+  }
+  .btn-secondary {
+    @apply btn bg-surface text-ink shadow-card hover:bg-bg;
+  }
+  .btn-danger {
+    @apply btn bg-bad text-white hover:opacity-90;
+  }
+  .input {
+    @apply w-full rounded-md border border-ink/15 bg-surface px-2.5 py-1.5 text-sm placeholder:text-ink-3 focus:border-brand focus:ring-1 focus:ring-brand focus:outline-none;
+  }
+  .label {
+    @apply block text-2xs font-semibold uppercase tracking-wider text-ink-2 mb-1;
+  }
+  .th {
+    @apply px-3 py-2 text-left text-2xs font-semibold uppercase tracking-wider text-ink-2 whitespace-nowrap;
+  }
+  .td {
+    @apply px-3 py-2 align-middle whitespace-nowrap;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-2xs font-semibold;
+  }
+}

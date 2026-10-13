@@ -1,0 +1,185 @@
+import type { FastifyInstance } from 'fastify';
+import { z } from 'zod';
+import { and, count, desc, eq, type SQL } from 'drizzle-orm';
+import { db } from '../db/client.js';
+import { evaluations, qaFormVersions, qaForms, transfers, users } from '../db/schema.js';
+import { companyScope, requirePermission } from '../auth/plugin.js';
+import { audit } from '../lib/audit.js';
+import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
+import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
+import { answersSchema, formDefinitionSchema } from '../services/formSchema.js';
+import { scoreEvaluation } from '../services/scoring.js';
+
+const createSchema = z.object({
+  transferId: z.string().uuid(),
+  formId: z.string().uuid(),
+  targetAgentId: z.string().uuid().optional(),
+  callId: z.string().uuid().optional(),
+});
+
+const listQuery = paginationSchema.extend({
+  companyId: z.string().uuid().optional(),
+  status: z.enum(['draft', 'completed']).optional(),
+  reviewerId: z.string().uuid().optional(),
+  transferId: z.string().uuid().optional(),
+});
+
+export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
+  app.get('/', { preHandler: [requirePermission('qa.view')] }, async (req) => {
+    const q = listQuery.parse(req.query);
+    const scope = companyScope(req, q.companyId);
+    const where: SQL[] = [];
+    if (scope) where.push(eq(evaluations.companyId, scope));
+    if (q.status) where.push(eq(evaluations.status, q.status));
+    if (q.reviewerId) where.push(eq(evaluations.reviewerId, q.reviewerId));
+    if (q.transferId) where.push(eq(evaluations.transferId, q.transferId));
+    const whereAll = where.length ? and(...where) : undefined;
+    const [total] = await db.select({ n: count() }).from(evaluations).where(whereAll);
+    const rows = await db
+      .select({
+        evaluation: evaluations,
+        reviewerName: users.name,
+        formName: qaForms.name,
+        formVersion: qaFormVersions.version,
+      })
+      .from(evaluations)
+      .innerJoin(users, eq(evaluations.reviewerId, users.id))
+      .innerJoin(qaFormVersions, eq(evaluations.formVersionId, qaFormVersions.id))
+      .innerJoin(qaForms, eq(qaFormVersions.formId, qaForms.id))
+      .where(whereAll)
+      .orderBy(desc(evaluations.createdAt))
+      .limit(q.pageSize)
+      .offset(offsetOf(q));
+    return { evaluations: rows, meta: pageMeta(q, total.n) };
+  });
+
+  app.get('/:id', { preHandler: [requirePermission('qa.view')] }, async (req) => {
+    const { id } = req.params as { id: string };
+    const [row] = await db
+      .select({
+        evaluation: evaluations,
+        reviewerName: users.name,
+        formName: qaForms.name,
+        formVersion: qaFormVersions.version,
+        formSchema: qaFormVersions.schema,
+        maxScore: qaFormVersions.maxScore,
+        passThreshold: qaFormVersions.passThreshold,
+      })
+      .from(evaluations)
+      .innerJoin(users, eq(evaluations.reviewerId, users.id))
+      .innerJoin(qaFormVersions, eq(evaluations.formVersionId, qaFormVersions.id))
+      .innerJoin(qaForms, eq(qaFormVersions.formId, qaForms.id))
+      .where(eq(evaluations.id, id));
+    if (!row) throw new NotFoundError('Evaluation not found');
+    companyScope(req, row.evaluation.companyId);
+    return row;
+  });
+
+  app.post('/', { preHandler: [requirePermission('qa.evaluate')] }, async (req, reply) => {
+    const body = createSchema.parse(req.body);
+    const [transfer] = await db.select().from(transfers).where(eq(transfers.id, body.transferId));
+    if (!transfer) throw new NotFoundError('Transfer not found');
+    const companyId = companyScope(req, transfer.companyId);
+    if (!companyId) throw new ValidationError('Evaluation requires a company context');
+
+    const [form] = await db.select().from(qaForms).where(eq(qaForms.id, body.formId));
+    if (!form || form.companyId !== transfer.companyId) throw new NotFoundError('Form not found');
+    if (form.state !== 'published' || form.currentVersion === 0) {
+      throw new ValidationError('Form has no published version');
+    }
+    const [version] = await db
+      .select()
+      .from(qaFormVersions)
+      .where(and(eq(qaFormVersions.formId, form.id), eq(qaFormVersions.version, form.currentVersion)));
+    if (!version) throw new ValidationError('Published version missing');
+
+    const [row] = await db
+      .insert(evaluations)
+      .values({
+        companyId: transfer.companyId,
+        transferId: transfer.id,
+        callId: body.callId ?? transfer.closerCallId ?? transfer.fronterCallId,
+        formVersionId: version.id,
+        targetAgentId: body.targetAgentId ?? null,
+        reviewerId: req.auth.userId,
+        status: 'draft',
+        answers: {},
+      })
+      .returning();
+    await audit(req, { action: 'evaluation.create', entityType: 'evaluation', entityId: row.id, companyId: transfer.companyId });
+    return reply.status(201).send({ evaluation: row });
+  });
+
+  app.patch('/:id', { preHandler: [requirePermission('qa.evaluate')] }, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = z
+      .object({
+        answers: answersSchema.optional(),
+        comments: z.string().max(5000).optional(),
+        coachingNotes: z.string().max(5000).optional(),
+      })
+      .parse(req.body);
+    const [before] = await db.select().from(evaluations).where(eq(evaluations.id, id));
+    if (!before) throw new NotFoundError('Evaluation not found');
+    companyScope(req, before.companyId);
+    if (before.status === 'completed') {
+      throw new ConflictError('Completed evaluations are immutable');
+    }
+    const [row] = await db
+      .update(evaluations)
+      .set({
+        answers: body.answers ?? before.answers,
+        comments: body.comments ?? before.comments,
+        coachingNotes: body.coachingNotes ?? before.coachingNotes,
+        updatedAt: new Date(),
+      })
+      .where(eq(evaluations.id, id))
+      .returning();
+    return { evaluation: row };
+  });
+
+  /** Completion scores server-side against the frozen form version. */
+  app.post('/:id/complete', { preHandler: [requirePermission('qa.evaluate')] }, async (req) => {
+    const { id } = req.params as { id: string };
+    const [evalRow] = await db.select().from(evaluations).where(eq(evaluations.id, id));
+    if (!evalRow) throw new NotFoundError('Evaluation not found');
+    companyScope(req, evalRow.companyId);
+    if (evalRow.status === 'completed') throw new ConflictError('Already completed');
+
+    const [version] = await db
+      .select()
+      .from(qaFormVersions)
+      .where(eq(qaFormVersions.id, evalRow.formVersionId));
+    if (!version) throw new NotFoundError('Form version missing');
+    const form = formDefinitionSchema.parse(version.schema);
+    const answers = answersSchema.parse(evalRow.answers ?? {});
+
+    const result = scoreEvaluation(form, answers, Number(version.passThreshold));
+    if (result.missingRequired.length > 0) {
+      throw new ValidationError(`Required questions unanswered: ${result.missingRequired.join(', ')}`);
+    }
+
+    const [row] = await db
+      .update(evaluations)
+      .set({
+        status: 'completed',
+        score: String(result.score),
+        maxScore: String(result.maxScore),
+        percent: String(result.percent),
+        passed: result.passed,
+        autoFailed: result.autoFailed,
+        completedAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(evaluations.id, id))
+      .returning();
+    await audit(req, {
+      action: 'evaluation.complete',
+      entityType: 'evaluation',
+      entityId: id,
+      after: { score: result.score, percent: result.percent, passed: result.passed, autoFailed: result.autoFailed },
+      companyId: evalRow.companyId,
+    });
+    return { evaluation: row, result };
+  });
+}
