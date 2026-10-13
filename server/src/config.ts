@@ -21,6 +21,8 @@ const envSchema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true'),
+  /** Rolling window for un-reviewed call data; 0 keeps everything forever. */
+  RETENTION_DAYS: z.coerce.number().min(0).default(7),
   SYNC_POLL_SECONDS: z.coerce.number().default(60),
   SYNC_LOOKBACK_MINUTES: z.coerce.number().default(15),
   SYNC_HISTORICAL_DAYS: z.coerce.number().default(30),

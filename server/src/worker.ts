@@ -97,6 +97,37 @@ async function checkPendingRecordings(): Promise<void> {
     .where(and(eq(recordings.status, 'missing'), lt(recordings.lastCheckedAt, cutoff), lt(recordings.checkAttempts, 20)));
 }
 
+/**
+ * Daily retention: delete un-reviewed call data older than RETENTION_DAYS,
+ * counted from each row's LAST change, so late disposition corrections are
+ * never cut off mid-flight. Evaluated and flagged transfers are kept forever
+ * together with their calls and recordings. Mock/demo rows are untouched.
+ */
+async function applyRetention(): Promise<void> {
+  if (config.RETENTION_DAYS <= 0) return;
+  const cutoff = new Date(Date.now() - config.RETENTION_DAYS * 24 * 3600 * 1000);
+  const t = await db.execute(sql`
+    delete from transfers tr
+     where tr.is_mock = false
+       and tr.updated_at < ${cutoff}
+       and tr.match_status <> 'flagged'
+       and not exists (select 1 from evaluations e where e.transfer_id = tr.id)`);
+  const c = await db.execute(sql`
+    delete from calls c
+     where c.is_mock = false
+       and c.call_date < ${cutoff}
+       and not exists (select 1 from transfers tr where tr.fronter_call_id = c.id or tr.closer_call_id = c.id)
+       and not exists (select 1 from evaluations e where e.call_id = c.id)`);
+  const r = await db.execute(sql`
+    delete from recordings r
+     where r.is_mock = false
+       and r.call_id is null
+       and coalesce(r.start_time, r.created_at) < ${cutoff}`);
+  console.log(
+    `[worker] retention: removed ${t.rowCount ?? 0} transfers, ${c.rowCount ?? 0} calls, ${r.rowCount ?? 0} recordings older than ${config.RETENTION_DAYS}d (evaluated/flagged kept)`,
+  );
+}
+
 async function main(): Promise<void> {
   await runMigrations();
 
@@ -108,6 +139,10 @@ async function main(): Promise<void> {
       }
       if (job.name === 'check-recordings') {
         await checkPendingRecordings();
+        return { ok: true };
+      }
+      if (job.name === 'retention') {
+        await applyRetention();
         return { ok: true };
       }
       if (job.name === 'tick') {
@@ -138,6 +173,7 @@ async function main(): Promise<void> {
     { every: config.RECORDING_RETRY_MINUTES * 60 * 1000 },
     { name: 'check-recordings' },
   );
+  await syncQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention' });
 
   console.log(
     `[worker] started — polling every ${config.SYNC_POLL_SECONDS}s, recording checks every ${config.RECORDING_RETRY_MINUTES}m`,

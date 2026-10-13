@@ -692,7 +692,9 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
   // --- exact per-call log: user_stats exports, chunked to stay under the
   // 10k-row export cap; incremental = today+yesterday, full = backfill window ---
   const todayLocal = toLocalStr(now).slice(0, 10);
-  const dayCount = full ? Math.min(config.SYNC_HISTORICAL_DAYS, API_FULL_BACKFILL_DAYS) : 2;
+  // no point backfilling past the retention window — it would be deleted again
+  const retentionCap = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : Number.MAX_SAFE_INTEGER;
+  const dayCount = full ? Math.min(config.SYNC_HISTORICAL_DAYS, API_FULL_BACKFILL_DAYS, retentionCap) : 2;
   const chunks: Array<{ from: string; to: string }> = [];
   for (let i = dayCount - 1; i >= 0; i -= 2) {
     chunks.push({ from: localDateMinus(todayLocal, i), to: localDateMinus(todayLocal, Math.max(i - 1, 0)) });
