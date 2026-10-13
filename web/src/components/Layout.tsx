@@ -5,6 +5,7 @@ import {
   Activity,
   ArrowLeftRight,
   BadgeCheck,
+  BarChart3,
   Building2,
   ClipboardList,
   FileSpreadsheet,
@@ -57,6 +58,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
     items: [
       { to: '/qa/forms', label: 'QA forms', icon: <ClipboardList size={16} />, perm: 'qa.view' },
       { to: '/qa/evaluations', label: 'Evaluations', icon: <ListChecks size={16} />, perm: 'qa.view' },
+      { to: '/reports/agents', label: 'Agent report', icon: <BarChart3 size={16} />, perm: 'reports.view' },
     ],
   },
   {

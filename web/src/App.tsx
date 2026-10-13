@@ -9,6 +9,7 @@ import { FormsPage } from './pages/Forms';
 import { FormBuilderPage } from './pages/FormBuilder';
 import { EvaluationPage } from './pages/Evaluation';
 import { EvaluationsListPage } from './pages/EvaluationsList';
+import { AgentReportPage } from './pages/AgentReport';
 import { CompaniesPage } from './pages/admin/Companies';
 import { DialersPage } from './pages/admin/Dialers';
 import { AgentsPage } from './pages/admin/Agents';
@@ -44,6 +45,7 @@ export default function App() {
                 <Route path="/qa/forms" element={<FormsPage />} />
                 <Route path="/qa/forms/:id" element={<FormBuilderPage />} />
                 <Route path="/qa/evaluations" element={<EvaluationsListPage />} />
+                <Route path="/reports/agents" element={<AgentReportPage />} />
                 <Route path="/qa/evaluations/:id" element={<EvaluationPage />} />
                 <Route path="/admin/companies" element={<CompaniesPage />} />
                 <Route path="/admin/dialers" element={<DialersPage />} />

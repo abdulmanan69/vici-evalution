@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, gte, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { db } from '../db/client.js';
 import {
@@ -749,31 +749,54 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
         callsImported += 1;
       }
 
-      await db
-        .insert(recordings)
-        .values({
-          companyId: conn.companyId,
-          dialerServerId: conn.id,
-          callId,
-          viciRecordingId: row.recordingId,
-          viciLeadId: row.leadId,
-          filename: row.filename,
-          locationUrl: row.locationUrl,
-          startTime: row.startTime,
-          lengthSec: row.lengthSec,
-          status: row.locationUrl ? 'available' : 'pending',
-          raw: { source: 'recording_lookup' },
-        })
-        .onConflictDoUpdate({
-          target: [recordings.dialerServerId, recordings.filename],
-          set: {
+      // A recording can resurface under the same recording_id with a changed
+      // filename (re-encodes, archive moves) — match on EITHER key so neither
+      // unique constraint can fail the whole sync job.
+      const [existingRec] = await db
+        .select({ id: recordings.id })
+        .from(recordings)
+        .where(
+          and(
+            eq(recordings.dialerServerId, conn.id),
+            or(
+              eq(recordings.filename, row.filename),
+              row.recordingId != null ? eq(recordings.viciRecordingId, row.recordingId) : sql`false`,
+            ),
+          ),
+        )
+        .limit(1);
+      if (existingRec) {
+        await db
+          .update(recordings)
+          .set({
             callId,
+            viciRecordingId: row.recordingId,
+            viciLeadId: row.leadId,
+            filename: row.filename,
             locationUrl: row.locationUrl,
             lengthSec: row.lengthSec,
             status: row.locationUrl ? 'available' : 'pending',
             updatedAt: new Date(),
-          },
-        });
+          })
+          .where(eq(recordings.id, existingRec.id));
+      } else {
+        await db
+          .insert(recordings)
+          .values({
+            companyId: conn.companyId,
+            dialerServerId: conn.id,
+            callId,
+            viciRecordingId: row.recordingId,
+            viciLeadId: row.leadId,
+            filename: row.filename,
+            locationUrl: row.locationUrl,
+            startTime: row.startTime,
+            lengthSec: row.lengthSec,
+            status: row.locationUrl ? 'available' : 'pending',
+            raw: { source: 'recording_lookup' },
+          })
+          .onConflictDoNothing();
+      }
       recsImported += 1;
     }
   }

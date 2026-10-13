@@ -21,10 +21,11 @@ const SERIES = { total: '#3B4A9F', closed: '#C97A10' };
 export function DashboardPage() {
   const { companyId } = useCompanyScope();
   const [days, setDays] = useState(30);
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['dashboard', companyId, days],
+    queryKey: ['dashboard', companyId, days, tz],
     queryFn: () =>
-      api<DashboardStats>('/dashboard/stats', { query: { companyId: companyId || undefined, days } }),
+      api<DashboardStats>('/dashboard/stats', { query: { companyId: companyId || undefined, days, tz } }),
   });
 
   if (isLoading) return <Loading />;
