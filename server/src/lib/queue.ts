@@ -19,9 +19,11 @@ export async function enqueueDialerSync(dialerServerId: string, full = false): P
     'sync-dialer',
     { dialerServerId, full },
     {
-      jobId: `sync:${dialerServerId}`,
-      removeOnComplete: 100,
-      removeOnFail: 100,
+      // BullMQ forbids ':' in custom ids; and the job must be removed on
+      // completion or the id would block every future sync of this dialer.
+      jobId: `sync-${dialerServerId}`,
+      removeOnComplete: true,
+      removeOnFail: true,
       attempts: 3,
       backoff: { type: 'exponential', delay: 10_000 },
     },

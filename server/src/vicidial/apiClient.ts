@@ -57,11 +57,15 @@ export class ViciApiClient {
   /**
    * recording_lookup for one lead or one agent+date. Returns rows keyed by the
    * header names the server itself reports.
+   *
+   * Verified on a live 2.14-189 build: with duration=Y the data rows carry one
+   * MORE cell than the header (seconds inserted before the URL) — the remap in
+   * fixRecordingRow recovers `location` and `length_in_sec` in that case.
    */
   async recordingLookup(opts: {
     leadId?: number;
     agentUser?: string;
-    date?: string; // YYYY-MM-DD
+    date?: string; // YYYY-MM-DD (dialer-local)
   }): Promise<Array<Record<string, string>>> {
     const params: Record<string, string> = {
       function: 'recording_lookup',
@@ -74,8 +78,68 @@ export class ViciApiClient {
     if (opts.date) params.date = opts.date;
 
     const body = await this.call(params);
+    return parsePipeWithHeader(body).map(fixRecordingRow);
+  }
+
+  /** campaigns_list has no header row; columns verified: id|name|active|… */
+  async campaignsList(): Promise<Array<{ campaign_id: string; campaign_name: string; active: string }>> {
+    const body = await this.call({ function: 'campaigns_list' });
+    return body
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('ERROR'))
+      .map((l) => {
+        const c = l.split('|');
+        return { campaign_id: (c[0] ?? '').trim(), campaign_name: (c[1] ?? '').trim(), active: (c[2] ?? '').trim() };
+      })
+      .filter((r) => r.campaign_id.length > 0);
+  }
+
+  /** Per-agent stats for a dialer-local datetime range; used as the agent roster. */
+  async agentStatsExport(startLocal: string, endLocal: string): Promise<Array<Record<string, string>>> {
+    const body = await this.call({
+      function: 'agent_stats_export',
+      datetime_start: startLocal,
+      datetime_end: endLocal,
+      stage: 'pipe',
+      header: 'YES',
+    });
     return parsePipeWithHeader(body);
   }
+
+  /** Currently logged-in agents (live roster supplement). */
+  async loggedInAgents(): Promise<Array<Record<string, string>>> {
+    const body = await this.call({ function: 'logged_in_agents', stage: 'pipe', header: 'YES' });
+    return parsePipeWithHeader(body);
+  }
+
+  /** Full lead record — provides status (latest disposition) and phone_number. */
+  async leadAllInfo(leadId: number): Promise<Record<string, string> | null> {
+    let body: string;
+    try {
+      body = await this.call({ function: 'lead_all_info', lead_id: String(leadId), stage: 'pipe', header: 'YES' });
+    } catch (err) {
+      if (err instanceof ViciApiError) return null; // unknown lead etc.
+      throw err;
+    }
+    const rows = parsePipeWithHeader(body);
+    return rows[0] ?? null;
+  }
+}
+
+/**
+ * Repairs recording_lookup rows where duration=Y added an unlisted seconds
+ * column: the URL lands one past the 'location' slot and 'location' holds the
+ * seconds. Pure; unit-tested.
+ */
+export function fixRecordingRow(row: Record<string, string>): Record<string, string> {
+  const extra = row.__extra0;
+  if (extra !== undefined && /^https?:\/\//i.test(extra) && row.location && !/^https?:\/\//i.test(row.location)) {
+    const fixed: Record<string, string> = { ...row, length_in_sec: row.location, location: extra };
+    delete fixed.__extra0;
+    return fixed;
+  }
+  return row;
 }
 
 export function parsePipeWithHeader(body: string): Array<Record<string, string>> {
@@ -92,6 +156,10 @@ export function parsePipeWithHeader(body: string): Array<Record<string, string>>
     header.forEach((h, i) => {
       row[h] = (cells[i] ?? '').trim();
     });
+    // keep cells beyond the header so callers can repair shifted layouts
+    for (let i = header.length; i < cells.length; i += 1) {
+      row[`__extra${i - header.length}`] = (cells[i] ?? '').trim();
+    }
     rows.push(row);
   }
   return rows;

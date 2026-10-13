@@ -11,24 +11,52 @@ Each dialer server row stores credentials for up to two sources and a
 
 | Mode | Call logs | Recordings | When to use |
 |---|---|---|---|
-| `db` | read-only MySQL | `recording_log` (MySQL) | you can grant SELECT on the asterisk DB (recommended) |
+| `db` | read-only MySQL | `recording_log` (MySQL) | you can grant SELECT on the asterisk DB (most accurate) |
 | `hybrid` | read-only MySQL | MySQL + `recording_lookup` API fallback | default |
-| `api` | **not available** | `recording_lookup` only | no DB access at all — limited |
+| `api` | **synthesized** from recordings + lead status (see below) | `recording_lookup` | API credentials only, no DB access |
 
-### Why the API alone is not enough — a documented limitation
+### API-only mode (no MySQL access)
 
 The VICIdial **Non-Agent API** (`/vicidial/non_agent_api.php`) has no function
 that exports the outbound call log (`vicidial_log`) or the closer log
-(`vicidial_closer_log`). It is used here for:
+(`vicidial_closer_log`). When only API credentials exist, the sync therefore
+**synthesizes** call records from what the API does expose (shapes verified
+live against a 2.14-189 build):
 
-- `version` — connectivity/credential checks (admin "Test connection"),
-- `recording_lookup` — recording metadata per lead or agent+date. Responses are
-  parsed by the header row the server itself returns (`header=YES`), not by
-  hard-coded column positions, because layouts differ between VICIdial builds.
+1. **Roster** — `campaigns_list` (no header row; `id|name|active|…`),
+   `agent_stats_export` and `logged_in_agents` (both honor `header=YES`)
+   build the campaign and agent lists.
+2. **Calls** — `recording_lookup` per agent per dialer-local day: every
+   recording becomes one call leg (`uniqueid = rec-<recording_id>`, stable and
+   idempotent). Note: with `duration=Y` this build returns one more data cell
+   than the header advertises (seconds inserted before the URL); the parser
+   repairs that shift (`fixRecordingRow`, unit-tested).
+3. **Disposition & phone** — `lead_all_info` per lead supplies `status` (the
+   lead's **latest** disposition) and `phone_number` (fallback: the number
+   embedded in the recording filename). Lookups are cached and capped per
+   cycle; missing statuses backfill on later cycles.
+4. **Fronter vs closer leg** — the admin's agent classification (Agents page)
+   wins; unclassified agents fall back to time order per lead (first agent on
+   the lead = fronter, later different agents = closer legs).
+5. **Transfer detection** — on one server the closer's final disposition
+   overwrites the lead status, so the fronter leg of a sold call no longer
+   shows `XFER`. Transfers are therefore detected **structurally**: a
+   fronter leg whose lead has a closer leg starting within 2 hours is created
+   as a transfer and linked directly (`matchMethod=structural-lead`,
+   confidence 85). Mapping-based detection (`XFER → Transfer`) still runs for
+   leads that never reached a closer disposition.
 
-Everything else requires the **read-only MySQL** source. Grant a dedicated
-MySQL user SELECT-only access; the adapter (`server/src/vicidial/dbClient.ts`)
-only ever issues SELECTs. Tables read:
+**Accuracy trade-offs of API mode** (inherent, documented):
+- per-call dispositions are approximated by the lead's latest status;
+- calls without recordings are invisible (no recording ⇒ no row);
+- campaign attribution per call is unavailable.
+If you ever get read-only MySQL access, switch the dialer to `hybrid` — the
+synthesized rows are superseded by exact log rows without duplication.
+
+### Read-only MySQL source (db/hybrid modes)
+
+Grant a dedicated MySQL user SELECT-only access; the adapter
+(`server/src/vicidial/dbClient.ts`) only ever issues SELECTs. Tables read:
 
 | Table | Used for |
 |---|---|
@@ -122,7 +150,8 @@ corrected dispositions move calls between queues; every change writes a
 
 ## Known limitations / assumptions (deliberately explicit)
 
-1. API-only mode cannot import call logs — documented above; use `db`/`hybrid`.
+1. API-only mode synthesizes calls from recordings and lead status — see the
+   accuracy trade-offs above; `db`/`hybrid` remain the exact sources.
 2. `vicidial_xfer_log` is not read; transfer detection relies on dispositions
    plus closer-log matching. If your workflow needs xfer-log timestamps, add a
    fetch in `dbClient.ts` after verifying that table's columns on your build.

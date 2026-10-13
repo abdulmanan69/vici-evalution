@@ -1,4 +1,5 @@
 import { and, desc, eq, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import { db } from '../db/client.js';
 import {
   calls,
@@ -21,6 +22,13 @@ import { localToUtc, utcToLocalString } from './timezone.js';
 import { decideMatch, DEFAULT_MATCH_OPTIONS, normalizePhone, type CloserCandidate } from './matcher.js';
 import { resolveMeaning, transition, type MappingRow } from './queueLogic.js';
 import type { DialerConnection, ViciCallRow } from './types.js';
+import {
+  assignLegSources,
+  normalizeRecordingRow,
+  phoneFromFilename,
+  syntheticUniqueId,
+  type ApiRecordingRow,
+} from './apiDerive.js';
 
 export interface SyncStats {
   [key: string]: number | string[] | undefined;
@@ -60,10 +68,9 @@ export async function runDialerSync(
       await syncCallStream(conn, viciDb, 'vicidial_closer_log', stats, opts.full);
       await syncRecordingsFromDb(conn, viciDb, stats, opts.full);
     } else if (conn.sourceMode === 'api') {
-      notes.push(
-        'API-only mode: the Non-Agent API has no call-log export; call records require read-only DB access. Only recording lookups ran.',
-      );
-      await syncRecordingsFromApi(conn, stats);
+      // No DB access: synthesize call records from recording_lookup +
+      // lead_all_info (verified shapes on this build — see docs).
+      await syncApiOnly(conn, stats, opts.full);
     } else {
       notes.push('No usable data source configured (db credentials missing).');
     }
@@ -506,6 +513,284 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
 }
 
 // ---------------------------------------------------------------------------
+// API-only ingestion (no MySQL access)
+// ---------------------------------------------------------------------------
+const API_AGENT_CAP = 300;
+const API_LEAD_LOOKUP_CAP = 800;
+const API_FULL_BACKFILL_DAYS = 14;
+
+function localDateMinus(todayLocal: string, minusDays: number): string {
+  const [y, m, d] = todayLocal.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d - minusDays)).toISOString().slice(0, 10);
+}
+
+/**
+ * 'api' source mode: call records are synthesized from recording_lookup rows
+ * (one recording = one call leg) and lead_all_info (status = the lead's
+ * latest disposition, phone number). Fronter vs closer leg comes from the
+ * agent classification on the Agents page, falling back to time order per
+ * lead. Everything is idempotent via synthetic uniqueids (rec-<recording_id>).
+ */
+async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: boolean): Promise<void> {
+  const api = new ViciApiClient(conn);
+  const notes = stats.notes as string[];
+  const now = new Date();
+
+  // --- campaigns ---
+  try {
+    const camps = await api.campaignsList();
+    for (const c of camps) {
+      await db
+        .insert(campaigns)
+        .values({
+          companyId: conn.companyId,
+          dialerServerId: conn.id,
+          viciCampaignId: c.campaign_id,
+          name: c.campaign_name,
+          active: c.active === 'Y',
+          raw: c,
+          syncedAt: now,
+        })
+        .onConflictDoUpdate({
+          target: [campaigns.dialerServerId, campaigns.viciCampaignId],
+          set: { name: c.campaign_name, active: c.active === 'Y', raw: c, syncedAt: now },
+        });
+    }
+    stats.campaigns = camps.length;
+  } catch (err) {
+    notes.push(`campaigns_list failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  // --- agent roster: stats export over a window + currently logged-in agents ---
+  const rosterRows: Array<Record<string, string>> = [];
+  try {
+    const rosterStart = new Date(now.getTime() - (full ? 7 : 1) * 24 * 3600 * 1000);
+    rosterRows.push(
+      ...(await api.agentStatsExport(
+        utcToLocalString(rosterStart, conn.timezone),
+        utcToLocalString(now, conn.timezone),
+      )),
+    );
+  } catch (err) {
+    notes.push(`agent_stats_export failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  try {
+    rosterRows.push(...(await api.loggedInAgents()));
+  } catch {
+    // live roster is a best-effort supplement
+  }
+  let rosterCount = 0;
+  const seenUsers = new Set<string>();
+  for (const r of rosterRows) {
+    const user = (r.user ?? '').trim();
+    if (!user || seenUsers.has(user)) continue;
+    seenUsers.add(user);
+    rosterCount += 1;
+    await db
+      .insert(viciAgents)
+      .values({
+        companyId: conn.companyId,
+        dialerServerId: conn.id,
+        viciUser: user,
+        fullName: r.full_name ?? null,
+        userGroup: r.user_group ?? null,
+        raw: r,
+        syncedAt: now,
+      })
+      .onConflictDoUpdate({
+        target: [viciAgents.dialerServerId, viciAgents.viciUser],
+        // never touch agentRole here — that is the admin's classification
+        set: { fullName: r.full_name ?? null, userGroup: r.user_group ?? null, raw: r, syncedAt: now },
+      });
+  }
+  stats.agents = rosterCount;
+
+  const agentRows = await db.select().from(viciAgents).where(eq(viciAgents.dialerServerId, conn.id));
+  const roleByUser = new Map(agentRows.map((a) => [a.viciUser, a.agentRole] as const));
+  const idByUser = new Map(agentRows.map((a) => [a.viciUser, a.id] as const));
+  let scanUsers = agentRows.filter((a) => a.active).map((a) => a.viciUser);
+  if (scanUsers.length > API_AGENT_CAP) {
+    notes.push(`agent cap: scanning ${API_AGENT_CAP} of ${scanUsers.length} agents per cycle`);
+    scanUsers = scanUsers.slice(0, API_AGENT_CAP);
+  }
+
+  // --- recording scan: incremental = today+yesterday, full = backfill window ---
+  const todayLocal = utcToLocalString(now, conn.timezone).slice(0, 10);
+  const dayCount = full ? Math.min(config.SYNC_HISTORICAL_DAYS, API_FULL_BACKFILL_DAYS) : 2;
+  const days: string[] = [];
+  for (let i = dayCount - 1; i >= 0; i -= 1) days.push(localDateMinus(todayLocal, i));
+
+  const leadCache = new Map<number, Record<string, string> | null>();
+  let lookups = 0;
+  let callsImported = 0;
+  let recsImported = 0;
+  let skipped = 0;
+
+  for (const day of days) {
+    const dayRows: ApiRecordingRow[] = [];
+    for (const user of scanUsers) {
+      let raw: Array<Record<string, string>>;
+      try {
+        raw = await api.recordingLookup({ agentUser: user, date: day });
+      } catch {
+        continue; // transient failure or agent with no recordings — next cycle retries
+      }
+      for (const r of raw) {
+        const n = normalizeRecordingRow(r);
+        if (!n.startTimeLocal || !n.user || !n.filename) {
+          skipped += 1;
+          continue;
+        }
+        dayRows.push({
+          startTime: localToUtc(n.startTimeLocal, conn.timezone),
+          user: n.user,
+          recordingId: n.recordingId,
+          leadId: n.leadId,
+          lengthSec: n.lengthSec,
+          locationUrl: n.locationUrl,
+          filename: n.filename,
+        });
+      }
+    }
+
+    // group per lead so transfer legs are classified together
+    const byLead = new Map<string, ApiRecordingRow[]>();
+    for (const r of dayRows) {
+      const key = r.leadId != null ? `l:${r.leadId}` : `f:${r.filename}`;
+      const list = byLead.get(key);
+      if (list) list.push(r);
+      else byLead.set(key, [r]);
+    }
+    const entries: Array<{ row: ApiRecordingRow; source: 'vicidial_log' | 'vicidial_closer_log'; inferred: boolean }> = [];
+    for (const rows of byLead.values()) {
+      entries.push(...assignLegSources(rows, (u) => roleByUser.get(u) ?? 'unknown'));
+    }
+
+    // pre-select existing synthesized calls so a later reclassification
+    // (fronter<->closer) updates the row instead of duplicating it
+    const uids = entries.map((e) => syntheticUniqueId(e.row));
+    const existingByUid = new Map<string, { id: string }>();
+    if (uids.length > 0) {
+      for (const c of await db
+        .select({ id: calls.id, uid: calls.viciUniqueId })
+        .from(calls)
+        .where(and(eq(calls.dialerServerId, conn.id), inArray(calls.viciUniqueId, uids)))) {
+        if (c.uid) existingByUid.set(c.uid, { id: c.id });
+      }
+    }
+
+    for (const { row, source, inferred } of entries) {
+      let leadInfo: Record<string, string> | null = null;
+      if (row.leadId != null) {
+        if (leadCache.has(row.leadId)) {
+          leadInfo = leadCache.get(row.leadId) ?? null;
+        } else if (lookups < API_LEAD_LOOKUP_CAP) {
+          lookups += 1;
+          try {
+            leadInfo = await api.leadAllInfo(row.leadId);
+          } catch {
+            leadInfo = null;
+          }
+          leadCache.set(row.leadId, leadInfo);
+        }
+      }
+      const status = leadInfo?.status ? leadInfo.status.trim().toUpperCase() : null;
+      const phone = leadInfo?.phone_number?.trim() || phoneFromFilename(row.filename);
+      const listId = leadInfo?.list_id && /^\d+$/.test(leadInfo.list_id) ? Number(leadInfo.list_id) : null;
+      const uid = syntheticUniqueId(row);
+      const rawPayload = {
+        derivedFrom: 'api_recording_lookup',
+        inferredLeg: inferred,
+        recording: { recording_id: row.recordingId, filename: row.filename },
+        lead_status: status,
+      };
+
+      let callId: string;
+      const existing = existingByUid.get(uid);
+      if (existing) {
+        await db
+          .update(calls)
+          .set({
+            source,
+            status,
+            phoneNumber: phone,
+            lengthSec: row.lengthSec,
+            viciAgentId: idByUser.get(row.user) ?? null,
+            viciUserRaw: row.user,
+            listId,
+            raw: rawPayload,
+            lastSyncedAt: new Date(),
+          })
+          .where(eq(calls.id, existing.id));
+        callId = existing.id;
+      } else {
+        const inserted = await db
+          .insert(calls)
+          .values({
+            companyId: conn.companyId,
+            dialerServerId: conn.id,
+            source,
+            viciLeadId: row.leadId,
+            viciUniqueId: uid,
+            viciAgentId: idByUser.get(row.user) ?? null,
+            viciUserRaw: row.user,
+            phoneNumber: phone,
+            callDate: row.startTime,
+            lengthSec: row.lengthSec,
+            status,
+            listId,
+            raw: rawPayload,
+          })
+          .onConflictDoNothing()
+          .returning({ id: calls.id });
+        if (inserted.length === 0) continue; // raced — next cycle refreshes it
+        callId = inserted[0].id;
+        existingByUid.set(uid, { id: callId });
+        callsImported += 1;
+      }
+
+      await db
+        .insert(recordings)
+        .values({
+          companyId: conn.companyId,
+          dialerServerId: conn.id,
+          callId,
+          viciRecordingId: row.recordingId,
+          viciLeadId: row.leadId,
+          filename: row.filename,
+          locationUrl: row.locationUrl,
+          startTime: row.startTime,
+          lengthSec: row.lengthSec,
+          status: row.locationUrl ? 'available' : 'pending',
+          raw: { source: 'recording_lookup' },
+        })
+        .onConflictDoUpdate({
+          target: [recordings.dialerServerId, recordings.filename],
+          set: {
+            callId,
+            locationUrl: row.locationUrl,
+            lengthSec: row.lengthSec,
+            status: row.locationUrl ? 'available' : 'pending',
+            updatedAt: new Date(),
+          },
+        });
+      recsImported += 1;
+    }
+  }
+
+  stats.api_calls_imported = callsImported;
+  stats.api_recordings = recsImported;
+  stats.api_lead_lookups = lookups;
+  if (skipped > 0) stats.api_rows_skipped = skipped;
+  if (lookups >= API_LEAD_LOOKUP_CAP) {
+    notes.push('lead lookup cap reached — remaining dispositions fill in on the next cycles');
+  }
+  notes.push(
+    'API mode: call dispositions come from the lead status (latest dispo per lead); per-call XFER history is not exposed by the Non-Agent API.',
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Transfers: create -> match -> queue transitions
 // ---------------------------------------------------------------------------
 async function companyMappings(companyId: string): Promise<MappingRow[]> {
@@ -524,12 +809,27 @@ async function companyMappings(companyId: string): Promise<MappingRow[]> {
 
 async function buildTransfers(conn: DialerConnection, stats: SyncStats): Promise<void> {
   const mappings = await companyMappings(conn.companyId);
-  if (mappings.length === 0) {
-    (stats.notes as string[]).push('No disposition mappings configured — transfers cannot be detected.');
-    return;
-  }
-
   const recent = new Date(Date.now() - config.SYNC_HISTORICAL_DAYS * 24 * 3600 * 1000);
+  let created = 0;
+
+  if (mappings.length > 0) {
+    created += await buildTransfersFromMappings(conn, mappings, recent);
+  } else {
+    (stats.notes as string[]).push(
+      'No disposition mappings configured — only structural transfer detection (API mode) can run.',
+    );
+  }
+  if (conn.sourceMode === 'api') {
+    created += await buildTransfersStructurally(conn, recent);
+  }
+  stats.transfers_created = created;
+}
+
+async function buildTransfersFromMappings(
+  conn: DialerConnection,
+  mappings: MappingRow[],
+  recent: Date,
+): Promise<number> {
   const fronterCalls = await db
     .select({
       id: calls.id,
@@ -586,7 +886,91 @@ async function buildTransfers(conn: DialerConnection, stats: SyncStats): Promise
       created += 1;
     }
   }
-  stats.transfers_created = created;
+  return created;
+}
+
+/**
+ * API mode has no per-call XFER disposition (the closer's final dispo
+ * overwrites the lead status), so transfers are also detected structurally:
+ * a fronter-leg call whose lead has a closer-leg call starting within two
+ * hours IS a transfer, and the pair is linked directly (same dialer + same
+ * lead = strong evidence).
+ */
+async function buildTransfersStructurally(conn: DialerConnection, recent: Date): Promise<number> {
+  const closerLeg = alias(calls, 'closer_leg');
+  const pairs = await db
+    .select({
+      fronterId: calls.id,
+      leadId: calls.viciLeadId,
+      phoneNumber: calls.phoneNumber,
+      callDate: calls.callDate,
+      lengthSec: calls.lengthSec,
+      closerId: closerLeg.id,
+      closerDate: closerLeg.callDate,
+    })
+    .from(calls)
+    .innerJoin(
+      closerLeg,
+      and(
+        eq(closerLeg.dialerServerId, calls.dialerServerId),
+        eq(closerLeg.source, 'vicidial_closer_log'),
+        eq(closerLeg.viciLeadId, calls.viciLeadId),
+        gte(closerLeg.callDate, calls.callDate),
+        lte(closerLeg.callDate, sql`${calls.callDate} + interval '2 hours'`),
+      ),
+    )
+    .leftJoin(transfers, eq(transfers.fronterCallId, calls.id))
+    .where(
+      and(
+        eq(calls.dialerServerId, conn.id),
+        eq(calls.source, 'vicidial_log'),
+        eq(calls.isMock, false),
+        gte(calls.callDate, recent),
+        isNull(transfers.id),
+        sql`${calls.viciLeadId} is not null`,
+      ),
+    )
+    .limit(20_000);
+
+  // keep the earliest closer leg per fronter call
+  const byFronter = new Map<string, (typeof pairs)[number]>();
+  for (const p of pairs) {
+    const prev = byFronter.get(p.fronterId);
+    if (!prev || p.closerDate < prev.closerDate) byFronter.set(p.fronterId, p);
+  }
+
+  let created = 0;
+  for (const p of byFronter.values()) {
+    const xferTime = new Date(p.callDate.getTime() + (p.lengthSec ?? 0) * 1000);
+    const inserted = await db
+      .insert(transfers)
+      .values({
+        companyId: conn.companyId,
+        dialerServerId: conn.id,
+        fronterCallId: p.fronterId,
+        closerCallId: p.closerId,
+        xferTime,
+        phoneNumber: p.phoneNumber,
+        viciLeadId: p.leadId,
+        closerLeadId: p.leadId,
+        matchStatus: 'matched',
+        matchConfidence: 85,
+        matchMethod: 'structural-lead',
+        matchNotes: 'same-dialer lead with a closer leg inside the transfer window',
+        queueStatus: 'unclosed',
+      })
+      .onConflictDoNothing({ target: [transfers.fronterCallId] })
+      .returning({ id: transfers.id });
+    if (inserted.length > 0) {
+      await db.insert(transferEvents).values({
+        transferId: inserted[0].id,
+        toStatus: 'unclosed',
+        reason: 'structural detection: closer leg found for the same lead on this dialer',
+      });
+      created += 1;
+    }
+  }
+  return created;
 }
 
 async function matchPendingTransfers(companyId: string, stats: SyncStats): Promise<void> {
@@ -644,6 +1028,9 @@ async function matchPendingTransfers(companyId: string, stats: SyncStats): Promi
       ...DEFAULT_MATCH_OPTIONS,
       autoThreshold: config.MATCH_AUTO_THRESHOLD,
       flagThreshold: config.MATCH_FLAG_THRESHOLD,
+      // warm handoffs: the closer leg often starts while the fronter is still
+      // on the line, well before the fronter leg's end timestamp
+      maxEarlySec: 600,
     };
     const decision = decideMatch(
       {
@@ -740,12 +1127,16 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
     .limit(10_000);
 
   let transitions = 0;
+  const unmapped = new Map<string, number>();
   for (const row of rows) {
     const meaning = resolveMeaning(mappings, {
       dialerServerId: row.closerDialerId,
       campaignId: null,
       dispositionCode: row.closerStatus,
     });
+    if (meaning === null && row.closerStatus) {
+      unmapped.set(row.closerStatus, (unmapped.get(row.closerStatus) ?? 0) + 1);
+    }
     const result = transition(row.transfer.queueStatus, {
       matched: true,
       closerDisposition: row.closerStatus,
@@ -772,6 +1163,13 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
     transitions += 1;
   }
   stats.queue_transitions = transitions;
+  if (unmapped.size > 0) {
+    // surfaces the sale/no-sale codes the admin still needs to map
+    stats.unmapped_closer_statuses = [...unmapped.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([code, n]) => `${code}(${n})`);
+  }
 }
 
 /** Normalizes phone once at import time is avoided — matcher normalizes on the fly. */

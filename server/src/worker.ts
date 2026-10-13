@@ -29,9 +29,11 @@ async function enqueueActiveDialers(): Promise<void> {
       'sync-dialer',
       { dialerServerId: d.id },
       {
-        jobId: `sync:${d.id}`, // dedupe: one in-flight sync per dialer
-        removeOnComplete: 100,
-        removeOnFail: 100,
+        // ':' is forbidden in custom ids; remove on completion so the id
+        // dedupes only while a sync is queued/running, never afterwards.
+        jobId: `sync-${d.id}`,
+        removeOnComplete: true,
+        removeOnFail: true,
         attempts: 3,
         backoff: { type: 'exponential', delay: 10_000 },
       },
