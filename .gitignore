@@ -8,3 +8,5 @@ coverage/
 
 .playwright-mcp/
 *.png
+*.yml.snapshot
+login-snap.md
