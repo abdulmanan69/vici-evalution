@@ -307,7 +307,9 @@ async function setCursor(dialerServerId: string, stream: string, ts: Date): Prom
 }
 
 function initialWindowStart(full?: boolean): Date {
-  const days = full ? config.SYNC_HISTORICAL_DAYS : 1;
+  // no point importing past the retention window — it would be deleted again
+  const cap = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : config.SYNC_HISTORICAL_DAYS;
+  const days = full ? Math.min(config.SYNC_HISTORICAL_DAYS, cap) : 1;
   return new Date(Date.now() - days * 24 * 3600 * 1000);
 }
 
@@ -349,31 +351,47 @@ async function syncCallStream(
   let skippedNoUid = 0;
   let maxSeen: Date | null = null;
 
-  for (;;) {
-    const sinceLocal = utcToLocalString(sinceUtc, conn.timezone);
-    const untilLocal = utcToLocalString(untilUtc, conn.timezone);
-    const rows =
-      source === 'vicidial_log'
-        ? await viciDb.fetchOutboundCalls(sinceLocal, untilLocal, BATCH_LIMIT)
-        : await viciDb.fetchCloserCalls(sinceLocal, untilLocal, BATCH_LIMIT);
-    if (rows.length === 0) break;
+  const runPass = async (archive: boolean, passSinceUtc: Date): Promise<void> => {
+    let cursorUtc = passSinceUtc;
+    for (;;) {
+      const sinceLocal = utcToLocalString(cursorUtc, conn.timezone);
+      const untilLocal = utcToLocalString(untilUtc, conn.timezone);
+      const rows =
+        source === 'vicidial_log'
+          ? await viciDb.fetchOutboundCalls(sinceLocal, untilLocal, BATCH_LIMIT, archive)
+          : await viciDb.fetchCloserCalls(sinceLocal, untilLocal, BATCH_LIMIT, archive);
+      if (rows.length === 0) break;
 
-    for (const row of rows) {
-      const callDateUtc = localToUtc(row.call_date, conn.timezone);
-      if (!maxSeen || callDateUtc > maxSeen) maxSeen = callDateUtc;
-      if (!row.uniqueid) {
-        skippedNoUid += 1;
-        continue;
+      for (const row of rows) {
+        const callDateUtc = localToUtc(row.call_date, conn.timezone);
+        if (!maxSeen || callDateUtc > maxSeen) maxSeen = callDateUtc;
+        if (!row.uniqueid) {
+          skippedNoUid += 1;
+          continue;
+        }
+        await upsertCall(conn, source, row, callDateUtc, agentMap, campMap, groupMap);
+        imported += 1;
       }
-      await upsertCall(conn, source, row, callDateUtc, agentMap, campMap, groupMap);
-      imported += 1;
-    }
 
-    if (rows.length < BATCH_LIMIT) break;
-    // advance window past the last processed row (equal timestamps re-read via overlap)
-    const last = rows[rows.length - 1];
-    sinceUtc = localToUtc(last.call_date, conn.timezone);
+      if (rows.length < BATCH_LIMIT) break;
+      // advance window past the last processed row (equal timestamps re-read via overlap)
+      const last = rows[rows.length - 1];
+      cursorUtc = localToUtc(last.call_date, conn.timezone);
+    }
+  };
+
+  // Full syncs read the *_archive table first: dialers with a nightly archive
+  // job keep little or nothing in the live tables beyond the current day.
+  if (full) {
+    try {
+      await runPass(true, initialWindowStart(full));
+    } catch (err) {
+      (stats.notes as string[]).push(
+        `${source}_archive not readable: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
+  await runPass(false, sinceUtc);
 
   if (maxSeen) await setCursor(conn.id, source, maxSeen);
   stats[`${source}_imported`] = imported;
@@ -448,11 +466,14 @@ async function syncRecordingsFromDb(
   let unlinked = 0;
   let maxSeen: Date | null = null;
 
+  const runPass = async (archive: boolean, passSinceUtc: Date): Promise<void> => {
+  let cursorUtc = passSinceUtc;
   for (;;) {
     const rows = await viciDb.fetchRecordings(
-      utcToLocalString(sinceUtc, conn.timezone),
+      utcToLocalString(cursorUtc, conn.timezone),
       utcToLocalString(untilUtc, conn.timezone),
       BATCH_LIMIT,
+      archive,
     );
     if (rows.length === 0) break;
 
@@ -474,41 +495,41 @@ async function syncRecordingsFromDb(
       if (startUtc && (!maxSeen || startUtc > maxSeen)) maxSeen = startUtc;
       const callId = r.vicidial_id ? (callByUid.get(r.vicidial_id) ?? null) : null;
       if (!callId) unlinked += 1;
-      const now = new Date();
-      await db
-        .insert(recordings)
-        .values({
-          companyId: conn.companyId,
-          dialerServerId: conn.id,
-          callId,
-          viciRecordingId: r.recording_id,
-          viciLeadId: r.lead_id,
+      // either-key upsert: a recording can already exist under the same
+      // recording_id with a different filename (or vice versa) from the
+      // API-era import — a single-key conflict target would abort the job
+      await upsertRecordingByEitherKey(
+        conn,
+        {
+          recordingId: r.recording_id,
+          leadId: r.lead_id,
           filename: r.filename,
           locationUrl: r.location,
           startTime: startUtc,
           lengthSec: r.length_in_sec,
-          status: r.location ? 'available' : 'pending',
-          raw: r,
-        })
-        .onConflictDoUpdate({
-          target: [recordings.dialerServerId, recordings.filename],
-          set: {
-            callId: callId ?? undefined,
-            locationUrl: r.location,
-            lengthSec: r.length_in_sec,
-            status: r.location ? 'available' : 'pending',
-            raw: r,
-            updatedAt: now,
-          },
-        });
+        },
+        callId,
+      );
       imported += 1;
     }
 
     if (rows.length < BATCH_LIMIT) break;
     const last = rows[rows.length - 1];
     if (!last.start_time) break;
-    sinceUtc = localToUtc(last.start_time, conn.timezone);
+    cursorUtc = localToUtc(last.start_time, conn.timezone);
   }
+  };
+
+  if (full) {
+    try {
+      await runPass(true, initialWindowStart(full));
+    } catch (err) {
+      (stats.notes as string[]).push(
+        `recording_log_archive not readable: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  await runPass(false, sinceUtc);
 
   if (maxSeen) await setCursor(conn.id, 'recording_log', maxSeen);
   stats.recordings_imported = imported;

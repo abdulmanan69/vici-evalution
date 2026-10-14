@@ -41,12 +41,17 @@ export class ViciDbClient {
     }
   }
 
-  /** Outbound call legs. `since`/`until` are dialer-local 'YYYY-MM-DD HH:MM:SS'. */
-  async fetchOutboundCalls(since: string, until: string, limit = 5000): Promise<ViciCallRow[]> {
+  /**
+   * Outbound call legs. `since`/`until` are dialer-local 'YYYY-MM-DD HH:MM:SS'.
+   * `archive` reads the *_archive table — dialers with a nightly archive job
+   * keep only the current day in the live tables.
+   */
+  async fetchOutboundCalls(since: string, until: string, limit = 5000, archive = false): Promise<ViciCallRow[]> {
+    const table = archive ? 'vicidial_log_archive' : 'vicidial_log';
     const [rows] = await this.pool.query(
       `SELECT uniqueid, lead_id, list_id, campaign_id, call_date, length_in_sec,
               status, phone_number, user, term_reason
-         FROM vicidial_log
+         FROM ${table}
         WHERE call_date > ? AND call_date <= ?
         ORDER BY call_date ASC
         LIMIT ?`,
@@ -56,11 +61,12 @@ export class ViciDbClient {
   }
 
   /** Closer/inbound call legs (vicidial_closer_log.campaign_id = in-group). */
-  async fetchCloserCalls(since: string, until: string, limit = 5000): Promise<ViciCallRow[]> {
+  async fetchCloserCalls(since: string, until: string, limit = 5000, archive = false): Promise<ViciCallRow[]> {
+    const table = archive ? 'vicidial_closer_log_archive' : 'vicidial_closer_log';
     const [rows] = await this.pool.query(
       `SELECT uniqueid, lead_id, list_id, campaign_id, call_date, length_in_sec,
               status, phone_number, user, term_reason
-         FROM vicidial_closer_log
+         FROM ${table}
         WHERE call_date > ? AND call_date <= ?
         ORDER BY call_date ASC
         LIMIT ?`,
@@ -70,11 +76,12 @@ export class ViciDbClient {
   }
 
   /** recording_log rows; vicidial_id is the uniqueid of the recorded leg. */
-  async fetchRecordings(since: string, until: string, limit = 5000): Promise<ViciRecordingRow[]> {
+  async fetchRecordings(since: string, until: string, limit = 5000, archive = false): Promise<ViciRecordingRow[]> {
+    const table = archive ? 'recording_log_archive' : 'recording_log';
     const [rows] = await this.pool.query(
       `SELECT recording_id, start_time, length_in_sec, filename, location,
               lead_id, user, vicidial_id
-         FROM recording_log
+         FROM ${table}
         WHERE start_time > ? AND start_time <= ?
         ORDER BY start_time ASC
         LIMIT ?`,
