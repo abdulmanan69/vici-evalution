@@ -574,29 +574,20 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
       const filename = r.filename ?? (location ? location.split('/').pop()! : '');
       if (!filename) continue;
       const startLocal = r.start_time ?? r.start ?? null;
-      await db
-        .insert(recordings)
-        .values({
-          companyId: conn.companyId,
-          dialerServerId: conn.id,
-          viciRecordingId: r.recording_id ? Number(r.recording_id) : null,
-          viciLeadId: c.leadId,
+      // either-key upsert — recording_lookup filenames can differ from the
+      // recording_log ones for the same recording_id (format variants)
+      await upsertRecordingByEitherKey(
+        conn,
+        {
+          recordingId: r.recording_id ? Number(r.recording_id) : null,
+          leadId: c.leadId,
           filename,
           locationUrl: location || null,
           startTime: startLocal ? localToUtc(startLocal, conn.timezone) : null,
           lengthSec: r.length_in_sec ? Number(r.length_in_sec) : null,
-          status: location ? 'available' : 'pending',
-          raw: r,
-        })
-        .onConflictDoUpdate({
-          target: [recordings.dialerServerId, recordings.filename],
-          set: {
-            locationUrl: location || null,
-            status: location ? 'available' : 'pending',
-            raw: r,
-            updatedAt: new Date(),
-          },
-        });
+        },
+        null,
+      );
       found += 1;
     }
   }
