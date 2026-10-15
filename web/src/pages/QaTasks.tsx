@@ -6,7 +6,7 @@ import { api, ApiError } from '../api/client';
 import type { PageMeta, QaForm } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { useCompanyScope } from '../components/Layout';
-import { Chip, EmptyState, ErrorState, Field, Loading, PageHeader, Pagination, fmtDateTime } from '../components/ui';
+import { Chip, EmptyState, ErrorState, Field, Loading, PageHeader, Pagination, dialerDayIso, fmtDateTime } from '../components/ui';
 
 type Method = 'transfer' | 'unclosed' | 'closed';
 const METHOD_LABEL: Record<Method, string> = { transfer: 'Transfer', unclosed: 'Unclosed', closed: 'Closed' };
@@ -57,8 +57,9 @@ interface Reviewer {
   status: string;
 }
 
-const todayIso = () => new Date().toISOString().slice(0, 10);
-const daysAgoIso = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+// dates are dialer days (New York), not the reviewer's own calendar
+const todayIso = () => dialerDayIso();
+const daysAgoIso = (n: number) => dialerDayIso(-n);
 
 function ProgressBar({ done, total }: { done: number; total: number }) {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;

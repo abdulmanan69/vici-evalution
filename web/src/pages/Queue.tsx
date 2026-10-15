@@ -3,15 +3,32 @@ import { Link, useParams } from 'react-router-dom';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Download, Search } from 'lucide-react';
 import { api } from '../api/client';
-import type { Dialer, PageMeta, QueueItem } from '../api/types';
+import type { Dialer, PageMeta, QueueItem, Transfer } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
 import { Chip, EmptyState, ErrorState, Loading, PageHeader, Pagination, fmtDateTime, fmtDuration } from '../components/ui';
 
 const TITLES: Record<string, { title: string; subtitle: string }> = {
   transfer: { title: 'Transfers', subtitle: 'Every call a fronter transferred — the full log, with each call’s current state' },
   unclosed: { title: 'Unclosed', subtitle: 'Reached a closer but not yet a configured sale' },
-  closed: { title: 'Closed', subtitle: 'Closer disposition explicitly mapped to sale' },
+  closed: {
+    title: 'Closed',
+    subtitle: "Every sale — transfer, callback and inbound — so the count matches the dialer's SALE column",
+  },
 };
+
+/** How a Closed entry became a sale — together these add up to the dialer's SALE count. */
+export function SaleTypeChip({ transfer }: { transfer: Transfer }) {
+  if (transfer.kind === 'inbound_sale') {
+    return <span className="chip bg-info-soft text-info" title="Reached the closer group with no fronter transfer">Inbound sale</span>;
+  }
+  if (transfer.kind === 'callback_sale') {
+    return <span className="chip bg-amber-soft text-amber-line" title="Closer's own follow-up call, no transfer in the window">Callback sale</span>;
+  }
+  if (transfer.saleCallId) {
+    return <span className="chip bg-brand-soft text-brand" title="Transferred, then sold on a later call of the same lead">Transfer · sold later</span>;
+  }
+  return <span className="chip bg-good-soft text-good" title="Sold on the transfer's closer call">Transfer sale</span>;
+}
 
 export function QueuePage() {
   const { status = 'transfer' } = useParams();
@@ -117,8 +134,9 @@ export function QueuePage() {
           <table className="w-full text-sm">
             <thead className="border-b border-ink/10">
               <tr>
-                <th className="th">Transferred</th>
+                <th className="th">{status === 'closed' ? 'Time' : 'Transferred'}</th>
                 {status === 'transfer' && <th className="th">State</th>}
+                {status === 'closed' && <th className="th">Sale type</th>}
                 <th className="th">Phone</th>
                 <th className="th">Fronter</th>
                 <th className="th">Campaign</th>
@@ -138,10 +156,21 @@ export function QueuePage() {
                       <Chip value={row.transfer.queueStatus} />
                     </td>
                   )}
+                  {status === 'closed' && (
+                    <td className="td">
+                      <SaleTypeChip transfer={row.transfer} />
+                    </td>
+                  )}
                   <td className="td font-mono">{row.transfer.phoneNumber ?? '—'}</td>
                   <td className="td">
-                    <div className="font-medium">{row.fronterAgentName ?? row.fronterCall.viciUserRaw ?? '—'}</div>
-                    <div className="font-mono text-2xs text-ink-3">{row.fronterAgentUser ?? ''}</div>
+                    {row.fronterCall ? (
+                      <>
+                        <div className="font-medium">{row.fronterAgentName ?? row.fronterCall.viciUserRaw ?? '—'}</div>
+                        <div className="font-mono text-2xs text-ink-3">{row.fronterAgentUser ?? ''}</div>
+                      </>
+                    ) : (
+                      <span className="text-2xs text-ink-3">no fronter</span>
+                    )}
                   </td>
                   <td className="td text-ink-2">{row.campaignName ?? row.viciCampaignId ?? '—'}</td>
                   <td className="td">

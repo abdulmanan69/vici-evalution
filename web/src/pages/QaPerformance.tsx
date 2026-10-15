@@ -5,7 +5,7 @@ import { ArrowDown, ArrowUp, Download } from 'lucide-react';
 import { api } from '../api/client';
 import type { QaForm } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
-import { EmptyState, ErrorState, Loading, PageHeader, StatTile } from '../components/ui';
+import { EmptyState, ErrorState, Loading, PageHeader, StatTile, dialerDayIso } from '../components/ui';
 
 type GroupBy = 'agent' | 'reviewer';
 
@@ -47,8 +47,9 @@ interface PerfResponse {
   rows: PerfRow[];
 }
 
-const today = () => new Date().toISOString().slice(0, 10);
-const daysAgo = (n: number) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+// dates are dialer days (New York), not the viewer's own calendar
+const today = () => dialerDayIso();
+const daysAgo = (n: number) => dialerDayIso(-n);
 
 type SortKey = 'name' | 'evaluations' | 'avgPercent' | 'passRate' | 'autoFailed' | 'taskCompletion';
 

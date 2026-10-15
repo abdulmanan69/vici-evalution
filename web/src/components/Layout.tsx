@@ -9,6 +9,7 @@ import {
   Building2,
   CalendarCheck,
   ClipboardList,
+  Clock,
   FileSpreadsheet,
   Gauge,
   Headphones,
@@ -24,6 +25,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext';
 import { api } from '../api/client';
+import { configureTimeZones } from './ui';
 import type { Company } from '../api/types';
 
 /** Super admins can pin the whole console to one company; everyone else is already scoped. */
@@ -96,6 +98,29 @@ export function Layout({ children }: { children: ReactNode }) {
     enabled: isSuperAdmin,
   });
 
+  // Reviewers work in Pakistan while the dialer runs on New York time. Dates
+  // always mean the dialer's day; this switch only changes how clock times
+  // are shown. Default: dialer time, so everything lines up with VICIdial.
+  const dialerTz = user?.dialerTimezone ?? 'UTC';
+  const localTz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const [timeMode, setTimeMode] = useState<'dialer' | 'local'>(() => {
+    try {
+      return localStorage.getItem('qa-time-mode') === 'local' ? 'local' : 'dialer';
+    } catch {
+      return 'dialer';
+    }
+  });
+  configureTimeZones(dialerTz, timeMode);
+  const changeTimeMode = (mode: 'dialer' | 'local') => {
+    setTimeMode(mode);
+    try {
+      localStorage.setItem('qa-time-mode', mode);
+    } catch {
+      // storage unavailable — the choice lasts for this session only
+    }
+  };
+  const zoneLabel = (tz: string) => tz.split('/').pop()?.replace(/_/g, ' ') ?? tz;
+
   return (
     <CompanyScopeContext.Provider value={{ companyId, setCompanyId }}>
       <div className="flex min-h-screen">
@@ -161,28 +186,51 @@ export function Layout({ children }: { children: ReactNode }) {
         </aside>
 
         <div className="ml-56 flex-1">
-          {isSuperAdmin && (
-            <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-ink/10 bg-surface px-6 py-2">
-              <FileSpreadsheet size={14} className="text-ink-3" />
-              <span className="text-2xs font-semibold uppercase tracking-wider text-ink-2">
-                Company scope
-              </span>
-              <select
-                className="input w-64"
-                value={companyId}
-                onChange={(e) => setCompanyId(e.target.value)}
-                aria-label="Company scope"
-              >
-                <option value="">All companies</option>
-                {companiesData?.companies.map((c) => (
-                  <option key={c.id} value={c.id}>
-                    {c.name}
-                  </option>
+          <div className="sticky top-0 z-10 flex flex-wrap items-center gap-2 border-b border-ink/10 bg-surface px-6 py-2">
+            {isSuperAdmin && (
+              <>
+                <FileSpreadsheet size={14} className="text-ink-3" />
+                <span className="text-2xs font-semibold uppercase tracking-wider text-ink-2">Company scope</span>
+                <select
+                  className="input w-64"
+                  value={companyId}
+                  onChange={(e) => setCompanyId(e.target.value)}
+                  aria-label="Company scope"
+                >
+                  <option value="">All companies</option>
+                  {companiesData?.companies.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              </>
+            )}
+            <div className="ml-auto flex items-center gap-2">
+              <Clock size={14} className="text-ink-3" />
+              <span className="text-2xs font-semibold uppercase tracking-wider text-ink-2">Times in</span>
+              <div className="flex rounded-md bg-bg p-0.5" role="radiogroup" aria-label="Show times in">
+                {(['dialer', 'local'] as const).map((m) => (
+                  <button
+                    key={m}
+                    role="radio"
+                    aria-checked={timeMode === m}
+                    onClick={() => changeTimeMode(m)}
+                    className={`rounded px-2.5 py-1 text-2xs font-medium ${
+                      timeMode === m ? 'bg-surface text-brand shadow-card' : 'text-ink-2 hover:text-ink'
+                    }`}
+                    title={m === 'dialer' ? `Dialer clock (${dialerTz}) — matches VICIdial` : `Your clock (${localTz})`}
+                  >
+                    {m === 'dialer' ? `Dialer · ${zoneLabel(dialerTz)}` : `Mine · ${zoneLabel(localTz)}`}
+                  </button>
                 ))}
-              </select>
+              </div>
             </div>
-          )}
-          <main className="mx-auto max-w-[1400px] px-6 py-6">{children}</main>
+          </div>
+          {/* remounting on a time-mode change re-renders every time with the new zone */}
+          <main key={timeMode} className="mx-auto max-w-[1400px] px-6 py-6">
+            {children}
+          </main>
         </div>
       </div>
     </CompanyScopeContext.Provider>

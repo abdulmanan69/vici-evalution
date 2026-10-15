@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query';
 import { api } from '../api/client';
 import type { Dialer } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
-import { EmptyState, ErrorState, Loading, PageHeader } from '../components/ui';
+import { EmptyState, ErrorState, Loading, PageHeader, dialerDayIso } from '../components/ui';
 
 interface ActivityRow {
   user: string;
@@ -54,13 +54,13 @@ function hms(sec: number | null): string {
   return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
-const today = new Date().toISOString().slice(0, 10);
+
 
 export function AgentReportPage() {
   const { companyId } = useCompanyScope();
   const [dialerId, setDialerId] = useState('');
-  const [dateFrom, setDateFrom] = useState(today);
-  const [dateTo, setDateTo] = useState(today);
+  const [dateFrom, setDateFrom] = useState(() => dialerDayIso());
+  const [dateTo, setDateTo] = useState(() => dialerDayIso());
 
   const { data: dialers } = useQuery({
     queryKey: ['dialers', companyId],

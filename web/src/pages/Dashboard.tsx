@@ -13,18 +13,18 @@ import {
 import { api } from '../api/client';
 import type { DashboardStats } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
-import { ErrorState, Loading, PageHeader, StatTile } from '../components/ui';
+import { ErrorState, Loading, PageHeader, StatTile, dialerDayIso } from '../components/ui';
 
 // validated 2-series palette (blue/orange, CVD-safe — see docs/ARCHITECTURE.md)
 const SERIES = { total: '#3B4A9F', closed: '#C97A10' };
 
-const today = new Date().toISOString().slice(0, 10);
+
 
 export function DashboardPage() {
   const { companyId } = useCompanyScope();
   const [preset, setPreset] = useState<'1' | '7' | '15' | '30' | 'custom'>('7');
-  const [customFrom, setCustomFrom] = useState(today);
-  const [customTo, setCustomTo] = useState(today);
+  const [customFrom, setCustomFrom] = useState(() => dialerDayIso());
+  const [customTo, setCustomTo] = useState(() => dialerDayIso());
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   const customReady = preset !== 'custom' || (!!customFrom && !!customTo && customFrom <= customTo);
@@ -94,7 +94,12 @@ export function DashboardPage() {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatTile label="Transfers" value={t.transfers.toLocaleString()} sub="fronter XFER calls" />
         <StatTile label="Unclosed" value={t.unclosed.toLocaleString()} accent="amber" sub="awaiting a sale" />
-        <StatTile label="Closed" value={t.closed.toLocaleString()} accent="good" sub="mapped sale dispositions" />
+        <StatTile
+          label="Closed (sales)"
+          value={t.closed.toLocaleString()}
+          accent="good"
+          sub={`${t.closedFromTransfers} from transfers · ${t.callbackSales} callback · ${t.inboundSales} inbound`}
+        />
         <StatTile label="Close rate" value={`${t.closeRate}%`} sub="closed / all transfers" />
         <StatTile
           label="Flagged matches"

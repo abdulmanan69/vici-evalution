@@ -6,14 +6,18 @@ import { api } from '../api/client';
 import type { Call, Evaluation, QaForm, Recording, TransferEvent, Transfer } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { AudioPlayer } from '../components/AudioPlayer';
+import { SaleTypeChip } from './Queue';
 import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
 type LeadInfo = Record<string, string | number | null>;
 
 interface Detail {
   transfer: Transfer;
-  fronterCall: Call;
+  /** null for sales that had no fronter transfer */
+  fronterCall: Call | null;
   closerCall: Call | null;
+  /** a later call of the lead that carried the sale */
+  saleCall: (Call & { agentName: string | null }) | null;
   lead: LeadInfo | null;
   fronterAgentUser: string | null;
   fronterAgentName: string | null;
@@ -199,8 +203,10 @@ export function TransferDetailPage() {
   if (isError || !data) return <ErrorState message="Transfer could not load." onRetry={() => void refetch()} />;
 
   const t = data.transfer;
-  const fronterRecs = data.recordings.filter((r) => r.callId === data.fronterCall.id);
+  const fronterRecs = data.recordings.filter((r) => data.fronterCall && r.callId === data.fronterCall.id);
   const closerRecs = data.recordings.filter((r) => data.closerCall && r.callId === data.closerCall.id);
+  const saleRecs = data.recordings.filter((r) => data.saleCall && r.callId === data.saleCall.id);
+  const saleOnly = t.kind !== 'transfer';
 
   return (
     <div>
@@ -235,21 +241,35 @@ export function TransferDetailPage() {
         {t.matchNotes && <span className="text-2xs text-ink-3">{t.matchNotes}</span>}
       </div>
 
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="mb-3">
+        <SaleTypeChip transfer={t} />
+      </div>
+      <div className={`grid gap-4 ${data.saleCall ? 'lg:grid-cols-3' : saleOnly ? '' : 'lg:grid-cols-2'}`}>
+        {!saleOnly && (
+          <CallLeg
+            title="Fronter leg"
+            call={data.fronterCall}
+            agentName={data.fronterAgentName}
+            agentUser={data.fronterAgentUser}
+            recordings={fronterRecs}
+          />
+        )}
         <CallLeg
-          title="Fronter leg"
-          call={data.fronterCall}
-          agentName={data.fronterAgentName}
-          agentUser={data.fronterAgentUser}
-          recordings={fronterRecs}
-        />
-        <CallLeg
-          title="Closer leg"
+          title={saleOnly ? (t.kind === 'inbound_sale' ? 'Inbound sale call' : 'Callback sale call') : 'Closer leg'}
           call={data.closerCall}
           agentName={data.closerAgentName}
           agentUser={data.closerAgentUser}
           recordings={closerRecs}
         />
+        {data.saleCall && (
+          <CallLeg
+            title="Sold on a later call"
+            call={data.saleCall}
+            agentName={data.saleCall.agentName}
+            agentUser={data.saleCall.viciUserRaw}
+            recordings={saleRecs}
+          />
+        )}
       </div>
 
       {data.lead && <LeadCard lead={data.lead} />}

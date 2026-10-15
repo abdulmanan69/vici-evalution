@@ -188,15 +188,50 @@ export function StatTile({
   );
 }
 
+/**
+ * Every date filter in the app is a DIALER day. Times can be shown in the
+ * dialer's zone (default, so they line up with VICIdial's reports) or in
+ * the viewer's own zone — set once by the header switch.
+ */
+let dialerTimeZone = 'UTC';
+let displayTimeZone: string | undefined;
+
+export function configureTimeZones(dialerTz: string, mode: 'dialer' | 'local'): void {
+  dialerTimeZone = dialerTz || 'UTC';
+  displayTimeZone = mode === 'dialer' ? dialerTimeZone : undefined;
+}
+
+/** YYYY-MM-DD of the dialer's calendar, offset by whole days (−1 = yesterday). */
+export function dialerDayIso(offsetDays = 0): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: dialerTimeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const get = (t: string) => Number(parts.find((p) => p.type === t)?.value);
+  return new Date(Date.UTC(get('year'), get('month') - 1, get('day') + offsetDays)).toISOString().slice(0, 10);
+}
+
 export function fmtDateTime(iso: string | null | undefined): string {
   if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleString(undefined, {
+  return new Date(iso).toLocaleString(undefined, {
     month: 'short',
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+    timeZone: displayTimeZone,
   });
+}
+
+export function fmtDay(iso: string | null | undefined): string {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString(undefined, { day: '2-digit', month: 'short', timeZone: displayTimeZone });
+}
+
+export function fmtClock(iso: string | null | undefined): string {
+  if (!iso) return '';
+  return new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', timeZone: displayTimeZone });
 }
 
 export function fmtDuration(sec: number | null | undefined): string {

@@ -7,7 +7,7 @@ import type { Evaluation, FormDefinition, FormQuestion, PageMeta } from '../api/
 import { useAuth } from '../auth/AuthContext';
 import { useCompanyScope } from '../components/Layout';
 import { AudioPlayer } from '../components/AudioPlayer';
-import { Chip, EmptyState, ErrorState, Loading, PageHeader, Pagination } from '../components/ui';
+import { Chip, EmptyState, ErrorState, Loading, PageHeader, Pagination, fmtClock, fmtDay } from '../components/ui';
 
 interface Row {
   evaluation: Evaluation;
@@ -82,13 +82,10 @@ function answerCell(q: FormQuestion, answers: Evaluation['answers']): { text: st
   return { text: String(v), sub: '', ratio: 1 };
 }
 
+/** shown in the zone picked in the header (dialer time by default) */
 function dateParts(iso: string | null): { d: string; t: string } {
   if (!iso) return { d: '—', t: '' };
-  const x = new Date(iso);
-  return {
-    d: x.toLocaleDateString(undefined, { day: '2-digit', month: 'short' }),
-    t: x.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }),
-  };
+  return { d: fmtDay(iso), t: fmtClock(iso) };
 }
 
 function Drawer({ id, onClose }: { id: string; onClose: () => void }) {

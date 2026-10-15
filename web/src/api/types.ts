@@ -8,6 +8,8 @@ export interface AuthUser {
   allowedFormIds: string[] | null;
   /** null = every queue; otherwise only these queues are shown */
   allowedQueues: Array<'transfer' | 'unclosed' | 'closed'> | null;
+  /** IANA zone of the company's dialer — every date filter is a day on this clock */
+  dialerTimezone: string;
 }
 
 export interface Company {
@@ -79,8 +81,12 @@ export interface Transfer {
   id: string;
   companyId: string;
   dialerServerId: string;
-  fronterCallId: string;
+  /** transfer = fronter XFER; the sale kinds have no fronter leg */
+  kind: 'transfer' | 'callback_sale' | 'inbound_sale';
+  fronterCallId: string | null;
   closerCallId: string | null;
+  /** a sale on a later call of the lead that closed this transfer */
+  saleCallId: string | null;
   xferTime: string;
   phoneNumber: string | null;
   viciLeadId: number | null;
@@ -95,7 +101,7 @@ export interface Transfer {
 
 export interface QueueItem {
   transfer: Transfer;
-  fronterCall: Call;
+  fronterCall: Call | null;
   fronterAgentUser: string | null;
   fronterAgentName: string | null;
   closerCallDate: string | null;
@@ -204,6 +210,9 @@ export interface DashboardStats {
   timezone: string;
   totals: {
     transfers: number;
+    closedFromTransfers: number;
+    callbackSales: number;
+    inboundSales: number;
     transfer: number;
     unclosed: number;
     closed: number;
