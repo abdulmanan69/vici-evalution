@@ -1,9 +1,10 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
-import { and, count, desc, eq, inArray, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { calls, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
+import { calls, dialerServers, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
+import { localToUtc } from '../vicidial/timezone.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
@@ -23,35 +24,116 @@ const listQuery = paginationSchema.extend({
   status: z.enum(['draft', 'completed']).optional(),
   reviewerId: z.string().uuid().optional(),
   transferId: z.string().uuid().optional(),
+  formId: z.string().uuid().optional(),
+  result: z.enum(['pass', 'fail', 'auto_fail']).optional(),
+  /** matches the evaluated agent's name or user id */
+  agent: z.string().max(60).optional(),
+  /** YYYY-MM-DD = dialer-local day */
+  dateFrom: z.string().max(40).optional(),
+  dateTo: z.string().max(40).optional(),
+  /** reviewers: only my own evaluations */
+  mine: z.coerce.boolean().optional(),
 });
 
 export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
   app.get('/', { preHandler: [requirePermission('qa.view')] }, async (req) => {
     const q = listQuery.parse(req.query);
     const scope = companyScope(req, q.companyId);
+    const fc = alias(calls, 'fc');
+    const cc = alias(calls, 'cc');
+    const fa = alias(viciAgents, 'fa');
+    const ca = alias(viciAgents, 'ca');
+
     const where: SQL[] = [];
     if (scope) where.push(eq(evaluations.companyId, scope));
     if (q.status) where.push(eq(evaluations.status, q.status));
-    if (q.reviewerId) where.push(eq(evaluations.reviewerId, q.reviewerId));
+    if (q.mine) where.push(eq(evaluations.reviewerId, req.auth.userId));
+    else if (q.reviewerId) where.push(eq(evaluations.reviewerId, q.reviewerId));
     if (q.transferId) where.push(eq(evaluations.transferId, q.transferId));
+    if (q.formId) where.push(eq(qaForms.id, q.formId));
+    if (q.result === 'pass') where.push(eq(evaluations.passed, true));
+    if (q.result === 'fail') where.push(and(eq(evaluations.passed, false), eq(evaluations.autoFailed, false))!);
+    if (q.result === 'auto_fail') where.push(eq(evaluations.autoFailed, true));
+    if (q.agent) {
+      const pat = `%${q.agent}%`;
+      where.push(
+        sql`(${fa.fullName} ilike ${pat} or ${fa.viciUser} ilike ${pat} or ${ca.fullName} ilike ${pat} or ${ca.viciUser} ilike ${pat})`,
+      );
+    }
+    if (q.dateFrom || q.dateTo) {
+      // plain dates mean the dialer's day, like everywhere else
+      const [dialerRow] = await db
+        .select()
+        .from(dialerServers)
+        .where(scope ? eq(dialerServers.companyId, scope) : eq(dialerServers.active, true))
+        .limit(1);
+      const tz = dialerRow?.timezone ?? 'UTC';
+      const evDate = sql`coalesce(${evaluations.completedAt}, ${evaluations.createdAt})`;
+      const parseDay = (v: string, end: boolean): Date =>
+        /^\d{4}-\d{2}-\d{2}$/.test(v) ? localToUtc(`${v} ${end ? '23:59:59' : '00:00:00'}`, tz) : new Date(v);
+      if (q.dateFrom) where.push(sql`${evDate} >= ${parseDay(q.dateFrom, false)}`);
+      if (q.dateTo) where.push(sql`${evDate} <= ${parseDay(q.dateTo, true)}`);
+    }
     const whereAll = where.length ? and(...where) : undefined;
-    const [total] = await db.select({ n: count() }).from(evaluations).where(whereAll);
+
+    const [total] = await db
+      .select({ n: count() })
+      .from(evaluations)
+      .innerJoin(users, eq(evaluations.reviewerId, users.id))
+      .innerJoin(qaFormVersions, eq(evaluations.formVersionId, qaFormVersions.id))
+      .innerJoin(qaForms, eq(qaFormVersions.formId, qaForms.id))
+      .leftJoin(transfers, eq(evaluations.transferId, transfers.id))
+      .leftJoin(fc, eq(transfers.fronterCallId, fc.id))
+      .leftJoin(fa, eq(fc.viciAgentId, fa.id))
+      .leftJoin(cc, eq(transfers.closerCallId, cc.id))
+      .leftJoin(ca, eq(cc.viciAgentId, ca.id))
+      .where(whereAll);
+
     const rows = await db
       .select({
         evaluation: evaluations,
         reviewerName: users.name,
         formName: qaForms.name,
+        formTarget: qaForms.target,
+        formId: qaForms.id,
         formVersion: qaFormVersions.version,
+        formVersionId: qaFormVersions.id,
+        phone: transfers.phoneNumber,
+        callTime: transfers.xferTime,
+        queueStatus: transfers.queueStatus,
+        fronterAgent: fa.fullName,
+        fronterUser: fa.viciUser,
+        closerAgent: ca.fullName,
+        closerUser: ca.viciUser,
+        hasRecording: sql<boolean>`exists(select 1 from recordings r where r.call_id in (${fc.id}, ${cc.id}) and r.status = 'available')`,
       })
       .from(evaluations)
       .innerJoin(users, eq(evaluations.reviewerId, users.id))
       .innerJoin(qaFormVersions, eq(evaluations.formVersionId, qaFormVersions.id))
       .innerJoin(qaForms, eq(qaFormVersions.formId, qaForms.id))
+      .leftJoin(transfers, eq(evaluations.transferId, transfers.id))
+      .leftJoin(fc, eq(transfers.fronterCallId, fc.id))
+      .leftJoin(fa, eq(fc.viciAgentId, fa.id))
+      .leftJoin(cc, eq(transfers.closerCallId, cc.id))
+      .leftJoin(ca, eq(cc.viciAgentId, ca.id))
       .where(whereAll)
-      .orderBy(desc(evaluations.createdAt))
+      .orderBy(desc(sql`coalesce(${evaluations.completedAt}, ${evaluations.createdAt})`))
       .limit(q.pageSize)
       .offset(offsetOf(q));
-    return { evaluations: rows, meta: pageMeta(q, total.n) };
+
+    // ship the question definitions of the versions on this page so the UI
+    // can render one column per scored question
+    const versionIds = [...new Set(rows.map((r) => r.formVersionId))];
+    const forms: Record<string, unknown> = {};
+    if (versionIds.length > 0) {
+      for (const v of await db
+        .select()
+        .from(qaFormVersions)
+        .where(inArray(qaFormVersions.id, versionIds))) {
+        forms[v.id] = { version: v.version, schema: v.schema };
+      }
+    }
+    return { evaluations: rows, forms, meta: pageMeta(q, total.n) };
   });
 
   app.get('/:id', { preHandler: [requirePermission('qa.view')] }, async (req) => {

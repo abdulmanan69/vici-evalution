@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
-import { and, count, desc, eq, gte, lte, sum, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, lte, sql, sum, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { calls, dialerServers, evaluations, qaFormVersions, qaForms, transfers, users, viciAgents } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
@@ -354,44 +354,113 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get('/evaluations.csv', { preHandler: [requirePermission('reports.export')] }, async (req, reply) => {
-    const q = exportQuery.parse(req.query);
+    const q = z
+      .object({
+        companyId: z.string().uuid().optional(),
+        formId: z.string().uuid().optional(),
+        reviewerId: z.string().uuid().optional(),
+        result: z.enum(['pass', 'fail', 'auto_fail']).optional(),
+        agent: z.string().max(60).optional(),
+        dateFrom: z.string().max(40).optional(),
+        dateTo: z.string().max(40).optional(),
+      })
+      .parse(req.query);
     const scope = companyScope(req, q.companyId);
+    const fc = alias(calls, 'efc');
+    const cc = alias(calls, 'ecc');
+    const fa = alias(viciAgents, 'efa');
+    const ca = alias(viciAgents, 'eca');
+
+    const [dialerRow] = await db
+      .select()
+      .from(dialerServers)
+      .where(scope ? eq(dialerServers.companyId, scope) : eq(dialerServers.active, true))
+      .limit(1);
+    const tz = dialerRow?.timezone ?? 'UTC';
+
     const where: SQL[] = [eq(evaluations.status, 'completed')];
     if (scope) where.push(eq(evaluations.companyId, scope));
-    if (q.dateFrom) where.push(gte(evaluations.completedAt, q.dateFrom));
-    if (q.dateTo) where.push(lte(evaluations.completedAt, q.dateTo));
+    if (q.formId) where.push(eq(qaForms.id, q.formId));
+    if (q.reviewerId) where.push(eq(evaluations.reviewerId, q.reviewerId));
+    if (q.result === 'pass') where.push(eq(evaluations.passed, true));
+    if (q.result === 'fail') where.push(and(eq(evaluations.passed, false), eq(evaluations.autoFailed, false))!);
+    if (q.result === 'auto_fail') where.push(eq(evaluations.autoFailed, true));
+    if (q.agent) {
+      const pat = `%${q.agent}%`;
+      where.push(
+        sql`(${fa.fullName} ilike ${pat} or ${fa.viciUser} ilike ${pat} or ${ca.fullName} ilike ${pat} or ${ca.viciUser} ilike ${pat})`,
+      );
+    }
+    const parseDay = (v: string, end: boolean) =>
+      /^\d{4}-\d{2}-\d{2}$/.test(v) ? localToUtc(`${v} ${end ? '23:59:59' : '00:00:00'}`, tz) : new Date(v);
+    if (q.dateFrom) where.push(gte(evaluations.completedAt, parseDay(q.dateFrom, false)));
+    if (q.dateTo) where.push(lte(evaluations.completedAt, parseDay(q.dateTo, true)));
 
     const rows = await db
       .select({
-        completedAt: evaluations.completedAt,
-        score: evaluations.score,
-        maxScore: evaluations.maxScore,
-        percent: evaluations.percent,
-        passed: evaluations.passed,
-        autoFailed: evaluations.autoFailed,
+        evaluation: evaluations,
         reviewer: users.name,
         formName: qaForms.name,
+        formTarget: qaForms.target,
         formVersion: qaFormVersions.version,
-        agentUser: viciAgents.viciUser,
-        agentName: viciAgents.fullName,
+        formVersionId: qaFormVersions.id,
+        schema: qaFormVersions.schema,
+        phone: transfers.phoneNumber,
+        fronterAgent: fa.fullName,
+        fronterUser: fa.viciUser,
+        closerAgent: ca.fullName,
+        closerUser: ca.viciUser,
       })
       .from(evaluations)
       .innerJoin(users, eq(evaluations.reviewerId, users.id))
       .innerJoin(qaFormVersions, eq(evaluations.formVersionId, qaFormVersions.id))
       .innerJoin(qaForms, eq(qaFormVersions.formId, qaForms.id))
-      .leftJoin(viciAgents, eq(evaluations.targetAgentId, viciAgents.id))
+      .leftJoin(transfers, eq(evaluations.transferId, transfers.id))
+      .leftJoin(fc, eq(transfers.fronterCallId, fc.id))
+      .leftJoin(fa, eq(fc.viciAgentId, fa.id))
+      .leftJoin(cc, eq(transfers.closerCallId, cc.id))
+      .leftJoin(ca, eq(cc.viciAgentId, ca.id))
       .where(and(...where))
       .orderBy(desc(evaluations.completedAt))
       .limit(EXPORT_LIMIT);
 
-    await audit(req, { action: 'report.export_evaluations', after: { rows: rows.length } });
-    const csv = toCsv(
-      ['completed_at', 'score', 'max_score', 'percent', 'passed', 'auto_failed', 'reviewer', 'form', 'form_version', 'agent_user', 'agent_name'],
-      rows.map((r) => [
-        r.completedAt, r.score, r.maxScore, r.percent, r.passed, r.autoFailed,
-        r.reviewer, r.formName, r.formVersion, r.agentUser, r.agentName,
-      ]),
-    );
+    // one column per scored question when a single form is exported —
+    // columns come from the newest version, answers matched by question id
+    type Q = { id: string; text: string; type: string; weight: number; scaleMax?: number; options?: Array<{ value: string; label: string; scorePct: number }> };
+    let questionCols: Q[] = [];
+    if (q.formId && rows.length > 0) {
+      const newest = rows.reduce((a, b) => (a.formVersion >= b.formVersion ? a : b));
+      const schema = newest.schema as { sections: Array<{ questions: Q[] }> };
+      questionCols = schema.sections.flatMap((s) => s.questions).filter((qq) => qq.weight > 0);
+    }
+
+    const header = [
+      'date', 'time', 'number', 'agent', 'evaluator', 'method', 'result', 'score_percent',
+      ...questionCols.map((qq) => `${qq.text} (/${qq.weight})`),
+      'comments',
+    ];
+    const body = rows.map((r) => {
+      const local = r.evaluation.completedAt ? utcToLocalString(r.evaluation.completedAt, tz) : '';
+      const agent = r.formTarget === 'fronter' ? (r.fronterAgent ?? r.fronterUser) : (r.closerAgent ?? r.closerUser);
+      const answers = (r.evaluation.answers ?? {}) as Record<string, unknown>;
+      const qCells = questionCols.map((qq) => {
+        const v = answers[qq.id];
+        if (v === null || v === undefined || v === '') return '';
+        if (qq.type === 'rating') return `${v}/${qq.scaleMax ?? 5}`;
+        if (qq.type === 'dropdown') return qq.options?.find((o) => o.value === String(v))?.label ?? String(v);
+        return String(v);
+      });
+      return [
+        local.slice(0, 10), local.slice(11, 16), r.phone, agent, r.reviewer, `${r.formName} v${r.formVersion}`,
+        r.evaluation.autoFailed ? 'auto-fail' : r.evaluation.passed ? 'pass' : 'fail',
+        r.evaluation.percent,
+        ...qCells,
+        r.evaluation.comments,
+      ];
+    });
+
+    await audit(req, { action: 'report.export_evaluations', after: { rows: rows.length, formId: q.formId ?? null } });
+    const csv = toCsv(header, body);
     reply.header('content-type', 'text/csv; charset=utf-8');
     reply.header('content-disposition', 'attachment; filename="evaluations.csv"');
     return reply.send(csv);
