@@ -543,7 +543,12 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     return;
   }
   const api = new ViciApiClient(conn);
-  const lookback = new Date(Date.now() - config.SYNC_LOOKBACK_MINUTES * 4 * 60 * 1000);
+  // cover the whole retention window — recording_log can be empty on hosted
+  // dialers, so this lookup is the recording source and must reach past days.
+  // Transfer legs come first (those are the calls QA actually reviews); the
+  // 300-lead cap drains the backlog across cycles without stalling a sync.
+  const lookbackDays = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : 7;
+  const lookback = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000);
 
   const candidates = await db
     .select({ leadId: calls.viciLeadId })
@@ -552,13 +557,18 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     .where(
       and(
         eq(calls.dialerServerId, conn.id),
+        eq(calls.isMock, false),
         gte(calls.callDate, lookback),
         isNull(recordings.id),
         sql`${calls.viciLeadId} is not null`,
       ),
     )
     .groupBy(calls.viciLeadId)
-    .limit(200);
+    .orderBy(
+      sql`max((exists(select 1 from transfers t where t.fronter_call_id = ${calls.id} or t.closer_call_id = ${calls.id}))::int) desc`,
+      sql`max(${calls.callDate}) desc`,
+    )
+    .limit(300);
 
   let found = 0;
   for (const c of candidates) {
@@ -569,11 +579,32 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     } catch {
       continue; // transient API failure — retried next cycle
     }
+    // the lead's call legs, so each recording links to the right one
+    const leadCalls = await db
+      .select({ id: calls.id, callDate: calls.callDate })
+      .from(calls)
+      .where(
+        and(eq(calls.dialerServerId, conn.id), eq(calls.viciLeadId, c.leadId), eq(calls.isMock, false)),
+      )
+      .limit(50);
     for (const r of rows) {
       const location = r.location ?? r.url ?? '';
       const filename = r.filename ?? (location ? location.split('/').pop()! : '');
       if (!filename) continue;
       const startLocal = r.start_time ?? r.start ?? null;
+      const startTime = startLocal ? localToUtc(startLocal, conn.timezone) : null;
+      // link to the lead's nearest call leg within 15 minutes
+      let bestId: string | null = null;
+      if (startTime) {
+        let bestDelta = 15 * 60_000;
+        for (const lc of leadCalls) {
+          const delta = Math.abs(lc.callDate.getTime() - startTime.getTime());
+          if (delta <= bestDelta) {
+            bestDelta = delta;
+            bestId = lc.id;
+          }
+        }
+      }
       // either-key upsert — recording_lookup filenames can differ from the
       // recording_log ones for the same recording_id (format variants)
       await upsertRecordingByEitherKey(
@@ -583,10 +614,10 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
           leadId: c.leadId,
           filename,
           locationUrl: location || null,
-          startTime: startLocal ? localToUtc(startLocal, conn.timezone) : null,
+          startTime,
           lengthSec: r.length_in_sec ? Number(r.length_in_sec) : null,
         },
-        null,
+        bestId,
       );
       found += 1;
     }

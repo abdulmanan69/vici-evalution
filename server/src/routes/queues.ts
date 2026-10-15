@@ -18,6 +18,7 @@ import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { scoreCandidate, DEFAULT_MATCH_OPTIONS } from '../vicidial/matcher.js';
+import { localToUtc } from '../vicidial/timezone.js';
 
 const fronterCall = alias(calls, 'fronter_call');
 const closerCall = alias(calls, 'closer_call');
@@ -29,8 +30,9 @@ const listQuery = paginationSchema.extend({
   dialerServerId: z.string().uuid().optional(),
   campaignId: z.string().uuid().optional(),
   matchStatus: z.enum(['pending_match', 'matched', 'flagged', 'unmatched']).optional(),
-  dateFrom: z.coerce.date().optional(),
-  dateTo: z.coerce.date().optional(),
+  // YYYY-MM-DD = dialer-local day (like VICIdial's own reports); ISO datetimes also accepted
+  dateFrom: z.string().max(40).optional(),
+  dateTo: z.string().max(40).optional(),
   search: z.string().max(60).optional(), // phone or lead id
   includeMock: z.coerce.boolean().default(false),
 });
@@ -55,8 +57,25 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     if (q.dialerServerId) where.push(eq(transfers.dialerServerId, q.dialerServerId));
     if (q.campaignId) where.push(eq(fronterCall.campaignId, q.campaignId));
     if (q.matchStatus) where.push(eq(transfers.matchStatus, q.matchStatus));
-    if (q.dateFrom) where.push(gte(transfers.xferTime, q.dateFrom));
-    if (q.dateTo) where.push(lte(transfers.xferTime, q.dateTo));
+    if (q.dateFrom || q.dateTo) {
+      // plain dates mean the DIALER's day, so queue day-counts line up with
+      // the agent report and VICIdial's own reports
+      let tz = 'UTC';
+      const [dialerRow] = q.dialerServerId
+        ? await db.select().from(dialerServers).where(eq(dialerServers.id, q.dialerServerId))
+        : await db
+            .select()
+            .from(dialerServers)
+            .where(scope ? eq(dialerServers.companyId, scope) : eq(dialerServers.active, true))
+            .limit(1);
+      if (dialerRow) tz = dialerRow.timezone;
+      const parseDay = (v: string, endOfDay: boolean): Date =>
+        /^\d{4}-\d{2}-\d{2}$/.test(v)
+          ? localToUtc(`${v} ${endOfDay ? '23:59:59' : '00:00:00'}`, tz)
+          : new Date(v);
+      if (q.dateFrom) where.push(gte(transfers.xferTime, parseDay(q.dateFrom, false)));
+      if (q.dateTo) where.push(lte(transfers.xferTime, parseDay(q.dateTo, true)));
+    }
     if (!q.includeMock) where.push(eq(transfers.isMock, false));
     if (q.search) {
       const digits = q.search.replace(/\D/g, '');

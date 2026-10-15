@@ -44,8 +44,9 @@ export function QueuePage() {
           search: search || undefined,
           dialerServerId: dialerId || undefined,
           matchStatus: matchStatus || undefined,
-          dateFrom: dateFrom ? new Date(dateFrom).toISOString() : undefined,
-          dateTo: dateTo ? new Date(`${dateTo}T23:59:59`).toISOString() : undefined,
+          // plain dates: the server interprets them as the dialer's day
+          dateFrom: dateFrom || undefined,
+          dateTo: dateTo || undefined,
         },
       }),
     placeholderData: keepPreviousData,
