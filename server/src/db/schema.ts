@@ -380,6 +380,9 @@ export const qaForms = pgTable(
     name: text('name').notNull(),
     description: text('description'),
     target: formTargetEnum('target').notNull().default('any'),
+    // the queue this form evaluates (null = any queue); drives which queues
+    // a reviewer restricted to this form may see
+    queue: queueStatusEnum('queue'),
     campaignId: uuid('campaign_id').references(() => campaigns.id),
     state: formStateEnum('state').notNull().default('draft'),
     currentVersion: integer('current_version').notNull().default(0),

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { Plus } from 'lucide-react';
 import { api } from '../api/client';
@@ -15,6 +15,7 @@ export function FormsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [name, setName] = useState('');
   const [target, setTarget] = useState<'fronter' | 'closer' | 'any'>('closer');
+  const [queue, setQueue] = useState<'' | 'transfer' | 'unclosed' | 'closed'>('');
   const [description, setDescription] = useState('');
 
   const { data, isLoading, isError, refetch } = useQuery({
@@ -26,12 +27,21 @@ export function FormsPage() {
     mutationFn: () =>
       api<{ form: QaForm }>('/qa/forms', {
         method: 'POST',
-        body: { name, target, description: description || undefined, companyId: companyId || undefined },
+        body: {
+          name,
+          target,
+          queue: queue || null,
+          description: description || undefined,
+          companyId: companyId || undefined,
+        },
       }),
     onSuccess: (res) => navigate(`/qa/forms/${res.form.id}`),
   });
 
   const createBlocked = isSuperAdmin && !companyId;
+
+  // the builder is a manager tool; reviewers reach forms through evaluations
+  if (!hasPerm('qa.forms.manage')) return <Navigate to="/" replace />;
 
   return (
     <div>
@@ -106,6 +116,14 @@ export function FormsPage() {
                 <option value="closer">Closers</option>
                 <option value="fronter">Fronters</option>
                 <option value="any">Any agent</option>
+              </select>
+            </Field>
+            <Field label="Queue" hint="Reviewers limited to this form only see this queue.">
+              <select className="input" value={queue} onChange={(e) => setQueue(e.target.value as typeof queue)}>
+                <option value="">Any queue</option>
+                <option value="transfer">Transfers</option>
+                <option value="unclosed">Unclosed</option>
+                <option value="closed">Closed</option>
               </select>
             </Field>
             <Field label="Description (optional)">

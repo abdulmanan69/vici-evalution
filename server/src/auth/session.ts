@@ -1,6 +1,6 @@
-import { and, eq, gt } from 'drizzle-orm';
+import { and, eq, gt, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { roles, sessions, users } from '../db/schema.js';
+import { qaForms, roles, sessions, users } from '../db/schema.js';
 import { config } from '../config.js';
 import { newSessionToken, sha256, verifyPassword } from '../lib/crypto.js';
 
@@ -13,6 +13,22 @@ export interface AuthContext {
   permissions: string[];
   /** non-empty = the only QA forms this reviewer may see and use */
   allowedFormIds: string[] | null;
+  /** derived from allowedFormIds: the only queues this reviewer may see; null = all */
+  allowedQueues: Array<'transfer' | 'unclosed' | 'closed'> | null;
+}
+
+/**
+ * A reviewer limited to specific forms only sees those forms' queues. A form
+ * with no queue set applies anywhere, so it lifts the queue restriction.
+ */
+async function withAllowedQueues(auth: AuthContext): Promise<AuthContext> {
+  if (!auth.allowedFormIds) return auth;
+  const forms = await db
+    .select({ queue: qaForms.queue })
+    .from(qaForms)
+    .where(inArray(qaForms.id, auth.allowedFormIds));
+  if (forms.length === 0 || forms.some((f) => f.queue === null)) return auth;
+  return { ...auth, allowedQueues: [...new Set(forms.map((f) => f.queue!))] };
 }
 
 export interface LoginResult {
@@ -51,7 +67,7 @@ export async function login(
   return {
     token,
     expiresAt,
-    auth: toAuthContext(row.user, row.role),
+    auth: await withAllowedQueues(toAuthContext(row.user, row.role)),
   };
 }
 
@@ -65,7 +81,7 @@ export async function resolveSession(token: string): Promise<AuthContext | null>
     .where(and(eq(sessions.tokenHash, tokenHash), gt(sessions.expiresAt, new Date())));
   const row = rows[0];
   if (!row || row.user.status !== 'active') return null;
-  return toAuthContext(row.user, row.role);
+  return withAllowedQueues(toAuthContext(row.user, row.role));
 }
 
 export async function logout(token: string): Promise<void> {
@@ -88,5 +104,6 @@ function toAuthContext(
     roleName: role.name,
     permissions: role.permissions,
     allowedFormIds: user.allowedFormIds && user.allowedFormIds.length > 0 ? user.allowedFormIds : null,
+    allowedQueues: null,
   };
 }

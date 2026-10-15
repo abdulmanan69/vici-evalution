@@ -56,7 +56,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
   {
     group: 'Quality',
     items: [
-      { to: '/qa/forms', label: 'QA forms', icon: <ClipboardList size={16} />, perm: 'qa.view' },
+      { to: '/qa/forms', label: 'QA forms', icon: <ClipboardList size={16} />, perm: 'qa.forms.manage' },
       { to: '/qa/evaluations', label: 'Evaluations', icon: <ListChecks size={16} />, perm: 'qa.view' },
       { to: '/reports/agents', label: 'Agent report', icon: <BarChart3 size={16} />, perm: 'reports.view' },
     ],
@@ -100,7 +100,15 @@ export function Layout({ children }: { children: ReactNode }) {
           </div>
           <nav className="flex-1 overflow-y-auto px-2 pb-4">
             {NAV.map((group) => {
-              const visible = group.items.filter((i) => !i.perm || hasPerm(i.perm));
+              const visible = group.items.filter((i) => {
+                if (i.perm && !hasPerm(i.perm)) return false;
+                // a reviewer limited to certain methods only sees those queues
+                const queue = i.to.match(/^\/queues\/(\w+)$/)?.[1];
+                if (queue && user?.allowedQueues && !hasPerm('qa.forms.manage')) {
+                  return user.allowedQueues.includes(queue as 'transfer' | 'unclosed' | 'closed');
+                }
+                return true;
+              });
               if (visible.length === 0) return null;
               return (
                 <div key={group.group} className="mt-4">

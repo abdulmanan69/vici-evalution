@@ -5,6 +5,9 @@ export interface AuthUser {
   companyId: string | null;
   roleName: string;
   permissions: string[];
+  allowedFormIds: string[] | null;
+  /** null = every queue; otherwise only these queues are shown */
+  allowedQueues: Array<'transfer' | 'unclosed' | 'closed'> | null;
 }
 
 export interface Company {
@@ -129,6 +132,7 @@ export interface QaForm {
   name: string;
   description: string | null;
   target: 'fronter' | 'closer' | 'any';
+  queue: 'transfer' | 'unclosed' | 'closed' | null;
   state: 'draft' | 'published' | 'archived';
   currentVersion: number;
   draftSchema: FormDefinition | null;

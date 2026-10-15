@@ -14,6 +14,7 @@ const formMetaSchema = z.object({
   name: z.string().min(2).max(200),
   description: z.string().max(2000).optional(),
   target: z.enum(['fronter', 'closer', 'any']).default('any'),
+  queue: z.enum(['transfer', 'unclosed', 'closed']).nullable().optional(),
   campaignId: z.string().uuid().nullable().optional(),
   passThreshold: z.number().min(0).max(100).default(80),
 });
@@ -39,7 +40,9 @@ export async function qaFormRoutes(app: FastifyInstance): Promise<void> {
     return { forms: rows };
   });
 
-  app.get('/:id', { preHandler: [requirePermission('qa.view')] }, async (req) => {
+  // the builder is a manager tool — reviewers get the form schema through
+  // their evaluation, never by browsing forms
+  app.get('/:id', { preHandler: [requirePermission('qa.forms.manage')] }, async (req) => {
     const { id } = req.params as { id: string };
     const [form] = await db.select().from(qaForms).where(eq(qaForms.id, id));
     if (!form) throw new NotFoundError('Form not found');
@@ -58,7 +61,7 @@ export async function qaFormRoutes(app: FastifyInstance): Promise<void> {
     return { form, versions };
   });
 
-  app.get('/:id/versions/:version', { preHandler: [requirePermission('qa.view')] }, async (req) => {
+  app.get('/:id/versions/:version', { preHandler: [requirePermission('qa.forms.manage')] }, async (req) => {
     const { id, version } = req.params as { id: string; version: string };
     const [form] = await db.select().from(qaForms).where(eq(qaForms.id, id));
     if (!form) throw new NotFoundError('Form not found');
@@ -81,6 +84,7 @@ export async function qaFormRoutes(app: FastifyInstance): Promise<void> {
         name: body.name,
         description: body.description ?? null,
         target: body.target,
+        queue: body.queue ?? null,
         campaignId: body.campaignId ?? null,
         state: 'draft',
         draftSchema: { sections: [] },
@@ -122,6 +126,7 @@ export async function qaFormRoutes(app: FastifyInstance): Promise<void> {
         name: body.name ?? before.name,
         description: body.description ?? before.description,
         target: body.target ?? before.target,
+        queue: body.queue !== undefined ? body.queue : before.queue,
         campaignId: body.campaignId !== undefined ? body.campaignId : before.campaignId,
         state: body.state ?? before.state,
         draftSchema,

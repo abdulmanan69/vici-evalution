@@ -300,7 +300,7 @@ export function TransferDetailPage() {
       <Modal title="Start evaluation" open={evalModal} onClose={() => setEvalModal(false)}>
         <p className="mb-3 text-sm text-ink-2">Choose a published QA form for this call.</p>
         <div className="space-y-2">
-          {formsData?.forms.map((f) => (
+          {formsData?.forms.filter((f) => !f.queue || f.queue === t.queueStatus).map((f) => (
             <button
               key={f.id}
               className="card flex w-full items-center justify-between p-3 text-left hover:bg-bg"
@@ -314,9 +314,9 @@ export function TransferDetailPage() {
               <span className="text-brand">Use →</span>
             </button>
           ))}
-          {formsData && formsData.forms.length === 0 && (
+          {formsData && formsData.forms.filter((f) => !f.queue || f.queue === t.queueStatus).length === 0 && (
             <p className="text-sm text-ink-2">
-              No published forms for this company yet. Create one under QA forms.
+              No evaluation method for this queue is available to you.
             </p>
           )}
         </div>

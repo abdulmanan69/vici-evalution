@@ -15,12 +15,22 @@ import {
 } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
-import { NotFoundError, ValidationError } from '../lib/errors.js';
+import { ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
+import { hasPermission } from '../auth/permissions.js';
+import type { AuthContext } from '../auth/session.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { scoreCandidate, DEFAULT_MATCH_OPTIONS } from '../vicidial/matcher.js';
 import { localToUtc } from '../vicidial/timezone.js';
 import { toConnection } from '../vicidial/credentials.js';
 import { getPooledDbClient } from '../vicidial/dbPool.js';
+
+/** A reviewer limited to certain forms only reaches the matching queues. */
+function assertQueueAllowed(auth: AuthContext, queue: string): void {
+  if (!auth.allowedQueues || hasPermission(auth.permissions, 'qa.forms.manage')) return;
+  if (!auth.allowedQueues.includes(queue as 'transfer' | 'unclosed' | 'closed')) {
+    throw new ForbiddenError('This queue is not assigned to you');
+  }
+}
 
 const fronterCall = alias(calls, 'fronter_call');
 const closerCall = alias(calls, 'closer_call');
@@ -45,6 +55,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     if (!['transfer', 'unclosed', 'closed'].includes(status)) {
       throw new ValidationError('Queue must be transfer, unclosed or closed');
     }
+    assertQueueAllowed(req.auth, status);
     const q = listQuery.parse(req.query);
     const scope = companyScope(req, q.companyId);
 
@@ -149,6 +160,10 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(transfers.id, transferId));
     if (!row) throw new NotFoundError('Transfer not found');
     companyScope(req, row.transfer.companyId);
+    // the Transfers queue lists every transfer, so access to it covers any call
+    if (!req.auth.allowedQueues?.includes('transfer')) {
+      assertQueueAllowed(req.auth, row.transfer.queueStatus);
+    }
 
     const callIds = [row.fronterCall.id, row.closerCall?.id].filter((x): x is string => !!x);
     const recRows = await db

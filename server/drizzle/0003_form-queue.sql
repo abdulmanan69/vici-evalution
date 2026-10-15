@@ -1,0 +1,1 @@
+ALTER TABLE "qa_forms" ADD COLUMN "queue" "queue_status";

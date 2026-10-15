@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useParams } from 'react-router-dom';
+import { Navigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ArrowDown, ArrowUp, Plus, Save, Trash2, UploadCloud } from 'lucide-react';
 import { api, ApiError } from '../api/client';
@@ -291,8 +291,20 @@ export function FormBuilderPage() {
     onError: (err) => setMessage(err instanceof ApiError ? err.message : 'Publish failed.'),
   });
 
+  // the builder is a manager tool; reviewers reach forms through evaluations
+  if (readOnly) return <Navigate to="/" replace />;
   if (isLoading) return <Loading />;
   if (isError || !data) return <ErrorState message="Form could not load." onRetry={() => void refetch()} />;
+
+  const setQueue = async (queue: string) => {
+    try {
+      await api(`/qa/forms/${id}`, { method: 'PATCH', body: { queue: queue || null } });
+      setMessage('Queue saved.');
+      void queryClient.invalidateQueries({ queryKey: ['form', id] });
+    } catch (err) {
+      setMessage(err instanceof ApiError ? err.message : 'Saving the queue failed.');
+    }
+  };
 
   const totalWeight = def.sections
     .flatMap((s) => s.questions)
@@ -308,6 +320,20 @@ export function FormBuilderPage() {
         actions={
           !readOnly && (
             <>
+              <label className="flex items-center gap-1 text-2xs text-ink-2">
+                Queue
+                <select
+                  className="input w-32"
+                  value={data.form.queue ?? ''}
+                  onChange={(e) => void setQueue(e.target.value)}
+                  title="Reviewers limited to this form only see this queue"
+                >
+                  <option value="">Any queue</option>
+                  <option value="transfer">Transfers</option>
+                  <option value="unclosed">Unclosed</option>
+                  <option value="closed">Closed</option>
+                </select>
+              </label>
               <label className="flex items-center gap-1 text-2xs text-ink-2">
                 Pass %
                 <input
