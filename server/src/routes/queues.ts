@@ -7,6 +7,7 @@ import {
   calls,
   campaigns,
   dialerServers,
+  dispositionMappings,
   evaluations,
   recordings,
   transferEvents,
@@ -189,11 +190,92 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       if (s) saleCall = { ...s.call, agentName: s.agentName };
     }
 
+    const leadId = row.transfer.viciLeadId ?? row.fronterCall?.viciLeadId ?? row.closerCall?.viciLeadId ?? null;
+    const refTime = row.transfer.xferTime;
+
+    // Sales with no transfer row of their own (callback / inbound) and
+    // transfers whose call row has not landed yet still show the lead's
+    // fronter: the latest XFER call on the lead up to 3 days before.
+    let fronterFromLead = false;
+    if (!row.fronterCall && leadId != null) {
+      const codes = (
+        await db
+          .select({ code: dispositionMappings.dispositionCode })
+          .from(dispositionMappings)
+          .where(
+            and(
+              eq(dispositionMappings.companyId, row.transfer.companyId),
+              eq(dispositionMappings.meaning, 'transfer'),
+              eq(dispositionMappings.active, true),
+            ),
+          )
+      ).map((m) => m.code.toUpperCase());
+      if (codes.length) {
+        const [f] = await db
+          .select({ call: calls, agentUser: viciAgents.viciUser, agentName: viciAgents.fullName })
+          .from(calls)
+          .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
+          .where(
+            and(
+              eq(calls.dialerServerId, row.transfer.dialerServerId),
+              eq(calls.source, 'vicidial_log'),
+              eq(calls.viciLeadId, leadId),
+              sql`upper(coalesce(${calls.status}, '')) in (${sql.join(codes.map((c) => sql`${c}`), sql`, `)})`,
+              gte(calls.callDate, new Date(refTime.getTime() - 3 * 86_400_000)),
+              lte(calls.callDate, new Date(refTime.getTime() + 30 * 60_000)),
+            ),
+          )
+          // the real conversation, not a 0-second dispo row
+          .orderBy(sql`(coalesce(${calls.lengthSec}, 0) > 0) desc`, desc(calls.callDate))
+          .limit(1);
+        if (f) {
+          row.fronterCall = f.call;
+          row.fronterAgentUser = f.agentUser ?? f.call.viciUserRaw;
+          row.fronterAgentName = f.agentName;
+          fronterFromLead = true;
+        }
+      }
+    }
+
     const callIds = [row.fronterCall?.id, row.closerCall?.id, saleCall?.id].filter((x): x is string => !!x);
-    const recRows = await db
-      .select()
-      .from(recordings)
-      .where(or(...callIds.map((id) => eq(recordings.callId, id))));
+    const recRows = callIds.length
+      ? await db
+          .select()
+          .from(recordings)
+          .where(or(...callIds.map((id) => eq(recordings.callId, id))))
+      : [];
+
+    // every other recording on the lead around this call, for context
+    const leadRecordings =
+      leadId == null
+        ? []
+        : await db
+            .select({
+              recording: recordings,
+              callStatus: calls.status,
+              callSource: calls.source,
+              callUser: calls.viciUserRaw,
+              agentName: viciAgents.fullName,
+            })
+            .from(recordings)
+            .leftJoin(calls, eq(recordings.callId, calls.id))
+            .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
+            .where(
+              and(
+                eq(recordings.dialerServerId, row.transfer.dialerServerId),
+                eq(recordings.viciLeadId, leadId),
+                gte(recordings.startTime, new Date(refTime.getTime() - 3 * 86_400_000)),
+                lte(recordings.startTime, new Date(refTime.getTime() + 86_400_000)),
+                callIds.length
+                  ? sql`(${recordings.callId} is null or ${recordings.callId} not in (${sql.join(
+                      callIds.map((id) => sql`${id}`),
+                      sql`, `,
+                    )}))`
+                  : sql`true`,
+              ),
+            )
+            .orderBy(recordings.startTime)
+            .limit(40);
     const events = await db
       .select()
       .from(transferEvents)
@@ -209,7 +291,6 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     // cached pool. Capped at 2.5s and always optional — the page never
     // waits on or fails because of lead info.
     let lead: Record<string, unknown> | null = null;
-    const leadId = row.transfer.viciLeadId ?? row.fronterCall?.viciLeadId ?? row.closerCall?.viciLeadId ?? null;
     if (leadId != null) {
       try {
         const [dialerRow] = await db
@@ -228,7 +309,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    return { ...row, saleCall, lead, recordings: recRows, events, evaluations: evals };
+    return { ...row, fronterFromLead, saleCall, lead, recordings: recRows, leadRecordings, events, evaluations: evals };
   });
 
   // Candidate closer calls for a flagged transfer, scored — for manual resolution.

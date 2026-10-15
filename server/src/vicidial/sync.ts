@@ -1214,6 +1214,41 @@ async function syncAgentDispositions(
  * time). Transfers whose XFER the agent took back are removed unless QA
  * work already hangs off them.
  */
+async function findAgentCall(
+  dialerServerId: string,
+  r: typeof agentDispositions.$inferSelect,
+  codes: string[],
+): Promise<typeof calls.$inferSelect | undefined> {
+  if (r.viciLeadId == null) return undefined;
+  // The disposition is saved after the call (talk + wrap-up), often 20-40
+  // min after the call started. Prefer the agent's call on the lead that
+  // carries the XFER status and ended closest to the disposition; skip calls
+  // another agent-log transfer already owns.
+  const isXfer = codes.length
+    ? sql`upper(coalesce(${calls.status}, '')) in (${sql.join(codes.map((c) => sql`${c}`), sql`, `)})`
+    : sql`false`;
+  const [call] = await db
+    .select()
+    .from(calls)
+    .where(
+      and(
+        eq(calls.dialerServerId, dialerServerId),
+        eq(calls.source, 'vicidial_log'),
+        eq(calls.viciLeadId, r.viciLeadId),
+        r.viciUser ? sql`upper(${calls.viciUserRaw}) = upper(${r.viciUser})` : sql`true`,
+        gte(calls.callDate, new Date(r.eventTime.getTime() - 3 * 3600_000)),
+        lte(calls.callDate, new Date(r.eventTime.getTime() + 20 * 60_000)),
+        sql`not exists (select 1 from transfers t where t.fronter_call_id = ${calls.id} and t.agent_log_id is not null)`,
+      ),
+    )
+    .orderBy(
+      sql`(${isXfer}) desc`,
+      sql`abs(extract(epoch from (${calls.callDate} + make_interval(secs => coalesce(${calls.lengthSec}, 0)) - ${r.eventTime})))`,
+    )
+    .limit(1);
+  return call;
+}
+
 async function buildTransfersFromAgentLog(
   conn: DialerConnection,
   mappings: MappingRow[],
@@ -1241,16 +1276,43 @@ async function buildTransfersFromAgentLog(
       dispositionCode: r.status,
     }) === 'transfer';
 
+  const codes = transferCodesOf(mappings).map((c) => c.toUpperCase());
   let created = 0;
   let adopted = 0;
+  let relinked = 0;
   for (const r of rows) {
     if (!isTransfer(r)) continue;
     const [existing] = await db
-      .select({ id: transfers.id })
+      .select({ id: transfers.id, fronterCallId: transfers.fronterCallId, matchStatus: transfers.matchStatus })
       .from(transfers)
       .where(and(eq(transfers.dialerServerId, conn.id), eq(transfers.agentLogId, r.agentLogId)))
       .limit(1);
-    if (existing) continue;
+    if (existing) {
+      // the call row may land after the disposition — link it once it does,
+      // so the transfer gets its recording and can match its closer leg
+      if (!existing.fronterCallId) {
+        const call = await findAgentCall(conn.id, r, codes);
+        if (call) {
+          try {
+            await db
+              .update(transfers)
+              .set({
+                fronterCallId: call.id,
+                xferTime: new Date(call.callDate.getTime() + (call.lengthSec ?? 0) * 1000),
+                phoneNumber: call.phoneNumber,
+                ...(existing.matchStatus === 'unmatched' ? { matchStatus: 'pending_match' as const } : {}),
+                updatedAt: new Date(),
+              })
+              .where(eq(transfers.id, existing.id));
+            relinked += 1;
+          } catch (err) {
+            // a legacy transfer still holds that call; the full sync clears it
+            if ((err as { code?: string }).code !== '23505') throw err;
+          }
+        }
+      }
+      continue;
+    }
 
     // the fronter's call for this disposition
     let [fronter] = r.viciUniqueId
@@ -1266,23 +1328,7 @@ async function buildTransfersFromAgentLog(
           )
           .limit(1)
       : [];
-    if (!fronter && r.viciLeadId != null) {
-      [fronter] = await db
-        .select()
-        .from(calls)
-        .where(
-          and(
-            eq(calls.dialerServerId, conn.id),
-            eq(calls.source, 'vicidial_log'),
-            eq(calls.viciLeadId, r.viciLeadId),
-            r.viciUser ? eq(calls.viciUserRaw, r.viciUser) : sql`true`,
-            gte(calls.callDate, new Date(r.eventTime.getTime() - 20 * 60_000)),
-            lte(calls.callDate, new Date(r.eventTime.getTime() + 20 * 60_000)),
-          ),
-        )
-        .orderBy(sql`abs(extract(epoch from (${calls.callDate} - ${r.eventTime})))`)
-        .limit(1);
-    }
+    if (!fronter) fronter = (await findAgentCall(conn.id, r, codes)) as typeof fronter;
 
     if (fronter) {
       // a transfer built earlier from the call record — adopt it
@@ -1371,6 +1417,7 @@ async function buildTransfersFromAgentLog(
        and upper(coalesce(c.vici_user_raw, '')) <> upper(ad.vici_user)`);
   if (reowned.rowCount) stats.fronter_calls_reowned = reowned.rowCount;
 
+  if (relinked) stats.transfers_fronter_relinked = relinked;
   if (adopted) stats.transfers_adopted = adopted;
   if (withdrawn.rowCount) stats.transfers_withdrawn = withdrawn.rowCount;
   if (orphaned) stats.transfers_without_agent_xfer_removed = orphaned;

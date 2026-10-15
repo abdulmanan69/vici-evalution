@@ -25,8 +25,19 @@ interface Detail {
   closerAgentName: string | null;
   dialerName: string;
   recordings: Recording[];
+  /** the fronter leg was found on the lead (sale-only rows, late call rows) */
+  fronterFromLead: boolean;
+  leadRecordings: LeadRecording[];
   events: TransferEvent[];
   evaluations: Evaluation[];
+}
+
+interface LeadRecording {
+  recording: Recording;
+  callStatus: string | null;
+  callSource: string | null;
+  callUser: string | null;
+  agentName: string | null;
 }
 
 interface Candidate {
@@ -90,7 +101,14 @@ function CallLeg({
             {recordings.length === 0 && <p className="text-2xs text-ink-3">No recording linked to this leg.</p>}
             {recordings.map((rec) =>
               rec.status === 'available' ? (
-                <AudioPlayer key={rec.id} recordingId={rec.id} label={rec.filename} />
+                <div key={rec.id}>
+                  <AudioPlayer recordingId={rec.id} label={rec.filename} />
+                  {!rec.lengthSec && (
+                    <p className="mt-1 text-2xs text-ink-3">
+                      0-second dialer entry (disposition only) — hear the full call under the other legs below.
+                    </p>
+                  )}
+                </div>
               ) : (
                 <div key={rec.id} className="flex items-center gap-2 rounded-md bg-bg px-3 py-2 text-2xs text-ink-2">
                   <Chip value={rec.status} />
@@ -101,6 +119,38 @@ function CallLeg({
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function LeadRecordings({ items }: { items: LeadRecording[] }) {
+  return (
+    <div className="card mt-4 p-4">
+      <h2 className="mb-1 font-display text-sm font-bold">Other recordings on this lead</h2>
+      <p className="mb-3 text-2xs text-ink-3">Every call on this lead from 3 days before to 1 day after, oldest first.</p>
+      <div className="space-y-3">
+        {items.map(({ recording: rec, callStatus, callSource, callUser, agentName }) => (
+          <div key={rec.id} className="rounded-md border border-ink/10 p-3">
+            <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs">
+              <span className="font-mono">{fmtDateTime(rec.startTime)}</span>
+              <span className="chip bg-bg text-ink-2">{callSource === 'vicidial_closer_log' ? 'Closer' : 'Fronter / outbound'}</span>
+              <span>
+                {agentName ?? callUser ?? '—'} {callUser && <span className="font-mono text-ink-3">({callUser})</span>}
+              </span>
+              <span className="font-mono">{callStatus ?? '—'}</span>
+              <span className="font-mono text-ink-3">{fmtDuration(rec.lengthSec)}</span>
+            </div>
+            {rec.status === 'available' ? (
+              <AudioPlayer recordingId={rec.id} label={rec.filename} />
+            ) : (
+              <div className="flex items-center gap-2 text-2xs text-ink-2">
+                <Chip value={rec.status} />
+                <span className="truncate font-mono">{rec.filename}</span>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -207,6 +257,13 @@ export function TransferDetailPage() {
   const closerRecs = data.recordings.filter((r) => data.closerCall && r.callId === data.closerCall.id);
   const saleRecs = data.recordings.filter((r) => data.saleCall && r.callId === data.saleCall.id);
   const saleOnly = t.kind !== 'transfer';
+  const showFronter = !saleOnly || !!data.fronterCall;
+  const legCount = (showFronter ? 1 : 0) + 1 + (data.saleCall ? 1 : 0);
+  const fronterTitle = data.fronterFromLead
+    ? saleOnly
+      ? "Fronter call on this lead"
+      : "Fronter leg (found on the lead)"
+    : "Fronter leg";
 
   return (
     <div>
@@ -244,10 +301,10 @@ export function TransferDetailPage() {
       <div className="mb-3">
         <SaleTypeChip transfer={t} />
       </div>
-      <div className={`grid gap-4 ${data.saleCall ? 'lg:grid-cols-3' : saleOnly ? '' : 'lg:grid-cols-2'}`}>
-        {!saleOnly && (
+      <div className={`grid gap-4 ${legCount === 3 ? 'lg:grid-cols-3' : legCount === 2 ? 'lg:grid-cols-2' : ''}`}>
+        {showFronter && (
           <CallLeg
-            title="Fronter leg"
+            title={fronterTitle}
             call={data.fronterCall}
             agentName={data.fronterAgentName}
             agentUser={data.fronterAgentUser}
@@ -271,6 +328,8 @@ export function TransferDetailPage() {
           />
         )}
       </div>
+
+      {data.leadRecordings.length > 0 && <LeadRecordings items={data.leadRecordings} />}
 
       {data.lead && <LeadCard lead={data.lead} />}
 
