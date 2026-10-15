@@ -9,7 +9,7 @@ import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
 import { toConnection } from '../vicidial/credentials.js';
 import { ViciApiClient } from '../vicidial/apiClient.js';
-import { localToUtc } from '../vicidial/timezone.js';
+import { localToUtc, utcToLocalString } from '../vicidial/timezone.js';
 import { fetchAgentStatusDetail, parseAgentStatusDetail } from '../vicidial/webReport.js';
 
 const EXPORT_LIMIT = 50_000;
@@ -147,34 +147,48 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     // becomes the authoritative source for the call counts too.
     let source: 'live_api' | 'archived_report' | 'platform_only' = viciError ? 'platform_only' : 'live_api';
     if (conn.apiUser) {
-      try {
-        // live table first; empty/absent means the range was archived — retry
-        // with the archive search the way VICIdial's own report page does
-        let parsed;
+      // A day being archived SPLITS its rows between the live tables and the
+      // archive: the live report can return a partial table for a past date.
+      // So both variants are fetched and summed per agent — live-only for
+      // today, live+archived for any range touching past days.
+      const todayLocal = utcToLocalString(new Date(), dialer.timezone).slice(0, 10);
+      const reportCalls = new Map<string, { name: string; calls: number; xfers: number; sales: number }>();
+      let anyReport = false;
+      const variants: boolean[] = q.dateFrom < todayLocal ? [false, true] : [false];
+      let lastReportError: string | null = null;
+      for (const archived of variants) {
         try {
-          parsed = parseAgentStatusDetail(await fetchAgentStatusDetail(conn, q.dateFrom, q.dateTo, false));
-        } catch {
-          parsed = parseAgentStatusDetail(await fetchAgentStatusDetail(conn, q.dateFrom, q.dateTo, true));
+          const parsed = parseAgentStatusDetail(
+            await fetchAgentStatusDetail(conn, q.dateFrom, q.dateTo, archived),
+          );
+          anyReport = true;
+          for (const pr of parsed.rows) {
+            if (!pr.user) continue;
+            const acc = reportCalls.get(pr.user) ?? { name: pr.name, calls: 0, xfers: 0, sales: 0 };
+            acc.calls += pr.calls;
+            acc.xfers += pr.statusCounts.XFER ?? 0;
+            acc.sales += pr.statusCounts.SALE ?? 0;
+            reportCalls.set(pr.user, acc);
+          }
+        } catch (err) {
+          // an empty table throws — normal for one of the two variants
+          lastReportError = err instanceof Error ? err.message : String(err);
         }
-        for (const pr of parsed.rows) {
-          if (!pr.user) continue;
-          const r = ensure(pr.user);
-          if (!r.fullName) r.fullName = pr.name;
-          if (r.viciCalls == null) r.viciCalls = pr.calls;
-          r.viciXfers = pr.statusCounts.XFER ?? 0;
-          r.viciSales = pr.statusCounts.SALE ?? 0;
+      }
+      if (anyReport) {
+        for (const [user, acc] of reportCalls) {
+          const r = ensure(user);
+          if (!r.fullName) r.fullName = acc.name;
+          if (r.viciCalls == null) r.viciCalls = acc.calls;
+          r.viciXfers = acc.xfers;
+          r.viciSales = acc.sales;
         }
         if (viciError) {
           source = 'archived_report';
           viciError = null;
         }
-      } catch (err) {
-        if (viciError) {
-          viciError = `${viciError}; archived report fallback failed: ${
-            err instanceof Error ? err.message : String(err)
-          }`;
-        }
-        // live stats succeeded — missing status columns are not an error
+      } else if (viciError && lastReportError) {
+        viciError = `${viciError}; report fallback failed: ${lastReportError}`;
       }
     }
 
