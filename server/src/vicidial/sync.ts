@@ -38,6 +38,9 @@ export interface SyncStats {
 }
 
 const BATCH_LIMIT = 5000;
+/** how far back each cycle re-reads calls whose disposition may still change */
+const REFRESH_HOURS = 12;
+const RECORDING_LOOKUP_BUDGET_MS = 20_000;
 const CURSOR_OVERLAP_MS = 2 * 60 * 1000; // re-read a small overlap to catch late rows
 const MATCH_WINDOW_BEFORE_MS = 2 * 60 * 1000;
 const MATCH_WINDOW_AFTER_MS = 10 * 60 * 1000;
@@ -118,6 +121,7 @@ export async function runDialerSync(
 
     await buildTransfers(conn, stats);
     await matchPendingTransfers(conn.companyId, stats);
+    await attributeSales(conn.companyId, stats);
     await updateQueueStatuses(conn.companyId, stats);
 
     await db
@@ -392,8 +396,69 @@ async function syncCallStream(
     }
   }
   await runPass(false, sinceUtc);
+  const cursorAfter = maxSeen;
 
-  if (maxSeen) await setCursor(conn.id, source, maxSeen);
+  // Realtime refresh. A call is written when it starts (status INCALL) and
+  // rewritten when the agent dispositions minutes later — after the cursor
+  // has moved past it. Re-read the recent window so XFER/SALE land within a
+  // cycle: every closer leg (a small table), and outbound legs only when
+  // their disposition is now one this company maps (the huge table stays cheap).
+  if (!full) {
+    const refreshSince = utcToLocalString(new Date(Date.now() - REFRESH_HOURS * 3600 * 1000), conn.timezone);
+    const refreshUntil = utcToLocalString(untilUtc, conn.timezone);
+    let refreshRows: ViciCallRow[] = [];
+    if (source === 'vicidial_closer_log') {
+      refreshRows = await viciDb.fetchCloserCalls(refreshSince, refreshUntil, BATCH_LIMIT);
+    } else {
+      const mapped = await companyMappings(conn.companyId);
+      const codes = [
+        ...new Set(
+          mapped
+            .filter((m) => m.meaning === 'transfer' || m.meaning === 'sale')
+            .map((m) => m.dispositionCode.trim().toUpperCase()),
+        ),
+      ];
+      refreshRows = await viciDb.fetchOutboundCallsByStatus(refreshSince, refreshUntil, codes, BATCH_LIMIT);
+    }
+    let refreshed = 0;
+    for (const row of refreshRows) {
+      if (!row.uniqueid) continue;
+      await upsertCall(conn, source, row, localToUtc(row.call_date, conn.timezone), agentMap, campMap, groupMap);
+      refreshed += 1;
+    }
+    stats[`${source}_refreshed`] = refreshed;
+
+    // Self-heal: any call we still hold at a mid-call status (from before
+    // this window, or a missed cycle) is re-read by its exact uniqueid from
+    // the live and archived tables until it carries its final disposition.
+    const stuck = await db
+      .select({ uid: calls.viciUniqueId })
+      .from(calls)
+      .where(
+        and(
+          eq(calls.dialerServerId, conn.id),
+          eq(calls.source, source),
+          eq(calls.isMock, false),
+          sql`upper(${calls.status}) in ('INCALL', 'QUEUE', 'DISPO', 'DONEM')`,
+          sql`${calls.callDate} < now() - interval '30 minutes'`,
+        ),
+      )
+      .limit(500);
+    const stuckIds = stuck.map((s) => s.uid).filter((u): u is string => !!u);
+    if (stuckIds.length > 0) {
+      let healed = 0;
+      for (const row of await viciDb.fetchCallsByUniqueIds(source, stuckIds)) {
+        if (!row.uniqueid || !row.status || ['INCALL', 'QUEUE', 'DISPO', 'DONEM'].includes(row.status.toUpperCase())) {
+          continue;
+        }
+        await upsertCall(conn, source, row, localToUtc(row.call_date, conn.timezone), agentMap, campMap, groupMap);
+        healed += 1;
+      }
+      stats[`${source}_healed`] = healed;
+    }
+  }
+
+  if (cursorAfter) await setCursor(conn.id, source, cursorAfter);
   stats[`${source}_imported`] = imported;
   if (skippedNoUid > 0) stats[`${source}_skipped_no_uniqueid`] = skippedNoUid;
 }
@@ -571,7 +636,14 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     .limit(300);
 
   let found = 0;
+  // a time budget keeps each sync cycle short so new calls and dispositions
+  // land within a minute; the backlog drains over the following cycles
+  const deadline = Date.now() + RECORDING_LOOKUP_BUDGET_MS;
   for (const c of candidates) {
+    if (Date.now() > deadline) {
+      (stats.notes as string[]).push('recording lookup time budget reached — continuing next cycle');
+      break;
+    }
     if (c.leadId == null) continue;
     let rows: Array<Record<string, string>>;
     try {
@@ -936,16 +1008,34 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
  * neither constraint can fail a sync job. callId null leaves any existing
  * link untouched.
  */
+type RecordingInput = {
+  recordingId: number | null;
+  leadId: number | null;
+  filename: string;
+  locationUrl: string | null;
+  startTime: Date | null;
+  lengthSec: number | null;
+};
+
 async function upsertRecordingByEitherKey(
   conn: DialerConnection,
-  row: {
-    recordingId: number | null;
-    leadId: number | null;
-    filename: string;
-    locationUrl: string | null;
-    startTime: Date | null;
-    lengthSec: number | null;
-  },
+  row: RecordingInput,
+  callId: string | null,
+): Promise<void> {
+  try {
+    await upsertRecordingUnchecked(conn, row, callId);
+  } catch (err) {
+    // The dialer can hold two recording entries that collide on our keys
+    // (same file under two recording ids, or a parallel sync importing the
+    // same row). Skipping that one row beats aborting the whole sync.
+    if ((err as { code?: string }).code === '23505') return;
+    throw err;
+  }
+}
+
+async function upsertRecordingUnchecked(
+  conn: DialerConnection,
+  row: RecordingInput,
   callId: string | null,
 ): Promise<void> {
   const [existingRec] = await db
@@ -1048,6 +1138,8 @@ async function transferExistsNearby(
       and(
         eq(transfers.dialerServerId, dialerServerId),
         eq(transfers.viciLeadId, viciLeadId),
+        // sale-only entries must never block a real fronter transfer
+        eq(transfers.kind, 'transfer'),
         gte(transfers.xferTime, new Date(xferTime.getTime() - 10 * 60_000)),
         lte(transfers.xferTime, new Date(xferTime.getTime() + 10 * 60_000)),
       ),
@@ -1350,8 +1442,184 @@ async function matchPendingTransfers(companyId: string, stats: SyncStats): Promi
   stats.match_unmatched = unmatched;
 }
 
+/**
+ * Every sale call ends up counted exactly once, so the Closed queue matches
+ * the dialer's SALE column:
+ *  1. a sale on a transfer's own closer leg — handled by the queue status;
+ *  2. a sale on a LATER call of a transferred lead (closer callback) closes
+ *     that lead's most recent transfer before it (one sale → one transfer);
+ *  3. a sale with no transfer behind it becomes its own Closed entry: an
+ *     inbound sale (call came straight into the closer group) or a callback
+ *     sale (closer's own follow-up call).
+ */
+async function attributeSales(companyId: string, stats: SyncStats): Promise<void> {
+  const mappings = await companyMappings(companyId);
+  const codes = [
+    ...new Set(
+      mappings.filter((m) => m.active && m.meaning === 'sale').map((m) => m.dispositionCode.trim().toUpperCase()),
+    ),
+  ];
+  if (codes.length === 0) return;
+  const codeList = sql.join(
+    codes.map((c) => sql`${c}`),
+    sql`, `,
+  );
+  const windowDays = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : 7;
+  const since = new Date(Date.now() - windowDays * 24 * 3600 * 1000);
+
+  // links whose sale call stopped being a sale (disposition corrected)
+  await db.execute(sql`
+    update transfers set sale_call_id = null, updated_at = now()
+     where company_id = ${companyId} and sale_call_id is not null
+       and not exists (select 1 from calls c where c.id = transfers.sale_call_id and upper(c.status) in (${codeList}))`);
+  const removed = await db.execute(sql`
+    delete from transfers
+     where company_id = ${companyId} and kind <> 'transfer' and is_mock = false
+       and not exists (select 1 from calls c where c.id = transfers.closer_call_id and upper(c.status) in (${codeList}))
+       and not exists (select 1 from evaluations e where e.transfer_id = transfers.id)`);
+
+  const pending = await db.execute(sql`
+    select c.id, c.dialer_server_id, c.campaign_id, c.vici_lead_id, c.status, c.call_date, c.source, c.phone_number
+      from calls c
+     where c.company_id = ${companyId} and c.is_mock = false and c.call_date >= ${since}
+       and upper(c.status) in (${codeList})
+       and not exists (select 1 from transfers t where t.closer_call_id = c.id or t.sale_call_id = c.id)
+     order by c.call_date
+     limit 5000`);
+
+  let linkedAsCloser = 0;
+  let linkedAsCallback = 0;
+  let saleOnly = 0;
+  for (const raw of pending.rows as Array<Record<string, unknown>>) {
+    const call = {
+      id: raw.id as string,
+      dialerServerId: raw.dialer_server_id as string,
+      campaignId: (raw.campaign_id as string | null) ?? null,
+      leadId: raw.vici_lead_id === null ? null : Number(raw.vici_lead_id),
+      status: raw.status as string,
+      callDate: new Date(raw.call_date as string),
+      source: raw.source as string,
+      phone: (raw.phone_number as string | null) ?? null,
+    };
+    const meaning = resolveMeaning(mappings, {
+      dialerServerId: call.dialerServerId,
+      campaignId: call.campaignId,
+      dispositionCode: call.status,
+    });
+    if (meaning !== 'sale') continue;
+
+    if (call.leadId !== null) {
+      const [t] = await db
+        .select()
+        .from(transfers)
+        .where(
+          and(
+            eq(transfers.companyId, companyId),
+            eq(transfers.kind, 'transfer'),
+            eq(transfers.dialerServerId, call.dialerServerId),
+            eq(transfers.viciLeadId, call.leadId),
+            lte(transfers.xferTime, new Date(call.callDate.getTime() + 10 * 60_000)),
+            gte(transfers.xferTime, new Date(call.callDate.getTime() - windowDays * 24 * 3600 * 1000)),
+            isNull(transfers.saleCallId),
+            sql`${transfers.queueStatus} <> 'closed'`,
+            eq(transfers.isMock, false),
+          ),
+        )
+        .orderBy(desc(transfers.xferTime))
+        .limit(1);
+      if (t) {
+        if (!t.closerCallId && call.source === 'vicidial_closer_log') {
+          // the matcher never found this transfer's closer leg — the sale IS it
+          await db
+            .update(transfers)
+            .set({
+              closerCallId: call.id,
+              closerLeadId: call.leadId,
+              matchStatus: 'matched',
+              matchMethod: 'sale-lead',
+              matchConfidence: 85,
+              matchNotes: 'closer leg identified by its sale on the same lead',
+              updatedAt: new Date(),
+            })
+            .where(eq(transfers.id, t.id));
+          linkedAsCloser += 1;
+        } else if (t.closerCallId) {
+          // closed by updateQueueStatuses, which reads the sale call's status
+          await db
+            .update(transfers)
+            .set({ saleCallId: call.id, updatedAt: new Date() })
+            .where(eq(transfers.id, t.id));
+          linkedAsCallback += 1;
+        } else {
+          // no closer leg was ever found, so nothing else will close it
+          await db
+            .update(transfers)
+            .set({
+              saleCallId: call.id,
+              queueStatus: 'closed',
+              saleDisposition: call.status,
+              closedAt: call.callDate,
+              updatedAt: new Date(),
+            })
+            .where(eq(transfers.id, t.id));
+          await db.insert(transferEvents).values({
+            transferId: t.id,
+            fromStatus: t.queueStatus,
+            toStatus: 'closed',
+            reason: `sold on a later call of this lead ('${call.status}')`,
+          });
+          linkedAsCallback += 1;
+        }
+        continue;
+      }
+    }
+
+    const inserted = await db
+      .insert(transfers)
+      .values({
+        companyId,
+        dialerServerId: call.dialerServerId,
+        kind: call.source === 'vicidial_closer_log' ? 'inbound_sale' : 'callback_sale',
+        fronterCallId: null,
+        closerCallId: call.id,
+        xferTime: call.callDate,
+        phoneNumber: call.phone,
+        viciLeadId: call.leadId,
+        closerLeadId: call.leadId,
+        matchStatus: 'matched',
+        matchMethod: 'sale-only',
+        matchConfidence: 100,
+        matchNotes:
+          call.source === 'vicidial_closer_log'
+            ? 'sale on a call that reached the closer group with no fronter transfer'
+            : "sale on the closer's own follow-up call — no transfer for this lead in the window",
+        queueStatus: 'closed',
+        saleDisposition: call.status,
+        closedAt: call.callDate,
+      })
+      .onConflictDoNothing()
+      .returning({ id: transfers.id });
+    if (inserted.length > 0) {
+      await db.insert(transferEvents).values({
+        transferId: inserted[0].id,
+        toStatus: 'closed',
+        reason:
+          call.source === 'vicidial_closer_log'
+            ? `inbound sale '${call.status}' — no fronter transfer`
+            : `callback sale '${call.status}' — no fronter transfer`,
+      });
+      saleOnly += 1;
+    }
+  }
+  if (linkedAsCloser) stats.sales_linked_as_closer = linkedAsCloser;
+  if (linkedAsCallback) stats.sales_linked_as_callback = linkedAsCallback;
+  if (saleOnly) stats.sales_without_transfer = saleOnly;
+  if (removed.rowCount) stats.sale_entries_removed = removed.rowCount;
+}
+
 async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise<void> {
   const mappings = await companyMappings(companyId);
+  const saleCall = alias(calls, 'sale_call');
   const rows = await db
     .select({
       transfer: transfers,
@@ -1359,13 +1627,19 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
       closerDialerId: calls.dialerServerId,
       closerIngroupId: calls.ingroupId,
       closerDate: calls.callDate,
+      saleStatus: saleCall.status,
+      saleDialerId: saleCall.dialerServerId,
+      saleCampaignId: saleCall.campaignId,
+      saleDate: saleCall.callDate,
     })
     .from(transfers)
     .innerJoin(calls, eq(transfers.closerCallId, calls.id))
+    .leftJoin(saleCall, eq(transfers.saleCallId, saleCall.id))
     .where(
       and(
         eq(transfers.companyId, companyId),
         eq(transfers.matchStatus, 'matched'),
+        eq(transfers.kind, 'transfer'),
         eq(transfers.isMock, false),
       ),
     )
@@ -1375,26 +1649,36 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
   let transitions = 0;
   const unmapped = new Map<string, number>();
   for (const row of rows) {
-    const meaning = resolveMeaning(mappings, {
+    const closerMeaning = resolveMeaning(mappings, {
       dialerServerId: row.closerDialerId,
       campaignId: null,
       dispositionCode: row.closerStatus,
     });
-    if (meaning === null && row.closerStatus) {
+    if (closerMeaning === null && row.closerStatus) {
       unmapped.set(row.closerStatus, (unmapped.get(row.closerStatus) ?? 0) + 1);
     }
+    // a sale on a later call of this lead closes the transfer too
+    const laterSale =
+      row.saleStatus !== null &&
+      resolveMeaning(mappings, {
+        dialerServerId: row.saleDialerId ?? row.closerDialerId,
+        campaignId: row.saleCampaignId ?? null,
+        dispositionCode: row.saleStatus,
+      }) === 'sale';
+    const viaOwnLeg = closerMeaning === 'sale';
     const result = transition(row.transfer.queueStatus, {
       matched: true,
       closerDisposition: row.closerStatus,
-      closerMeaning: meaning,
+      closerMeaning: viaOwnLeg || laterSale ? 'sale' : closerMeaning,
     });
     if (!result.changed) continue;
+    const closed = result.next === 'closed';
     await db
       .update(transfers)
       .set({
         queueStatus: result.next,
-        saleDisposition: result.next === 'closed' ? row.closerStatus : null,
-        closedAt: result.next === 'closed' ? row.closerDate : null,
+        saleDisposition: closed ? (viaOwnLeg ? row.closerStatus : row.saleStatus) : null,
+        closedAt: closed ? (viaOwnLeg ? row.closerDate : row.saleDate) : null,
         updatedAt: new Date(),
       })
       .where(eq(transfers.id, row.transfer.id));
@@ -1403,8 +1687,10 @@ async function updateQueueStatuses(companyId: string, stats: SyncStats): Promise
       fromStatus: row.transfer.queueStatus,
       toStatus: result.next,
       reason: result.regression
-        ? `disposition corrected: '${row.closerStatus}' is no longer a configured sale`
-        : `closer disposition '${row.closerStatus}' -> ${result.next}`,
+        ? `disposition corrected: no configured sale on this transfer anymore`
+        : closed && !viaOwnLeg
+          ? `sold on a later call of this lead ('${row.saleStatus}') after the closer leg ended '${row.closerStatus}'`
+          : `closer disposition '${row.closerStatus}' -> ${result.next}`,
     });
     transitions += 1;
   }

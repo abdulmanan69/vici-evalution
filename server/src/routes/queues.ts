@@ -63,9 +63,11 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     // The Transfer section is the full log of fronter transfers — every
     // transferred call regardless of what happened downstream. Unclosed and
     // Closed are the state-filtered views.
+    // Transfers lists fronter XFERs only; Closed also holds sales that had no
+    // transfer (callback/inbound), so its count matches the dialer's SALEs.
     const where: SQL[] =
       status === 'transfer'
-        ? []
+        ? [eq(transfers.kind, 'transfer')]
         : [eq(transfers.queueStatus, status as 'unclosed' | 'closed')];
     if (scope) where.push(eq(transfers.companyId, scope));
     // a reviewer assigned to specific agents only sees those agents' calls
@@ -109,7 +111,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const [total] = await db
       .select({ n: count() })
       .from(transfers)
-      .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
       .where(whereAll);
 
     const rows = await db
@@ -128,7 +130,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
         viciCampaignId: campaigns.viciCampaignId,
       })
       .from(transfers)
-      .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
       .leftJoin(fronterAgent, eq(fronterCall.viciAgentId, fronterAgent.id))
       .leftJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
       .leftJoin(closerAgent, eq(closerCall.viciAgentId, closerAgent.id))
@@ -157,7 +159,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
         dialerName: dialerServers.name,
       })
       .from(transfers)
-      .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
       .leftJoin(fronterAgent, eq(fronterCall.viciAgentId, fronterAgent.id))
       .leftJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
       .leftJoin(closerAgent, eq(closerCall.viciAgentId, closerAgent.id))
@@ -176,7 +178,18 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    const callIds = [row.fronterCall.id, row.closerCall?.id].filter((x): x is string => !!x);
+    // a sale made on a later call of the lead is shown as its own leg
+    let saleCall: (typeof calls.$inferSelect & { agentName: string | null }) | null = null;
+    if (row.transfer.saleCallId) {
+      const [s] = await db
+        .select({ call: calls, agentName: viciAgents.fullName })
+        .from(calls)
+        .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
+        .where(eq(calls.id, row.transfer.saleCallId));
+      if (s) saleCall = { ...s.call, agentName: s.agentName };
+    }
+
+    const callIds = [row.fronterCall?.id, row.closerCall?.id, saleCall?.id].filter((x): x is string => !!x);
     const recRows = await db
       .select()
       .from(recordings)
@@ -196,7 +209,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     // cached pool. Capped at 2.5s and always optional — the page never
     // waits on or fails because of lead info.
     let lead: Record<string, unknown> | null = null;
-    const leadId = row.transfer.viciLeadId ?? row.fronterCall.viciLeadId;
+    const leadId = row.transfer.viciLeadId ?? row.fronterCall?.viciLeadId ?? row.closerCall?.viciLeadId ?? null;
     if (leadId != null) {
       try {
         const [dialerRow] = await db
@@ -215,7 +228,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    return { ...row, lead, recordings: recRows, events, evaluations: evals };
+    return { ...row, saleCall, lead, recordings: recRows, events, evaluations: evals };
   });
 
   // Candidate closer calls for a flagged transfer, scored — for manual resolution.

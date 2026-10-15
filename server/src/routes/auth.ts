@@ -6,8 +6,8 @@ import { login, logout } from '../auth/session.js';
 import { audit } from '../lib/audit.js';
 import { UnauthorizedError, ValidationError } from '../lib/errors.js';
 import { db } from '../db/client.js';
-import { users } from '../db/schema.js';
-import { eq } from 'drizzle-orm';
+import { dialerServers, users } from '../db/schema.js';
+import { desc, eq } from 'drizzle-orm';
 import { hashPassword, verifyPassword } from '../lib/crypto.js';
 import { revokeUserSessions } from '../auth/session.js';
 
@@ -63,7 +63,15 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.get('/me', { preHandler: [authenticate] }, async (req) => {
-    return { user: req.auth };
+    // the dialer's zone — every date in the app is a dialer day, and the
+    // UI can show times in it or in the viewer's own zone
+    const [dialer] = await db
+      .select({ timezone: dialerServers.timezone })
+      .from(dialerServers)
+      .where(req.auth.companyId ? eq(dialerServers.companyId, req.auth.companyId) : eq(dialerServers.active, true))
+      .orderBy(desc(dialerServers.active))
+      .limit(1);
+    return { user: { ...req.auth, dialerTimezone: dialer?.timezone ?? 'UTC' } };
   });
 
   app.post('/change-password', { preHandler: [authenticate] }, async (req, reply) => {

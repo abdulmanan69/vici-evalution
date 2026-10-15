@@ -60,6 +60,54 @@ export class ViciDbClient {
     return rows as ViciCallRow[];
   }
 
+  /**
+   * Outbound legs in a window whose disposition is one of `statuses` — the
+   * realtime refresh: a row first read mid-call (INCALL) becomes XFER/SALE
+   * only when the agent dispositions, after the cursor has moved on.
+   */
+  async fetchOutboundCallsByStatus(
+    since: string,
+    until: string,
+    statuses: string[],
+    limit = 5000,
+  ): Promise<ViciCallRow[]> {
+    if (statuses.length === 0) return [];
+    const [rows] = await this.pool.query(
+      `SELECT uniqueid, lead_id, list_id, campaign_id, call_date, length_in_sec,
+              status, phone_number, user, term_reason
+         FROM vicidial_log
+        WHERE call_date > ? AND call_date <= ? AND UPPER(status) IN (?)
+        ORDER BY call_date ASC
+        LIMIT ?`,
+      [since, until, statuses.map((s) => s.toUpperCase()), limit],
+    );
+    return rows as ViciCallRow[];
+  }
+
+  /**
+   * Exact rows by uniqueid from the live AND archived table — heals calls we
+   * first saw mid-call (INCALL) whose final disposition was written later,
+   * whichever table the dialer has moved them to since.
+   */
+  async fetchCallsByUniqueIds(
+    source: 'vicidial_log' | 'vicidial_closer_log',
+    uniqueIds: string[],
+  ): Promise<ViciCallRow[]> {
+    if (uniqueIds.length === 0) return [];
+    const cols = `uniqueid, lead_id, list_id, campaign_id, call_date, length_in_sec,
+                  status, phone_number, user, term_reason`;
+    const out: ViciCallRow[] = [];
+    for (const table of [source, `${source}_archive`]) {
+      try {
+        const [rows] = await this.pool.query(`SELECT ${cols} FROM ${table} WHERE uniqueid IN (?)`, [uniqueIds]);
+        out.push(...(rows as ViciCallRow[]));
+      } catch {
+        // archive table may not exist on every dialer
+      }
+    }
+    return out;
+  }
+
   /** Closer/inbound call legs (vicidial_closer_log.campaign_id = in-group). */
   async fetchCloserCalls(since: string, until: string, limit = 5000, archive = false): Promise<ViciCallRow[]> {
     const table = archive ? 'vicidial_closer_log_archive' : 'vicidial_closer_log';

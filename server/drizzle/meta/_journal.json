@@ -43,6 +43,13 @@
       "when": 1792086756386,
       "tag": "0005_qa-tasks",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1792088438881,
+      "tag": "0006_sale-kinds",
+      "breakpoints": true
     }
   ]
 }

@@ -406,7 +406,7 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     const xferAgg = await db
       .select({ user: fronterCall.viciUserRaw, n: count() })
       .from(transfers)
-      .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
       .where(
         and(
           eq(transfers.dialerServerId, dialer.id),
@@ -517,7 +517,7 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
         closerStatus: closerCall.status,
       })
       .from(transfers)
-      .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
       .leftJoin(fronterAgent, eq(fronterCall.viciAgentId, fronterAgent.id))
       .leftJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
       .leftJoin(closerAgent, eq(closerCall.viciAgentId, closerAgent.id))

@@ -60,6 +60,8 @@ function candidateWhere(opts: {
                      where x.transfer_id = transfers.id and x.status in ('open', 'in_progress'))`,
   ];
   if (opts.queue !== 'transfer') parts.push(sql`transfers.queue_status = ${opts.queue}`);
+  // the Transfer method reviews fronter calls; sale-only entries have none
+  else parts.push(sql`transfers.kind = 'transfer'`);
   if (isAgentScoped(opts.reviewer)) parts.push(agentScopeCondition(opts.reviewer, opts.queue));
   if (opts.skipEvaluated) {
     parts.push(sql`not exists (
@@ -194,7 +196,7 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       .from(qaAssignments)
       .innerJoin(reviewer, eq(qaAssignments.assignedTo, reviewer.id))
       .innerJoin(transfers, eq(qaAssignments.transferId, transfers.id))
-      .innerJoin(fc, eq(transfers.fronterCallId, fc.id))
+      .leftJoin(fc, eq(transfers.fronterCallId, fc.id))
       .leftJoin(fa, eq(fc.viciAgentId, fa.id))
       .leftJoin(cc, eq(transfers.closerCallId, cc.id))
       .leftJoin(ca, eq(cc.viciAgentId, ca.id))

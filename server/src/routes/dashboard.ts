@@ -72,10 +72,10 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
     if (scope) tWhere.push(eq(transfers.companyId, scope));
 
     const byQueue = await db
-      .select({ queueStatus: transfers.queueStatus, n: count() })
+      .select({ queueStatus: transfers.queueStatus, kind: transfers.kind, n: count() })
       .from(transfers)
       .where(and(...tWhere))
-      .groupBy(transfers.queueStatus);
+      .groupBy(transfers.queueStatus, transfers.kind);
 
     const flagged = await db
       .select({ n: count() })
@@ -100,11 +100,11 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
       .from(evaluations)
       .where(and(...eWhere));
 
-    // daily trend: transfers vs closed, bucketed in dialer days
+    // daily trend: fronter transfers vs all sales, bucketed in dialer days
     const trend = await db
       .select({
         day: sql<string>`to_char(date_trunc('day', ${transfers.xferTime} AT TIME ZONE ${tz}), 'YYYY-MM-DD')`,
-        total: count(),
+        total: sql<number>`count(*) filter (where ${transfers.kind} = 'transfer')`,
         closed: sql<number>`count(*) filter (where ${transfers.queueStatus} = 'closed')`,
       })
       .from(transfers)
@@ -114,9 +114,21 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
       .groupBy(sql`1`)
       .orderBy(sql`1`);
 
-    const totals: Record<string, number> = { transfer: 0, unclosed: 0, closed: 0 };
-    for (const row of byQueue) totals[row.queueStatus] = row.n;
-    const totalTransfers = totals.transfer + totals.unclosed + totals.closed;
+    // Transfers = fronter XFERs. Closed = every sale (transfer, callback and
+    // inbound), matching the dialer's SALE count. Close rate stays the
+    // fronter-transfer conversion: transfers that ended in a sale.
+    const totals = { transfer: 0, unclosed: 0, closed: 0, closedFromTransfers: 0, callbackSales: 0, inboundSales: 0 };
+    for (const row of byQueue) {
+      if (row.kind === 'transfer') {
+        totals[row.queueStatus] += row.n;
+        if (row.queueStatus === 'closed') totals.closedFromTransfers += row.n;
+      } else {
+        totals.closed += row.n;
+        if (row.kind === 'callback_sale') totals.callbackSales += row.n;
+        else totals.inboundSales += row.n;
+      }
+    }
+    const totalTransfers = totals.transfer + totals.unclosed + totals.closedFromTransfers;
 
     return {
       dateFrom: fromDay,
@@ -127,7 +139,10 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
         transfer: totals.transfer,
         unclosed: totals.unclosed,
         closed: totals.closed,
-        closeRate: totalTransfers > 0 ? Math.round((totals.closed / totalTransfers) * 1000) / 10 : 0,
+        closedFromTransfers: totals.closedFromTransfers,
+        callbackSales: totals.callbackSales,
+        inboundSales: totals.inboundSales,
+        closeRate: totalTransfers > 0 ? Math.round((totals.closedFromTransfers / totalTransfers) * 1000) / 10 : 0,
         flaggedMatches: flagged[0]?.n ?? 0,
         missingRecordings: missingRecordings[0]?.n ?? 0,
         evaluationsCompleted: evalStats?.n ?? 0,

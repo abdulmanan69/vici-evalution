@@ -26,6 +26,7 @@ export const agentRoleEnum = pgEnum('agent_role', ['fronter', 'closer', 'blended
 export const dispoMeaningEnum = pgEnum('dispo_meaning', ['transfer', 'sale', 'no_sale', 'callback', 'dnc', 'other']);
 export const matchStatusEnum = pgEnum('match_status', ['pending_match', 'matched', 'flagged', 'unmatched']);
 export const queueStatusEnum = pgEnum('queue_status', ['transfer', 'unclosed', 'closed']);
+export const transferKindEnum = pgEnum('transfer_kind', ['transfer', 'callback_sale', 'inbound_sale']);
 export const recordingStatusEnum = pgEnum('recording_status', ['pending', 'available', 'missing', 'error']);
 export const formStateEnum = pgEnum('form_state', ['draft', 'published', 'archived']);
 export const formTargetEnum = pgEnum('form_target', ['fronter', 'closer', 'any']);
@@ -287,10 +288,16 @@ export const transfers = pgTable(
     dialerServerId: uuid('dialer_server_id')
       .notNull()
       .references(() => dialerServers.id, { onDelete: 'cascade' }),
-    fronterCallId: uuid('fronter_call_id')
-      .notNull()
-      .references(() => calls.id, { onDelete: 'cascade' }),
+    // 'transfer' = a fronter XFER. 'callback_sale' / 'inbound_sale' = a sale
+    // that reached no fronter transfer (a closer's own callback, or a call
+    // that came straight into the closer group) — those have no fronter leg
+    // and live only in the Closed queue, so Closed matches the dialer's SALEs.
+    kind: transferKindEnum('kind').notNull().default('transfer'),
+    fronterCallId: uuid('fronter_call_id').references(() => calls.id, { onDelete: 'cascade' }),
     closerCallId: uuid('closer_call_id').references(() => calls.id, { onDelete: 'set null' }),
+    // a sale made on a LATER call of the same lead (closer callback) that
+    // closes this transfer when its own closer leg was not the sale
+    saleCallId: uuid('sale_call_id').references(() => calls.id, { onDelete: 'set null' }),
     xferTime: timestamp('xfer_time', { withTimezone: true }).notNull(),
     phoneNumber: varchar('phone_number', { length: 24 }),
     viciLeadId: bigint('vici_lead_id', { mode: 'number' }),
@@ -309,9 +316,17 @@ export const transfers = pgTable(
   (t) => [
     // one transfer record per fronter call — duplicate sync runs are idempotent
     uniqueIndex('transfers_fronter_call_uq').on(t.fronterCallId),
+    // one sale-only record per sale call
+    uniqueIndex('transfers_sale_only_uq')
+      .on(t.closerCallId)
+      .where(sql`${t.kind} <> 'transfer'`),
+    uniqueIndex('transfers_sale_call_uq')
+      .on(t.saleCallId)
+      .where(sql`${t.saleCallId} is not null`),
     index('transfers_company_queue_idx').on(t.companyId, t.queueStatus, t.xferTime),
     index('transfers_match_idx').on(t.matchStatus),
     index('transfers_closer_call_idx').on(t.closerCallId),
+    index('transfers_lead_idx').on(t.dialerServerId, t.viciLeadId),
   ],
 );
 

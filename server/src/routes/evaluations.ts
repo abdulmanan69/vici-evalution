@@ -191,7 +191,7 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
           closerStatus: closerCall.status,
         })
         .from(transfers)
-        .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+        .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
         .leftJoin(fronterAgent, eq(fronterCall.viciAgentId, fronterAgent.id))
         .leftJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
         .leftJoin(closerAgent, eq(closerCall.viciAgentId, closerAgent.id))
