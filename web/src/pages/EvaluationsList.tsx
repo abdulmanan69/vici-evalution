@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Download, Headphones, X } from 'lucide-react';
 import { api } from '../api/client';
@@ -189,11 +189,13 @@ export function EvaluationsListPage() {
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState('');
   const [mine, setMine] = useState(false);
-  const [agent, setAgent] = useState('');
+  // reports drill into this page with ?agent=&dateFrom=&dateTo=
+  const [searchParams] = useSearchParams();
+  const [agent, setAgent] = useState(searchParams.get('agent') ?? '');
   const [formId, setFormId] = useState('');
   const [result, setResult] = useState('');
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
+  const [dateFrom, setDateFrom] = useState(searchParams.get('dateFrom') ?? '');
+  const [dateTo, setDateTo] = useState(searchParams.get('dateTo') ?? '');
   const [drawerId, setDrawerId] = useState<string | null>(null);
 
   useEffect(() => setPage(1), [companyId, status, mine, agent, formId, result, dateFrom, dateTo]);

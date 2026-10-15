@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import {
   bigint,
   boolean,
+  date,
   index,
   integer,
   jsonb,
@@ -494,12 +495,18 @@ export const qaAssignments = pgTable(
     assignedBy: uuid('assigned_by').references(() => users.id),
     dueAt: timestamp('due_at', { withTimezone: true }),
     status: assignmentStatusEnum('status').notNull().default('open'),
+    /** the dialer-local day the assigned calls happened on */
+    taskDate: date('task_date'),
+    /** the method the reviewer applies to this call */
+    queue: queueStatusEnum('queue'),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
     uniqueIndex('qa_assignments_transfer_user_uq').on(t.transferId, t.assignedTo),
     index('qa_assignments_assignee_idx').on(t.assignedTo, t.status),
+    index('qa_assignments_company_date_idx').on(t.companyId, t.taskDate),
   ],
 );
 

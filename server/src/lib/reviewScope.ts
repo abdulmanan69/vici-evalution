@@ -28,16 +28,27 @@ export function agentScopeCondition(auth: AuthContext, queue: QueueName): SQL {
   )`;
 }
 
+/** An open or in-progress task on this call — a manager's explicit assignment. */
+export async function hasActiveTask(userId: string, transferId: string): Promise<boolean> {
+  const result = await db.execute(
+    sql`select 1 from qa_assignments
+         where assigned_to = ${userId} and transfer_id = ${transferId}
+           and status in ('open', 'in_progress') limit 1`,
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
 /**
  * Whether an agent-scoped reviewer may open/evaluate this transfer: either
  * its fronter is theirs for 'transfer', or its closer is theirs for the
- * transfer's current queue.
+ * transfer's current queue. A task assigned by a manager always grants it.
  */
 export async function canReviewTransfer(
   auth: AuthContext,
   transfer: { id: string; queueStatus: QueueName },
 ): Promise<boolean> {
   if (!isAgentScoped(auth)) return true;
+  if (await hasActiveTask(auth.userId, transfer.id)) return true;
   const checks: QueueName[] = ['transfer'];
   if (transfer.queueStatus !== 'transfer') checks.push(transfer.queueStatus);
   const conds = checks.map((q) => agentScopeCondition(auth, q));

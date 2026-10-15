@@ -266,6 +266,10 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
         answers: {},
       })
       .returning();
+    // starting the evaluation starts the reviewer's task for this call
+    await db.execute(sql`
+      update qa_assignments set status = 'in_progress', updated_at = now()
+       where transfer_id = ${transfer.id} and assigned_to = ${req.auth.userId} and status = 'open'`);
     await audit(req, { action: 'evaluation.create', entityType: 'evaluation', entityId: row.id, companyId: transfer.companyId });
     return reply.status(201).send({ evaluation: row });
   });
@@ -333,6 +337,13 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       })
       .where(eq(evaluations.id, id))
       .returning();
+    // the reviewer's task for this call is done
+    if (evalRow.transferId) {
+      await db.execute(sql`
+        update qa_assignments set status = 'done', completed_at = now(), updated_at = now()
+         where transfer_id = ${evalRow.transferId} and assigned_to = ${evalRow.reviewerId}
+           and status in ('open', 'in_progress')`);
+    }
     await audit(req, {
       action: 'evaluation.complete',
       entityType: 'evaluation',

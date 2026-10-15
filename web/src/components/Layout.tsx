@@ -7,6 +7,7 @@ import {
   BadgeCheck,
   BarChart3,
   Building2,
+  CalendarCheck,
   ClipboardList,
   FileSpreadsheet,
   Gauge,
@@ -17,6 +18,7 @@ import {
   PhoneForwarded,
   Server,
   Settings2,
+  TrendingUp,
   UserCog,
   Users,
 } from 'lucide-react';
@@ -57,10 +59,17 @@ const NAV: { group: string; items: NavItem[] }[] = [
   {
     group: 'Quality',
     items: [
-      { to: '/qa/forms', label: 'QA forms', icon: <ClipboardList size={16} />, perm: 'qa.forms.manage' },
+      { to: '/qa/tasks', label: 'Tasks', icon: <CalendarCheck size={16} />, perm: 'qa.evaluate' },
       { to: '/qa/evaluations', label: 'Evaluations', icon: <ListChecks size={16} />, perm: 'qa.view' },
       { to: '/qa/team', label: 'QA team', icon: <UserCog size={16} />, perm: 'qa.assign' },
-      { to: '/reports/agents', label: 'Agent report', icon: <BarChart3 size={16} />, perm: 'reports.view' },
+      { to: '/qa/forms', label: 'QA forms', icon: <ClipboardList size={16} />, perm: 'qa.forms.manage' },
+    ],
+  },
+  {
+    group: 'Reports',
+    items: [
+      { to: '/reports/qa', label: 'QA performance', icon: <TrendingUp size={16} />, perm: 'reports.view' },
+      { to: '/reports/agents', label: 'Agent activity', icon: <BarChart3 size={16} />, perm: 'reports.view' },
     ],
   },
   {

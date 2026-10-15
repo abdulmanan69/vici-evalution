@@ -103,6 +103,18 @@ export async function resolveSession(token: string): Promise<AuthContext | null>
   return withAllowedQueues(toAuthContext(row.user, row.role));
 }
 
+/** A user's effective access (form, queue and agent limits) without a session. */
+export async function authContextForUser(userId: string): Promise<AuthContext | null> {
+  const rows = await db
+    .select({ user: users, role: roles })
+    .from(users)
+    .innerJoin(roles, eq(users.roleId, roles.id))
+    .where(eq(users.id, userId));
+  const row = rows[0];
+  if (!row) return null;
+  return withAllowedQueues(toAuthContext(row.user, row.role));
+}
+
 export async function logout(token: string): Promise<void> {
   await db.delete(sessions).where(eq(sessions.tokenHash, sha256(token)));
 }

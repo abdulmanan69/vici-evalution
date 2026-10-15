@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
-import { and, count, desc, eq, gte, lte, sql, sum, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, inArray, lte, sql, sum, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { calls, dialerServers, evaluations, qaFormVersions, qaForms, transfers, users, viciAgents } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
@@ -67,7 +67,194 @@ const exportQuery = z.object({
   queueStatus: z.enum(['transfer', 'unclosed', 'closed']).optional(),
 });
 
+const qaPerformanceQuery = z.object({
+  companyId: z.string().uuid().optional(),
+  dateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  dateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  groupBy: z.enum(['agent', 'reviewer']).default('agent'),
+  formId: z.string().uuid().optional(),
+  format: z.enum(['json', 'csv']).default('json'),
+});
+
+const num = (v: unknown): number => (v === null || v === undefined ? 0 : Number(v));
+const pct1 = (part: number, whole: number): number => (whole > 0 ? Math.round((part / whole) * 1000) / 10 : 0);
+
 export async function reportRoutes(app: FastifyInstance): Promise<void> {
+  /**
+   * QA performance for a dialer-day range, grouped by the evaluated agent
+   * (fronter leg for fronter forms, closer leg for closer forms) or by the
+   * reviewer who scored them — with task completion for reviewers.
+   */
+  app.get('/qa-performance', { preHandler: [requirePermission('reports.view')] }, async (req, reply) => {
+    const q = qaPerformanceQuery.parse(req.query);
+    if (q.dateTo < q.dateFrom) throw new ValidationError('dateTo must not be before dateFrom');
+    if ((Date.parse(q.dateTo) - Date.parse(q.dateFrom)) / 86_400_000 > 366) {
+      throw new ValidationError('Range too large — pick at most a year');
+    }
+    const scope = companyScope(req, q.companyId);
+    const [dialerRow] = await db
+      .select({ timezone: dialerServers.timezone })
+      .from(dialerServers)
+      .where(scope ? eq(dialerServers.companyId, scope) : eq(dialerServers.active, true))
+      .limit(1);
+    const tz = dialerRow?.timezone ?? 'UTC';
+    const start = localToUtc(`${q.dateFrom} 00:00:00`, tz);
+    const end = localToUtc(`${q.dateTo} 23:59:59`, tz);
+
+    const filters: SQL[] = [
+      sql`e.status = 'completed'`,
+      sql`e.completed_at >= ${start}`,
+      sql`e.completed_at <= ${end}`,
+    ];
+    if (scope) filters.push(sql`e.company_id = ${scope}`);
+    if (q.formId) filters.push(sql`f.id = ${q.formId}`);
+    const base = sql`
+      select e.id, e.reviewer_id, e.percent, e.passed, e.auto_failed, f.queue as form_queue,
+             case when f.target = 'fronter' then fc.vici_agent_id
+                  when f.target = 'closer' then cc.vici_agent_id
+                  else coalesce(cc.vici_agent_id, fc.vici_agent_id) end as agent_id
+        from evaluations e
+        join qa_form_versions v on v.id = e.form_version_id
+        join qa_forms f on f.id = v.form_id
+        left join transfers t on t.id = e.transfer_id
+        left join calls fc on fc.id = t.fronter_call_id
+        left join calls cc on cc.id = t.closer_call_id
+       where ${sql.join(filters, sql` and `)}`;
+    const aggregates = sql`
+      count(*)::int as evaluations,
+      round(avg(ev.percent)::numeric, 1) as avg_percent,
+      min(ev.percent) as lowest,
+      max(ev.percent) as highest,
+      count(*) filter (where ev.passed)::int as passed,
+      count(*) filter (where not ev.passed and not ev.auto_failed)::int as failed,
+      count(*) filter (where ev.auto_failed)::int as auto_failed,
+      count(*) filter (where ev.form_queue = 'transfer')::int as transfer_evals,
+      count(*) filter (where ev.form_queue = 'unclosed')::int as unclosed_evals,
+      count(*) filter (where ev.form_queue = 'closed')::int as closed_evals`;
+
+    type Row = Record<string, unknown>;
+    let rows: Array<Record<string, string | number | null>> = [];
+
+    if (q.groupBy === 'agent') {
+      const result = await db.execute(sql`
+        with ev as (${base})
+        select ev.agent_id, a.full_name, a.vici_user, a.agent_role, ${aggregates}
+          from ev left join vici_agents a on a.id = ev.agent_id
+         group by ev.agent_id, a.full_name, a.vici_user, a.agent_role
+         order by evaluations desc, a.full_name`);
+      rows = (result.rows as Row[]).map((r) => {
+        const evals = num(r.evaluations);
+        return {
+          id: (r.agent_id as string | null) ?? null,
+          name: (r.full_name as string | null) ?? (r.vici_user as string | null) ?? 'Unknown agent',
+          user: (r.vici_user as string | null) ?? null,
+          role: (r.agent_role as string | null) ?? null,
+          evaluations: evals,
+          avgPercent: r.avg_percent === null ? null : num(r.avg_percent),
+          lowest: r.lowest === null ? null : num(r.lowest),
+          highest: r.highest === null ? null : num(r.highest),
+          passed: num(r.passed),
+          failed: num(r.failed),
+          autoFailed: num(r.auto_failed),
+          passRate: pct1(num(r.passed), evals),
+          transferEvals: num(r.transfer_evals),
+          unclosedEvals: num(r.unclosed_evals),
+          closedEvals: num(r.closed_evals),
+        };
+      });
+    } else {
+      const evalResult = await db.execute(sql`
+        with ev as (${base})
+        select ev.reviewer_id, ${aggregates} from ev group by ev.reviewer_id`);
+      const taskWhere: SQL[] = [
+        sql`x.status <> 'cancelled'`,
+        sql`x.task_date >= ${q.dateFrom}::date`,
+        sql`x.task_date <= ${q.dateTo}::date`,
+      ];
+      if (scope) taskWhere.push(sql`x.company_id = ${scope}`);
+      const taskResult = await db.execute(sql`
+        select x.assigned_to,
+               count(*)::int as tasks,
+               count(*) filter (where x.status = 'done')::int as tasks_done,
+               count(*) filter (where x.status = 'done' and x.due_at is not null
+                                  and x.completed_at > x.due_at)::int as tasks_late
+          from qa_assignments x
+         where ${sql.join(taskWhere, sql` and `)}
+         group by x.assigned_to`);
+      const evalBy = new Map((evalResult.rows as Row[]).map((r) => [r.reviewer_id as string, r]));
+      const taskBy = new Map((taskResult.rows as Row[]).map((r) => [r.assigned_to as string, r]));
+      const ids = [...new Set([...evalBy.keys(), ...taskBy.keys()])];
+      const names = ids.length
+        ? await db.select({ id: users.id, name: users.name, email: users.email }).from(users).where(inArray(users.id, ids))
+        : [];
+      rows = names
+        .map((u) => {
+          const e = evalBy.get(u.id) ?? {};
+          const t = taskBy.get(u.id) ?? {};
+          const evals = num(e.evaluations);
+          const tasks = num(t.tasks);
+          return {
+            id: u.id,
+            name: u.name,
+            user: u.email,
+            role: null,
+            evaluations: evals,
+            avgPercent: e.avg_percent === undefined || e.avg_percent === null ? null : num(e.avg_percent),
+            lowest: e.lowest === undefined || e.lowest === null ? null : num(e.lowest),
+            highest: e.highest === undefined || e.highest === null ? null : num(e.highest),
+            passed: num(e.passed),
+            failed: num(e.failed),
+            autoFailed: num(e.auto_failed),
+            passRate: pct1(num(e.passed), evals),
+            transferEvals: num(e.transfer_evals),
+            unclosedEvals: num(e.unclosed_evals),
+            closedEvals: num(e.closed_evals),
+            tasks,
+            tasksDone: num(t.tasks_done),
+            tasksLate: num(t.tasks_late),
+            taskCompletion: pct1(num(t.tasks_done), tasks),
+          };
+        })
+        .sort((a, b) => b.evaluations - a.evaluations || a.name.localeCompare(b.name));
+    }
+
+    const totalEvals = rows.reduce((s, r) => s + num(r.evaluations), 0);
+    const totalPassed = rows.reduce((s, r) => s + num(r.passed), 0);
+    const weightedAvg = totalEvals
+      ? Math.round((rows.reduce((s, r) => s + num(r.avgPercent) * num(r.evaluations), 0) / totalEvals) * 10) / 10
+      : null;
+    const summary = {
+      evaluations: totalEvals,
+      avgPercent: weightedAvg,
+      passRate: pct1(totalPassed, totalEvals),
+      autoFailed: rows.reduce((s, r) => s + num(r.autoFailed), 0),
+      people: rows.filter((r) => num(r.evaluations) > 0).length,
+      tasks: rows.reduce((s, r) => s + num(r.tasks), 0),
+      tasksDone: rows.reduce((s, r) => s + num(r.tasksDone), 0),
+    };
+
+    if (q.format === 'csv') {
+      const isAgent = q.groupBy === 'agent';
+      const header = [
+        isAgent ? 'agent' : 'reviewer', isAgent ? 'agent_user' : 'email', 'evaluations', 'avg_percent',
+        'pass_rate', 'passed', 'failed', 'auto_failed', 'lowest', 'highest',
+        'transfer_evals', 'unclosed_evals', 'closed_evals',
+        ...(isAgent ? [] : ['tasks', 'tasks_done', 'task_completion_percent', 'tasks_late']),
+      ];
+      const body = rows.map((r) => [
+        r.name, r.user, r.evaluations, r.avgPercent, r.passRate, r.passed, r.failed, r.autoFailed,
+        r.lowest, r.highest, r.transferEvals, r.unclosedEvals, r.closedEvals,
+        ...(isAgent ? [] : [r.tasks, r.tasksDone, r.taskCompletion, r.tasksLate]),
+      ]);
+      await audit(req, { action: 'report.export_qa_performance', after: { groupBy: q.groupBy, rows: rows.length } });
+      reply.header('content-type', 'text/csv; charset=utf-8');
+      reply.header('content-disposition', `attachment; filename="qa-performance-${q.groupBy}-${q.dateFrom}_${q.dateTo}.csv"`);
+      return reply.send(toCsv(header, body));
+    }
+
+    return { dateFrom: q.dateFrom, dateTo: q.dateTo, timezone: tz, groupBy: q.groupBy, summary, rows };
+  });
+
   /**
    * Per-agent activity for a dialer-local date range — the platform's
    * counterpart to VICIdial's "Agent Status Detail" report.
