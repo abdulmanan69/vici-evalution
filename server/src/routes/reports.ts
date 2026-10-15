@@ -424,30 +424,42 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
       .orderBy(desc(evaluations.completedAt))
       .limit(EXPORT_LIMIT);
 
-    // one column per scored question when a single form is exported —
-    // columns come from the newest version, answers matched by question id
+    // one column per scored AND informational question for EVERY form in the
+    // export, grouped per form — rows fill their own form's columns and leave
+    // the others blank, so a mixed export still carries all parameters
     type Q = { id: string; text: string; type: string; weight: number; scaleMax?: number; options?: Array<{ value: string; label: string; scorePct: number }> };
-    let questionCols: Q[] = [];
-    if (q.formId && rows.length > 0) {
-      const newest = rows.reduce((a, b) => (a.formVersion >= b.formVersion ? a : b));
-      const schema = newest.schema as { sections: Array<{ questions: Q[] }> };
-      questionCols = schema.sections.flatMap((s) => s.questions).filter((qq) => qq.weight > 0);
+    const newestByForm = new Map<string, { formName: string; formVersion: number; schema: unknown; formId: string }>();
+    for (const r of rows) {
+      const key = `${r.formName}`;
+      const prev = newestByForm.get(key);
+      if (!prev || r.formVersion > prev.formVersion) {
+        newestByForm.set(key, { formName: r.formName, formVersion: r.formVersion, schema: r.schema, formId: key });
+      }
     }
+    const questionCols: Array<{ formName: string; q: Q }> = [];
+    for (const f of newestByForm.values()) {
+      const schema = f.schema as { sections: Array<{ questions: Q[] }> };
+      for (const qq of schema.sections.flatMap((s) => s.questions)) {
+        questionCols.push({ formName: f.formName, q: qq });
+      }
+    }
+    const prefix = newestByForm.size > 1 ? (c: { formName: string; q: Q }) => `${c.formName.split(' ')[0]}: ` : () => '';
 
     const header = [
       'date', 'time', 'number', 'agent', 'evaluator', 'method', 'result', 'score_percent',
-      ...questionCols.map((qq) => `${qq.text} (/${qq.weight})`),
+      ...questionCols.map((c) => `${prefix(c)}${c.q.text}${c.q.weight > 0 ? ` (/${c.q.weight})` : ''}`),
       'comments',
     ];
     const body = rows.map((r) => {
       const local = r.evaluation.completedAt ? utcToLocalString(r.evaluation.completedAt, tz) : '';
       const agent = r.formTarget === 'fronter' ? (r.fronterAgent ?? r.fronterUser) : (r.closerAgent ?? r.closerUser);
       const answers = (r.evaluation.answers ?? {}) as Record<string, unknown>;
-      const qCells = questionCols.map((qq) => {
-        const v = answers[qq.id];
+      const qCells = questionCols.map((c) => {
+        if (c.formName !== r.formName) return '';
+        const v = answers[c.q.id];
         if (v === null || v === undefined || v === '') return '';
-        if (qq.type === 'rating') return `${v}/${qq.scaleMax ?? 5}`;
-        if (qq.type === 'dropdown') return qq.options?.find((o) => o.value === String(v))?.label ?? String(v);
+        if (c.q.type === 'rating') return `${v}/${c.q.scaleMax ?? 5}`;
+        if (c.q.type === 'dropdown') return c.q.options?.find((o) => o.value === String(v))?.label ?? String(v);
         return String(v);
       });
       return [
