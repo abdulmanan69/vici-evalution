@@ -19,6 +19,8 @@ import { NotFoundError, ValidationError } from '../lib/errors.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { scoreCandidate, DEFAULT_MATCH_OPTIONS } from '../vicidial/matcher.js';
 import { localToUtc } from '../vicidial/timezone.js';
+import { toConnection } from '../vicidial/credentials.js';
+import { getPooledDbClient } from '../vicidial/dbPool.js';
 
 const fronterCall = alias(calls, 'fronter_call');
 const closerCall = alias(calls, 'closer_call');
@@ -164,7 +166,30 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(evaluations.transferId, transferId))
       .orderBy(desc(evaluations.createdAt));
 
-    return { ...row, recordings: recRows, events, evaluations: evals };
+    // Lead details, fetched live from the dialer by primary key through a
+    // cached pool. Capped at 2.5s and always optional — the page never
+    // waits on or fails because of lead info.
+    let lead: Record<string, unknown> | null = null;
+    const leadId = row.transfer.viciLeadId ?? row.fronterCall.viciLeadId;
+    if (leadId != null) {
+      try {
+        const [dialerRow] = await db
+          .select()
+          .from(dialerServers)
+          .where(eq(dialerServers.id, row.transfer.dialerServerId));
+        const client = dialerRow ? getPooledDbClient(toConnection(dialerRow)) : null;
+        if (client) {
+          lead = await Promise.race([
+            client.fetchLead(leadId),
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+          ]);
+        }
+      } catch {
+        lead = null;
+      }
+    }
+
+    return { ...row, lead, recordings: recRows, events, evaluations: evals };
   });
 
   // Candidate closer calls for a flagged transfer, scored — for manual resolution.

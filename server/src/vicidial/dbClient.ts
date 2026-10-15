@@ -90,6 +90,21 @@ export class ViciDbClient {
     return rows as ViciRecordingRow[];
   }
 
+  /** One lead's details for the call page — primary-key lookup, milliseconds. */
+  async fetchLead(leadId: number): Promise<Record<string, unknown> | null> {
+    const [rows] = await this.pool.query(
+      `SELECT lead_id, status, list_id, phone_number, alt_phone, title, first_name,
+              middle_initial, last_name, address1, address2, address3, city, state,
+              postal_code, country_code, email, vendor_lead_code, source_id,
+              security_phrase, comments, called_count, last_local_call_time, entry_date
+         FROM vicidial_list
+        WHERE lead_id = ?
+        LIMIT 1`,
+      [leadId],
+    );
+    return (rows as Record<string, unknown>[])[0] ?? null;
+  }
+
   async fetchUsers(): Promise<ViciUserRow[]> {
     const [rows] = await this.pool.query(
       `SELECT user, full_name, user_group, user_level, active FROM vicidial_users`,

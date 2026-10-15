@@ -8,10 +8,13 @@ import { useAuth } from '../auth/AuthContext';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
+type LeadInfo = Record<string, string | number | null>;
+
 interface Detail {
   transfer: Transfer;
   fronterCall: Call;
   closerCall: Call | null;
+  lead: LeadInfo | null;
   fronterAgentUser: string | null;
   fronterAgentName: string | null;
   closerAgentUser: string | null;
@@ -93,6 +96,57 @@ function CallLeg({
             )}
           </div>
         </>
+      )}
+    </div>
+  );
+}
+
+function LeadCard({ lead }: { lead: LeadInfo }) {
+  const s = (k: string): string => {
+    const v = lead[k];
+    return v === null || v === undefined || v === '' ? '' : String(v);
+  };
+  const name = [s('title'), s('first_name'), s('middle_initial'), s('last_name')]
+    .filter(Boolean)
+    .join(' ');
+  const address = [s('address1'), s('address2'), s('address3')].filter(Boolean).join(', ');
+  const cityLine = [s('city'), s('state'), s('postal_code')].filter(Boolean).join(', ');
+  const fields: Array<{ label: string; value: string; mono?: boolean }> = [
+    { label: 'Name', value: name },
+    { label: 'Phone', value: s('phone_number'), mono: true },
+    { label: 'Alt phone', value: s('alt_phone'), mono: true },
+    { label: 'Email', value: s('email'), mono: true },
+    { label: 'Address', value: address },
+    { label: 'City / State / ZIP', value: cityLine },
+    { label: 'Lead status', value: s('status'), mono: true },
+    { label: 'Lead ID', value: s('lead_id'), mono: true },
+    { label: 'List ID', value: s('list_id'), mono: true },
+    { label: 'Vendor code', value: s('vendor_lead_code'), mono: true },
+    { label: 'Times called', value: s('called_count'), mono: true },
+    { label: 'Last call', value: s('last_local_call_time'), mono: true },
+    { label: 'Entered', value: s('entry_date'), mono: true },
+    { label: 'Security phrase', value: s('security_phrase') },
+  ].filter((f) => f.value !== '');
+  const comments = s('comments');
+
+  return (
+    <div className="card mt-4 p-4">
+      <h2 className="mb-3 font-display text-sm font-bold">Lead details</h2>
+      <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm md:grid-cols-3 lg:grid-cols-4">
+        {fields.map((f) => (
+          <div key={f.label} className="min-w-0">
+            <dt className="label">{f.label}</dt>
+            <dd className={`truncate ${f.mono ? 'font-mono text-[13px]' : ''}`} title={f.value}>
+              {f.value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+      {comments && (
+        <div className="mt-3 rounded-md bg-bg px-3 py-2 text-sm">
+          <span className="label">Comments</span>
+          <p className="whitespace-pre-wrap">{comments}</p>
+        </div>
       )}
     </div>
   );
@@ -197,6 +251,8 @@ export function TransferDetailPage() {
           recordings={closerRecs}
         />
       </div>
+
+      {data.lead && <LeadCard lead={data.lead} />}
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <div className="card p-4">
