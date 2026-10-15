@@ -68,8 +68,8 @@ export async function fetchAgentStatusDetail(
  * Data rows follow until the TOTALS row; the ID cell contains an <a> link.
  */
 export function parseAgentStatusDetail(html: string): AgentStatusDetail {
-  const text = html.replace(/<[^>]+>/g, '');
-  const lines = text.split('\n');
+  const rawLines = html.split('\n');
+  const lines = rawLines.map((l) => l.replace(/<[^>]+>/g, ''));
 
   const headerIdx = lines.findIndex((l) => /^\s*\|\s*USER NAME\s*\|/.test(l) && /\|\s*CALLS\s*\|/.test(l));
   if (headerIdx === -1) {
@@ -96,7 +96,8 @@ export function parseAgentStatusDetail(html: string): AgentStatusDetail {
     });
     rows.push({
       name: cells[0],
-      user: cells[1],
+      // the TEXT table truncates IDs to 8 chars; the link carries the full one
+      user: linkedUser(rawLines[i]) ?? cells[1],
       calls,
       statusCounts,
     });
@@ -105,6 +106,16 @@ export function parseAgentStatusDetail(html: string): AgentStatusDetail {
     throw new Error('Agent table parsed but contained no data rows');
   }
   return { statuses, rows };
+}
+
+function linkedUser(rawLine: string): string | null {
+  const m = /user_stats\.php\?[^"'>]*?\buser=([^&"'>]+)/i.exec(rawLine);
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1].replace(/\+/g, ' ')).trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -54,8 +54,8 @@ function candidateWhere(opts: {
   const parts: SQL[] = [
     sql`transfers.company_id = ${opts.companyId}`,
     sql`transfers.is_mock = false`,
-    sql`transfers.xfer_time >= ${opts.start}`,
-    sql`transfers.xfer_time <= ${opts.end}`,
+    sql`coalesce(transfers.counted_at, transfers.xfer_time) >= ${opts.start}`,
+    sql`coalesce(transfers.counted_at, transfers.xfer_time) <= ${opts.end}`,
     sql`not exists (select 1 from qa_assignments x
                      where x.transfer_id = transfers.id and x.status in ('open', 'in_progress'))`,
   ];

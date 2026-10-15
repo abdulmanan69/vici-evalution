@@ -14,6 +14,17 @@ export interface ViciCallRow {
   term_reason: string | null;
 }
 
+/** vicidial_agent_log — the agent's chosen disposition per handled call. */
+export interface AgentLogRow {
+  agent_log_id: number;
+  user: string | null;
+  event_time: string; // dialer-local
+  status: string | null;
+  lead_id: number | null;
+  uniqueid: string | null;
+  campaign_id: string | null;
+}
+
 export interface ViciRecordingRow {
   recording_id: number;
   start_time: string | null;

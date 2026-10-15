@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
 import { and, count, desc, eq, gte, inArray, lte, sql, sum, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { calls, dialerServers, evaluations, qaFormVersions, qaForms, transfers, users, viciAgents } from '../db/schema.js';
+import { agentDispositions, calls, dialerServers, evaluations, qaFormVersions, qaForms, transfers, users, viciAgents } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
@@ -403,19 +403,29 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const fronterCall = alias(calls, 'fc');
+    // credited like the dialer does: to the agent who dispositioned the XFER
+    const xferUser = sql<string | null>`coalesce(${agentDispositions.viciUser}, ${fronterCall.viciUserRaw})`;
     const xferAgg = await db
-      .select({ user: fronterCall.viciUserRaw, n: count() })
+      .select({ user: xferUser, n: count() })
       .from(transfers)
       .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(
+        agentDispositions,
+        and(
+          eq(agentDispositions.dialerServerId, transfers.dialerServerId),
+          eq(agentDispositions.agentLogId, transfers.agentLogId),
+        ),
+      )
       .where(
         and(
           eq(transfers.dialerServerId, dialer.id),
           eq(transfers.isMock, false),
-          gte(transfers.xferTime, startUtc),
-          lte(transfers.xferTime, endUtc),
+          eq(transfers.kind, 'transfer'),
+          sql`coalesce(${transfers.countedAt}, ${transfers.xferTime}) >= ${startUtc}`,
+          sql`coalesce(${transfers.countedAt}, ${transfers.xferTime}) <= ${endUtc}`,
         ),
       )
-      .groupBy(fronterCall.viciUserRaw);
+      .groupBy(sql`1`);
     for (const a of xferAgg) {
       if (a.user) ensure(a.user).transfersStarted = a.n;
     }
@@ -424,14 +434,16 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     const saleAgg = await db
       .select({ user: closerCall.viciUserRaw, n: count() })
       .from(transfers)
-      .innerJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
+      // the sale leg (a later callback when the closer leg was not the sale),
+      // credited on its own day like the dialer's SALE column
+      .innerJoin(closerCall, sql`${closerCall.id} = coalesce(${transfers.saleCallId}, ${transfers.closerCallId})`)
       .where(
         and(
           eq(closerCall.dialerServerId, dialer.id),
           eq(transfers.isMock, false),
           eq(transfers.queueStatus, 'closed'),
-          gte(transfers.xferTime, startUtc),
-          lte(transfers.xferTime, endUtc),
+          gte(closerCall.callDate, startUtc),
+          lte(closerCall.callDate, endUtc),
         ),
       )
       .groupBy(closerCall.viciUserRaw);
@@ -494,8 +506,8 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
 
     const where: SQL[] = [eq(transfers.isMock, false)];
     if (scope) where.push(eq(transfers.companyId, scope));
-    if (q.dateFrom) where.push(gte(transfers.xferTime, q.dateFrom));
-    if (q.dateTo) where.push(lte(transfers.xferTime, q.dateTo));
+    if (q.dateFrom) where.push(sql`coalesce(${transfers.countedAt}, ${transfers.xferTime}) >= ${q.dateFrom}`);
+    if (q.dateTo) where.push(sql`coalesce(${transfers.countedAt}, ${transfers.xferTime}) <= ${q.dateTo}`);
     if (q.queueStatus) where.push(eq(transfers.queueStatus, q.queueStatus));
 
     const rows = await db

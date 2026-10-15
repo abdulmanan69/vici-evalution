@@ -175,7 +175,7 @@ async function seedDemo(roleIds: Record<string, string>): Promise<void> {
   await db.insert(dispositionMappings).values([
     { companyId: company.id, dispositionCode: 'XFER', meaning: 'transfer', createdBy: demoAdmin.id },
     { companyId: company.id, dispositionCode: 'SALE', meaning: 'sale', createdBy: demoAdmin.id },
-    { companyId: company.id, dispositionCode: 'NI', meaning: 'no_sale', createdBy: demoAdmin.id },
+    { companyId: company.id, dispositionCode: 'NI', meaning: 'other', createdBy: demoAdmin.id },
   ]);
 
   // Mock call pair: fronter XFER on dialer A -> closer SALE on dialer B.

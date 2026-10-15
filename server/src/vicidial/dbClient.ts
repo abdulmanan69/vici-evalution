@@ -1,5 +1,6 @@
 import mysql from 'mysql2/promise';
 import type {
+  AgentLogRow,
   DialerConnection,
   ViciCallRow,
   ViciCampaignRow,
@@ -103,6 +104,49 @@ export class ViciDbClient {
         out.push(...(rows as ViciCallRow[]));
       } catch {
         // archive table may not exist on every dialer
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Agent dispositions (vicidial_agent_log) with one of `statuses`, by
+   * event_time — the source of VICIdial's Agent Status Detail counts.
+   */
+  async fetchAgentDispositions(
+    since: string,
+    until: string,
+    statuses: string[],
+    archive = false,
+    limit = 5000,
+  ): Promise<AgentLogRow[]> {
+    if (statuses.length === 0) return [];
+    const table = archive ? 'vicidial_agent_log_archive' : 'vicidial_agent_log';
+    const [rows] = await this.pool.query(
+      `SELECT agent_log_id, user, event_time, status, lead_id, uniqueid, campaign_id
+         FROM ${table}
+        WHERE event_time > ? AND event_time <= ? AND UPPER(status) IN (?)
+        ORDER BY event_time ASC
+        LIMIT ?`,
+      [since, until, statuses.map((s) => s.toUpperCase()), limit],
+    );
+    return rows as AgentLogRow[];
+  }
+
+  /** Current status of known agent-log rows (live and archive), to catch edits. */
+  async fetchAgentLogByIds(ids: number[]): Promise<AgentLogRow[]> {
+    if (ids.length === 0) return [];
+    const out: AgentLogRow[] = [];
+    for (const table of ['vicidial_agent_log', 'vicidial_agent_log_archive']) {
+      try {
+        const [rows] = await this.pool.query(
+          `SELECT agent_log_id, user, event_time, status, lead_id, uniqueid, campaign_id
+             FROM ${table} WHERE agent_log_id IN (?)`,
+          [ids],
+        );
+        out.push(...(rows as AgentLogRow[]));
+      } catch {
+        // archive table may not exist
       }
     }
     return out;

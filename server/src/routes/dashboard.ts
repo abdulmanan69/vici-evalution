@@ -65,8 +65,8 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
     const until = localToUtc(`${toDay} 23:59:59`, tz);
 
     const tWhere: SQL[] = [
-      gte(transfers.xferTime, since),
-      lte(transfers.xferTime, until),
+      sql`coalesce(${transfers.countedAt}, ${transfers.xferTime}) >= ${since}`,
+      sql`coalesce(${transfers.countedAt}, ${transfers.xferTime}) <= ${until}`,
       eq(transfers.isMock, false),
     ];
     if (scope) tWhere.push(eq(transfers.companyId, scope));
@@ -103,7 +103,7 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
     // daily trend: fronter transfers vs all sales, bucketed in dialer days
     const trend = await db
       .select({
-        day: sql<string>`to_char(date_trunc('day', ${transfers.xferTime} AT TIME ZONE ${tz}), 'YYYY-MM-DD')`,
+        day: sql<string>`to_char(date_trunc('day', coalesce(${transfers.countedAt}, ${transfers.xferTime}) AT TIME ZONE ${tz}), 'YYYY-MM-DD')`,
         total: sql<number>`count(*) filter (where ${transfers.kind} = 'transfer')`,
         closed: sql<number>`count(*) filter (where ${transfers.queueStatus} = 'closed')`,
       })

@@ -298,7 +298,15 @@ export const transfers = pgTable(
     // a sale made on a LATER call of the same lead (closer callback) that
     // closes this transfer when its own closer leg was not the sale
     saleCallId: uuid('sale_call_id').references(() => calls.id, { onDelete: 'set null' }),
+    /** the agent's XFER disposition this transfer comes from (DB mode) */
+    agentLogId: bigint('agent_log_id', { mode: 'number' }),
     xferTime: timestamp('xfer_time', { withTimezone: true }).notNull(),
+    /**
+     * when the dialer counts this on its reports (the agent's disposition
+     * event); day filters use this so per-day counts match VICIdial exactly.
+     * Falls back to xfer_time where unknown.
+     */
+    countedAt: timestamp('counted_at', { withTimezone: true }),
     phoneNumber: varchar('phone_number', { length: 24 }),
     viciLeadId: bigint('vici_lead_id', { mode: 'number' }),
     closerLeadId: bigint('closer_lead_id', { mode: 'number' }),
@@ -323,10 +331,44 @@ export const transfers = pgTable(
     uniqueIndex('transfers_sale_call_uq')
       .on(t.saleCallId)
       .where(sql`${t.saleCallId} is not null`),
+    uniqueIndex('transfers_agent_log_uq')
+      .on(t.dialerServerId, t.agentLogId)
+      .where(sql`${t.agentLogId} is not null`),
     index('transfers_company_queue_idx').on(t.companyId, t.queueStatus, t.xferTime),
     index('transfers_match_idx').on(t.matchStatus),
     index('transfers_closer_call_idx').on(t.closerCallId),
     index('transfers_lead_idx').on(t.dialerServerId, t.viciLeadId),
+  ],
+);
+
+/**
+ * The disposition each agent actually picked (vicidial_agent_log) — what
+ * VICIdial's own Agent Status Detail report counts. The call record's
+ * status can disagree or change later, so transfers are built from these.
+ * Only rows whose status is a mapped XFER code are kept.
+ */
+export const agentDispositions = pgTable(
+  'agent_dispositions',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    companyId: uuid('company_id')
+      .notNull()
+      .references(() => companies.id, { onDelete: 'cascade' }),
+    dialerServerId: uuid('dialer_server_id')
+      .notNull()
+      .references(() => dialerServers.id, { onDelete: 'cascade' }),
+    agentLogId: bigint('agent_log_id', { mode: 'number' }).notNull(),
+    viciUser: varchar('vici_user', { length: 50 }),
+    eventTime: timestamp('event_time', { withTimezone: true }).notNull(),
+    status: varchar('status', { length: 20 }),
+    viciLeadId: bigint('vici_lead_id', { mode: 'number' }),
+    viciUniqueId: varchar('vici_uniqueid', { length: 32 }),
+    viciCampaignId: varchar('vici_campaign_id', { length: 50 }),
+    syncedAt: timestamp('synced_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('agent_dispositions_dialer_log_uq').on(t.dialerServerId, t.agentLogId),
+    index('agent_dispositions_time_idx').on(t.dialerServerId, t.eventTime),
   ],
 );
 

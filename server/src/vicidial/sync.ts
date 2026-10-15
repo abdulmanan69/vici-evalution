@@ -2,6 +2,7 @@ import { and, desc, eq, gte, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { db } from '../db/client.js';
 import {
+  agentDispositions,
   calls,
   campaigns,
   dialerServers,
@@ -27,7 +28,7 @@ import {
 } from './timezone.js';
 import { decideMatch, DEFAULT_MATCH_OPTIONS, normalizePhone, type CloserCandidate } from './matcher.js';
 import { resolveMeaning, transition, type MappingRow } from './queueLogic.js';
-import type { DialerConnection, ViciCallRow } from './types.js';
+import type { AgentLogRow, DialerConnection, ViciCallRow } from './types.js';
 import { normalizeRecordingRow } from './apiDerive.js';
 import { fetchUserStatsCalls, type UserStatsCall } from './webReport.js';
 import { sha256 } from '../lib/crypto.js';
@@ -107,6 +108,7 @@ export async function runDialerSync(
       await syncCallStream(conn, viciDb, 'vicidial_log', stats, opts.full);
       await syncCallStream(conn, viciDb, 'vicidial_closer_log', stats, opts.full);
       await syncRecordingsFromDb(conn, viciDb, stats, opts.full);
+      await syncAgentDispositions(conn, viciDb, stats, opts.full);
     } else if (conn.sourceMode === 'api') {
       // No DB access: synthesize call records from recording_lookup +
       // lead_all_info (verified shapes on this build — see docs).
@@ -119,7 +121,7 @@ export async function runDialerSync(
       await syncRecordingsFromApi(conn, stats);
     }
 
-    await buildTransfers(conn, stats);
+    await buildTransfers(conn, stats, opts.full);
     await matchPendingTransfers(conn.companyId, stats);
     await attributeSales(conn.companyId, stats);
     await updateQueueStatuses(conn.companyId, stats);
@@ -1102,22 +1104,277 @@ async function companyMappings(companyId: string): Promise<MappingRow[]> {
   }));
 }
 
-async function buildTransfers(conn: DialerConnection, stats: SyncStats): Promise<void> {
+async function buildTransfers(conn: DialerConnection, stats: SyncStats, full?: boolean): Promise<void> {
   const mappings = await companyMappings(conn.companyId);
   const recent = new Date(Date.now() - config.SYNC_HISTORICAL_DAYS * 24 * 3600 * 1000);
   let created = 0;
 
-  if (mappings.length > 0) {
-    created += await buildTransfersFromMappings(conn, mappings, recent);
-  } else {
+  if (mappings.length === 0) {
     (stats.notes as string[]).push(
       'No disposition mappings configured — only structural transfer detection (API mode) can run.',
     );
+  } else if (conn.sourceMode !== 'api' && conn.db) {
+    // DB mode: a transfer is an agent's XFER disposition — exactly what
+    // VICIdial's Agent Status Detail report counts
+    created += await buildTransfersFromAgentLog(conn, mappings, recent, stats, full);
+  } else {
+    created += await buildTransfersFromMappings(conn, mappings, recent);
   }
   if (conn.sourceMode === 'api') {
     created += await buildTransfersStructurally(conn, recent);
   }
   stats.transfers_created = created;
+}
+
+function transferCodesOf(mappings: MappingRow[]): string[] {
+  return [
+    ...new Set(
+      mappings.filter((m) => m.active && m.meaning === 'transfer').map((m) => m.dispositionCode.trim().toUpperCase()),
+    ),
+  ];
+}
+
+/**
+ * Keep a copy of every agent disposition that is a mapped XFER code. Reads
+ * the recent window each cycle (full sync: the whole retention window, live
+ * and archived tables), then re-checks every kept row by id so an agent
+ * changing an XFER afterwards is reflected too.
+ */
+async function syncAgentDispositions(
+  conn: DialerConnection,
+  viciDb: ViciDbClient,
+  stats: SyncStats,
+  full?: boolean,
+): Promise<void> {
+  const mappings = await companyMappings(conn.companyId);
+  const codes = transferCodesOf(mappings);
+  if (codes.length === 0) return;
+  const windowDays = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : 7;
+  const sinceUtc = new Date(Date.now() - (full ? windowDays * 24 : REFRESH_HOURS) * 3600 * 1000);
+  const since = utcToLocalString(sinceUtc, conn.timezone);
+  const until = utcToLocalString(new Date(), conn.timezone);
+
+  const rows: AgentLogRow[] = [];
+  for (const archive of [true, false]) {
+    try {
+      rows.push(...(await viciDb.fetchAgentDispositions(since, until, codes, archive)));
+    } catch (err) {
+      if (!archive) throw err; // the live table must be readable
+    }
+  }
+  const upsert = async (r: AgentLogRow) => {
+    const values = {
+      viciUser: r.user,
+      eventTime: localToUtc(r.event_time, conn.timezone),
+      status: r.status,
+      viciLeadId: r.lead_id,
+      viciUniqueId: r.uniqueid || null,
+      viciCampaignId: r.campaign_id,
+      syncedAt: new Date(),
+    };
+    await db
+      .insert(agentDispositions)
+      .values({ companyId: conn.companyId, dialerServerId: conn.id, agentLogId: r.agent_log_id, ...values })
+      .onConflictDoUpdate({
+        target: [agentDispositions.dialerServerId, agentDispositions.agentLogId],
+        set: values,
+      });
+  };
+  for (const r of rows) await upsert(r);
+
+  // an XFER the agent later changed shows up only when re-read by id
+  const kept = await db
+    .select({ agentLogId: agentDispositions.agentLogId, status: agentDispositions.status })
+    .from(agentDispositions)
+    .where(
+      and(
+        eq(agentDispositions.dialerServerId, conn.id),
+        gte(agentDispositions.eventTime, new Date(Date.now() - windowDays * 24 * 3600 * 1000)),
+      ),
+    );
+  let changed = 0;
+  for (let i = 0; i < kept.length; i += 1000) {
+    const chunk = kept.slice(i, i + 1000);
+    const current = await viciDb.fetchAgentLogByIds(chunk.map((k) => k.agentLogId));
+    const before = new Map(chunk.map((k) => [k.agentLogId, (k.status ?? '').toUpperCase()]));
+    for (const r of current) {
+      if ((r.status ?? '').toUpperCase() !== before.get(r.agent_log_id)) {
+        await upsert(r);
+        changed += 1;
+      }
+    }
+  }
+  stats.agent_xfer_dispositions = rows.length;
+  if (changed) stats.agent_dispositions_changed = changed;
+}
+
+/**
+ * One transfer per agent XFER disposition, linked to the fronter's call by
+ * uniqueid (or, failing that, the agent's call on the same lead nearest in
+ * time). Transfers whose XFER the agent took back are removed unless QA
+ * work already hangs off them.
+ */
+async function buildTransfersFromAgentLog(
+  conn: DialerConnection,
+  mappings: MappingRow[],
+  recent: Date,
+  stats: SyncStats,
+  full?: boolean,
+): Promise<number> {
+  const campMap = new Map<string, string>();
+  for (const c of await db
+    .select({ id: campaigns.id, cid: campaigns.viciCampaignId })
+    .from(campaigns)
+    .where(eq(campaigns.dialerServerId, conn.id))) {
+    campMap.set(c.cid, c.id);
+  }
+  const rows = await db
+    .select()
+    .from(agentDispositions)
+    .where(and(eq(agentDispositions.dialerServerId, conn.id), gte(agentDispositions.eventTime, recent)))
+    .orderBy(agentDispositions.eventTime);
+
+  const isTransfer = (r: typeof agentDispositions.$inferSelect) =>
+    resolveMeaning(mappings, {
+      dialerServerId: conn.id,
+      campaignId: r.viciCampaignId ? (campMap.get(r.viciCampaignId) ?? null) : null,
+      dispositionCode: r.status,
+    }) === 'transfer';
+
+  let created = 0;
+  let adopted = 0;
+  for (const r of rows) {
+    if (!isTransfer(r)) continue;
+    const [existing] = await db
+      .select({ id: transfers.id })
+      .from(transfers)
+      .where(and(eq(transfers.dialerServerId, conn.id), eq(transfers.agentLogId, r.agentLogId)))
+      .limit(1);
+    if (existing) continue;
+
+    // the fronter's call for this disposition
+    let [fronter] = r.viciUniqueId
+      ? await db
+          .select()
+          .from(calls)
+          .where(
+            and(
+              eq(calls.dialerServerId, conn.id),
+              eq(calls.source, 'vicidial_log'),
+              eq(calls.viciUniqueId, r.viciUniqueId),
+            ),
+          )
+          .limit(1)
+      : [];
+    if (!fronter && r.viciLeadId != null) {
+      [fronter] = await db
+        .select()
+        .from(calls)
+        .where(
+          and(
+            eq(calls.dialerServerId, conn.id),
+            eq(calls.source, 'vicidial_log'),
+            eq(calls.viciLeadId, r.viciLeadId),
+            r.viciUser ? eq(calls.viciUserRaw, r.viciUser) : sql`true`,
+            gte(calls.callDate, new Date(r.eventTime.getTime() - 20 * 60_000)),
+            lte(calls.callDate, new Date(r.eventTime.getTime() + 20 * 60_000)),
+          ),
+        )
+        .orderBy(sql`abs(extract(epoch from (${calls.callDate} - ${r.eventTime})))`)
+        .limit(1);
+    }
+
+    if (fronter) {
+      // a transfer built earlier from the call record — adopt it
+      const [legacy] = await db
+        .select({ id: transfers.id, agentLogId: transfers.agentLogId })
+        .from(transfers)
+        .where(eq(transfers.fronterCallId, fronter.id))
+        .limit(1);
+      if (legacy && legacy.agentLogId === null) {
+        await db
+          .update(transfers)
+          .set({ agentLogId: r.agentLogId, countedAt: r.eventTime, updatedAt: new Date() })
+          .where(eq(transfers.id, legacy.id));
+        adopted += 1;
+        continue;
+      }
+      if (legacy) fronter = undefined as unknown as typeof fronter; // call already carries another XFER
+    }
+
+    const inserted = await db
+      .insert(transfers)
+      .values({
+        companyId: conn.companyId,
+        dialerServerId: conn.id,
+        kind: 'transfer',
+        fronterCallId: fronter?.id ?? null,
+        agentLogId: r.agentLogId,
+        xferTime: fronter ? new Date(fronter.callDate.getTime() + (fronter.lengthSec ?? 0) * 1000) : r.eventTime,
+        countedAt: r.eventTime,
+        phoneNumber: fronter?.phoneNumber ?? null,
+        viciLeadId: r.viciLeadId,
+        matchStatus: 'pending_match',
+        queueStatus: 'transfer',
+      })
+      .onConflictDoNothing()
+      .returning({ id: transfers.id });
+    if (inserted.length > 0) {
+      await db.insert(transferEvents).values({
+        transferId: inserted[0].id,
+        toStatus: 'transfer',
+        reason: `agent ${r.viciUser ?? '?'} dispositioned '${r.status}'`,
+      });
+      created += 1;
+    }
+  }
+
+  // XFERs the agent took back (status changed away from a transfer code)
+  const withdrawn = await db.execute(sql`
+    delete from transfers t
+     using agent_dispositions d
+     where t.dialer_server_id = ${conn.id} and t.kind = 'transfer'
+       and d.dialer_server_id = t.dialer_server_id and d.agent_log_id = t.agent_log_id
+       and upper(coalesce(d.status, '')) not in (${sql.join(transferCodesOf(mappings).map((c) => sql`${c}`), sql`, `)})
+       and not exists (select 1 from evaluations e where e.transfer_id = t.id)
+       and not exists (select 1 from qa_assignments x where x.transfer_id = t.id)`);
+
+  // Full sync only (agent dispositions then cover the whole window): legacy
+  // transfers built from a call record that no agent XFER disposition backs.
+  let orphaned = 0;
+  if (full) {
+    const res = await db.execute(sql`
+      delete from transfers t
+       where t.dialer_server_id = ${conn.id} and t.kind = 'transfer' and t.agent_log_id is null
+         and t.is_mock = false and t.xfer_time >= ${recent}
+         and not exists (select 1 from evaluations e where e.transfer_id = t.id)
+         and not exists (select 1 from qa_assignments x where x.transfer_id = t.id)`);
+    orphaned = res.rowCount ?? 0;
+  }
+
+  // The dialer credits an XFER to the agent who dispositioned it, even when
+  // the call row names a system user (VDAD) or another agent. Own the
+  // fronter leg accordingly; re-applied each sync since a refresh re-reads
+  // the call row as the dialer wrote it.
+  const reowned = await db.execute(sql`
+    update calls c
+       set vici_user_raw = ad.vici_user,
+           vici_agent_id = coalesce(va.id, c.vici_agent_id)
+      from transfers t
+      join agent_dispositions ad
+        on ad.dialer_server_id = t.dialer_server_id and ad.agent_log_id = t.agent_log_id
+      left join vici_agents va
+        on va.dialer_server_id = ad.dialer_server_id and va.vici_user = ad.vici_user
+     where c.id = t.fronter_call_id
+       and t.dialer_server_id = ${conn.id}
+       and ad.vici_user is not null and ad.vici_user <> ''
+       and upper(coalesce(c.vici_user_raw, '')) <> upper(ad.vici_user)`);
+  if (reowned.rowCount) stats.fronter_calls_reowned = reowned.rowCount;
+
+  if (adopted) stats.transfers_adopted = adopted;
+  if (withdrawn.rowCount) stats.transfers_withdrawn = withdrawn.rowCount;
+  if (orphaned) stats.transfers_without_agent_xfer_removed = orphaned;
+  return created;
 }
 
 /**
