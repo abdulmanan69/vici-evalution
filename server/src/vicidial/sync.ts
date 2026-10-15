@@ -1027,6 +1027,17 @@ async function buildTransfersFromMappings(
   mappings: MappingRow[],
   recent: Date,
 ): Promise<number> {
+  // prefilter by the mapped transfer codes in SQL — without this the row cap
+  // truncates the scan long before it reaches the XFER calls in a backfill
+  const xferCodes = [
+    ...new Set(
+      mappings
+        .filter((m) => m.active && m.meaning === 'transfer')
+        .map((m) => m.dispositionCode.trim().toUpperCase()),
+    ),
+  ];
+  if (xferCodes.length === 0) return 0;
+
   const fronterCalls = await db
     .select({
       id: calls.id,
@@ -1045,6 +1056,7 @@ async function buildTransfersFromMappings(
         eq(calls.source, 'vicidial_log'),
         eq(calls.isMock, false),
         gte(calls.callDate, recent),
+        inArray(calls.status, xferCodes),
         isNull(transfers.id),
       ),
     )
