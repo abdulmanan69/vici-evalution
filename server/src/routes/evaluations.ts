@@ -1,8 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, count, desc, eq, type SQL } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
+import { and, count, desc, eq, inArray, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { evaluations, qaFormVersions, qaForms, transfers, users } from '../db/schema.js';
+import { calls, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
@@ -72,7 +73,60 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(evaluations.id, id));
     if (!row) throw new NotFoundError('Evaluation not found');
     companyScope(req, row.evaluation.companyId);
-    return row;
+
+    // the reviewer scores while listening — ship the call's recordings and
+    // context so the player lives on the evaluation page itself
+    let callRecordings: Array<Record<string, unknown>> = [];
+    let callContext: Record<string, unknown> | null = null;
+    if (row.evaluation.transferId) {
+      const fronterCall = alias(calls, 'fc');
+      const closerCall = alias(calls, 'cc');
+      const fronterAgent = alias(viciAgents, 'fa');
+      const closerAgent = alias(viciAgents, 'ca');
+      const [t] = await db
+        .select({
+          transfer: transfers,
+          fronterCallId: fronterCall.id,
+          closerCallId: closerCall.id,
+          fronterAgent: fronterAgent.fullName,
+          fronterUser: fronterAgent.viciUser,
+          closerAgent: closerAgent.fullName,
+          closerUser: closerAgent.viciUser,
+          closerStatus: closerCall.status,
+        })
+        .from(transfers)
+        .innerJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+        .leftJoin(fronterAgent, eq(fronterCall.viciAgentId, fronterAgent.id))
+        .leftJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
+        .leftJoin(closerAgent, eq(closerCall.viciAgentId, closerAgent.id))
+        .where(eq(transfers.id, row.evaluation.transferId));
+      if (t) {
+        callContext = {
+          phoneNumber: t.transfer.phoneNumber,
+          xferTime: t.transfer.xferTime,
+          queueStatus: t.transfer.queueStatus,
+          fronterAgent: t.fronterAgent ?? t.fronterUser,
+          closerAgent: t.closerAgent ?? t.closerUser,
+          closerStatus: t.closerStatus,
+          transferId: t.transfer.id,
+        };
+        const legIds = [t.fronterCallId, t.closerCallId].filter((x): x is string => !!x);
+        if (legIds.length > 0) {
+          const recs = await db
+            .select()
+            .from(recordings)
+            .where(inArray(recordings.callId, legIds));
+          callRecordings = recs.map((r) => ({
+            id: r.id,
+            filename: r.filename,
+            status: r.status,
+            lengthSec: r.lengthSec,
+            leg: r.callId === t.fronterCallId ? 'fronter' : 'closer',
+          }));
+        }
+      }
+    }
+    return { ...row, call: callContext, recordings: callRecordings };
   });
 
   app.post('/', { preHandler: [requirePermission('qa.evaluate')] }, async (req, reply) => {

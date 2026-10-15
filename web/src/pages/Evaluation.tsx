@@ -4,7 +4,16 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Save } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
+import { AudioPlayer } from '../components/AudioPlayer';
 import { Chip, ErrorState, Loading, PageHeader, fmtDateTime } from '../components/ui';
+
+interface EvalRecording {
+  id: string;
+  filename: string;
+  status: string;
+  lengthSec: number | null;
+  leg: 'fronter' | 'closer';
+}
 
 interface Detail {
   evaluation: Evaluation;
@@ -14,6 +23,16 @@ interface Detail {
   formSchema: FormDefinition;
   maxScore: string;
   passThreshold: string;
+  call: {
+    phoneNumber: string | null;
+    xferTime: string;
+    queueStatus: string;
+    fronterAgent: string | null;
+    closerAgent: string | null;
+    closerStatus: string | null;
+    transferId: string;
+  } | null;
+  recordings: EvalRecording[];
 }
 
 type Answers = Record<string, string | number | boolean | null>;
@@ -193,10 +212,38 @@ export function EvaluationPage() {
         }
       />
 
-      {ev.transferId && (
-        <Link to={`/transfers/${ev.transferId}`} className="text-sm font-medium text-brand hover:underline">
-          ← Back to call detail (listen while you score)
-        </Link>
+      {data.call && (
+        <div className="sticky top-2 z-20 mt-2 rounded-lg border border-ink/10 bg-surface p-3 shadow-card">
+          <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+            <span className="font-mono font-semibold">{data.call.phoneNumber ?? 'unknown number'}</span>
+            <span className="text-ink-2">
+              {data.call.fronterAgent && <>fronter: <strong>{data.call.fronterAgent}</strong></>}
+              {data.call.closerAgent && <> · closer: <strong>{data.call.closerAgent}</strong></>}
+              {data.call.closerStatus && <> · dispo <span className="font-mono">{data.call.closerStatus}</span></>}
+            </span>
+            <span className="font-mono text-2xs text-ink-3">{fmtDateTime(data.call.xferTime)}</span>
+            <Link to={`/transfers/${data.call.transferId}`} className="ml-auto text-2xs font-medium text-brand hover:underline">
+              Full call detail →
+            </Link>
+          </div>
+          <div className="space-y-2">
+            {data.recordings.filter((r) => r.status === 'available').map((r) => (
+              <div key={r.id} className="flex items-center gap-2">
+                <span className={`chip shrink-0 ${r.leg === 'closer' ? 'bg-brand-soft text-brand' : 'bg-info-soft text-info'}`}>
+                  {r.leg}
+                </span>
+                <div className="min-w-0 flex-1">
+                  <AudioPlayer recordingId={r.id} />
+                </div>
+              </div>
+            ))}
+            {data.recordings.filter((r) => r.status === 'available').length === 0 && (
+              <p className="text-2xs text-ink-3">
+                No playable recording for this call yet — it may still be syncing from the dialer.
+              </p>
+            )}
+          </div>
+        </div>
       )}
 
       {done && (
