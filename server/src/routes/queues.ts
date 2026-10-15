@@ -18,6 +18,7 @@ import { audit } from '../lib/audit.js';
 import { ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
 import { hasPermission } from '../auth/permissions.js';
 import type { AuthContext } from '../auth/session.js';
+import { agentScopeCondition, canReviewTransfer, isAgentScoped } from '../lib/reviewScope.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { scoreCandidate, DEFAULT_MATCH_OPTIONS } from '../vicidial/matcher.js';
 import { localToUtc } from '../vicidial/timezone.js';
@@ -67,6 +68,10 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
         ? []
         : [eq(transfers.queueStatus, status as 'unclosed' | 'closed')];
     if (scope) where.push(eq(transfers.companyId, scope));
+    // a reviewer assigned to specific agents only sees those agents' calls
+    if (isAgentScoped(req.auth)) {
+      where.push(agentScopeCondition(req.auth, status as 'transfer' | 'unclosed' | 'closed'));
+    }
     if (q.dialerServerId) where.push(eq(transfers.dialerServerId, q.dialerServerId));
     if (q.campaignId) where.push(eq(fronterCall.campaignId, q.campaignId));
     if (q.matchStatus) where.push(eq(transfers.matchStatus, q.matchStatus));
@@ -163,6 +168,9 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     // the Transfers queue lists every transfer, so access to it covers any call
     if (!req.auth.allowedQueues?.includes('transfer')) {
       assertQueueAllowed(req.auth, row.transfer.queueStatus);
+    }
+    if (!(await canReviewTransfer(req.auth, row.transfer))) {
+      throw new ForbiddenError("This call's agent is not assigned to you");
     }
 
     const callIds = [row.fronterCall.id, row.closerCall?.id].filter((x): x is string => !!x);

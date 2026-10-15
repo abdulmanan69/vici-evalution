@@ -1,6 +1,6 @@
 import { and, eq, gt, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { qaForms, roles, sessions, users } from '../db/schema.js';
+import { qaForms, reviewerAgentAssignments, roles, sessions, users } from '../db/schema.js';
 import { config } from '../config.js';
 import { newSessionToken, sha256, verifyPassword } from '../lib/crypto.js';
 
@@ -13,22 +13,41 @@ export interface AuthContext {
   permissions: string[];
   /** non-empty = the only QA forms this reviewer may see and use */
   allowedFormIds: string[] | null;
-  /** derived from allowedFormIds: the only queues this reviewer may see; null = all */
+  /** the only queues this reviewer may see; null = all */
   allowedQueues: Array<'transfer' | 'unclosed' | 'closed'> | null;
+  /** true = the reviewer only sees calls of their assigned dialer agents */
+  agentScoped: boolean;
 }
 
+type QueueName = 'transfer' | 'unclosed' | 'closed';
+
 /**
- * A reviewer limited to specific forms only sees those forms' queues. A form
- * with no queue set applies anywhere, so it lifts the queue restriction.
+ * Two independent limits narrow a reviewer's queues: forms assigned to them
+ * (a form without a queue lifts that limit) and dialer agents assigned to
+ * them with methods. When both apply, only queues allowed by both remain.
  */
 async function withAllowedQueues(auth: AuthContext): Promise<AuthContext> {
-  if (!auth.allowedFormIds) return auth;
-  const forms = await db
-    .select({ queue: qaForms.queue })
-    .from(qaForms)
-    .where(inArray(qaForms.id, auth.allowedFormIds));
-  if (forms.length === 0 || forms.some((f) => f.queue === null)) return auth;
-  return { ...auth, allowedQueues: [...new Set(forms.map((f) => f.queue!))] };
+  let formQueues: QueueName[] | null = null;
+  if (auth.allowedFormIds) {
+    const forms = await db
+      .select({ queue: qaForms.queue })
+      .from(qaForms)
+      .where(inArray(qaForms.id, auth.allowedFormIds));
+    if (forms.length > 0 && forms.every((f) => f.queue !== null)) {
+      formQueues = [...new Set(forms.map((f) => f.queue!))];
+    }
+  }
+
+  const assignments = await db
+    .select({ methods: reviewerAgentAssignments.methods })
+    .from(reviewerAgentAssignments)
+    .where(eq(reviewerAgentAssignments.reviewerUserId, auth.userId));
+  const agentQueues: QueueName[] | null =
+    assignments.length > 0 ? [...new Set(assignments.flatMap((a) => a.methods))] : null;
+
+  let allowedQueues = formQueues ?? agentQueues;
+  if (formQueues && agentQueues) allowedQueues = formQueues.filter((q) => agentQueues.includes(q));
+  return { ...auth, allowedQueues, agentScoped: assignments.length > 0 };
 }
 
 export interface LoginResult {
@@ -105,5 +124,6 @@ function toAuthContext(
     permissions: role.permissions,
     allowedFormIds: user.allowedFormIds && user.allowedFormIds.length > 0 ? user.allowedFormIds : null,
     allowedQueues: null,
+    agentScoped: false,
   };
 }

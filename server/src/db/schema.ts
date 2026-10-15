@@ -449,6 +449,35 @@ export const evaluations = pgTable(
   ],
 );
 
+/**
+ * Which dialer agents a reviewer covers, and with which methods. A reviewer
+ * with any rows here only sees transfers whose evaluated leg belongs to one
+ * of their agents: the fronter leg for 'transfer', the closer leg for
+ * 'unclosed' and 'closed'.
+ */
+export const reviewerAgentAssignments = pgTable(
+  'reviewer_agent_assignments',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    companyId: uuid('company_id')
+      .notNull()
+      .references(() => companies.id, { onDelete: 'cascade' }),
+    reviewerUserId: uuid('reviewer_user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    viciAgentId: uuid('vici_agent_id')
+      .notNull()
+      .references(() => viciAgents.id, { onDelete: 'cascade' }),
+    methods: jsonb('methods').$type<Array<'transfer' | 'unclosed' | 'closed'>>().notNull().default([]),
+    createdBy: uuid('created_by').references(() => users.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('reviewer_agent_uq').on(t.reviewerUserId, t.viciAgentId),
+    index('reviewer_agent_reviewer_idx').on(t.reviewerUserId),
+  ],
+);
+
 export const qaAssignments = pgTable(
   'qa_assignments',
   {

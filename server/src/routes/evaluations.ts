@@ -9,6 +9,7 @@ import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
 import { hasPermission } from '../auth/permissions.js';
+import { canReviewTransfer } from '../lib/reviewScope.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { answersSchema, formDefinitionSchema } from '../services/formSchema.js';
 import { scoreEvaluation } from '../services/scoring.js';
@@ -239,6 +240,9 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       !hasPermission(req.auth.permissions, 'qa.forms.manage')
     ) {
       throw new ForbiddenError('This evaluation method is not assigned to you');
+    }
+    if (!(await canReviewTransfer(req.auth, transfer))) {
+      throw new ForbiddenError("This call's agent is not assigned to you");
     }
     if (form.state !== 'published' || form.currentVersion === 0) {
       throw new ValidationError('Form has no published version');

@@ -17,6 +17,7 @@ import {
   PhoneForwarded,
   Server,
   Settings2,
+  UserCog,
   Users,
 } from 'lucide-react';
 import { useAuth } from '../auth/AuthContext';
@@ -58,6 +59,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
     items: [
       { to: '/qa/forms', label: 'QA forms', icon: <ClipboardList size={16} />, perm: 'qa.forms.manage' },
       { to: '/qa/evaluations', label: 'Evaluations', icon: <ListChecks size={16} />, perm: 'qa.view' },
+      { to: '/qa/team', label: 'QA team', icon: <UserCog size={16} />, perm: 'qa.assign' },
       { to: '/reports/agents', label: 'Agent report', icon: <BarChart3 size={16} />, perm: 'reports.view' },
     ],
   },

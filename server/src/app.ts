@@ -15,6 +15,7 @@ import { dispositionRoutes } from './routes/dispositions.js';
 import { queueRoutes } from './routes/queues.js';
 import { recordingRoutes } from './routes/recordings.js';
 import { qaFormRoutes } from './routes/qaForms.js';
+import { qaTeamRoutes } from './routes/qaTeam.js';
 import { evaluationRoutes } from './routes/evaluations.js';
 import { userRoutes } from './routes/users.js';
 import { auditRoutes } from './routes/audit.js';
@@ -80,6 +81,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       await api.register(queueRoutes, { prefix: '/queues' });
       await api.register(recordingRoutes, { prefix: '/recordings' });
       await api.register(qaFormRoutes, { prefix: '/qa/forms' });
+      await api.register(qaTeamRoutes, { prefix: '/qa/team' });
       await api.register(evaluationRoutes, { prefix: '/evaluations' });
       await api.register(userRoutes, { prefix: '/users' });
       await api.register(auditRoutes, { prefix: '/audit-logs' });
