@@ -18,31 +18,76 @@ import { ErrorState, Loading, PageHeader, StatTile } from '../components/ui';
 // validated 2-series palette (blue/orange, CVD-safe — see docs/ARCHITECTURE.md)
 const SERIES = { total: '#3B4A9F', closed: '#C97A10' };
 
+const today = new Date().toISOString().slice(0, 10);
+
 export function DashboardPage() {
   const { companyId } = useCompanyScope();
-  const [days, setDays] = useState(30);
+  const [preset, setPreset] = useState<'1' | '7' | '15' | '30' | 'custom'>('7');
+  const [customFrom, setCustomFrom] = useState(today);
+  const [customTo, setCustomTo] = useState(today);
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+  const customReady = preset !== 'custom' || (!!customFrom && !!customTo && customFrom <= customTo);
+  const rangeQuery =
+    preset === 'custom'
+      ? { dateFrom: customFrom, dateTo: customTo }
+      : { days: Number(preset) };
+
   const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['dashboard', companyId, days, tz],
+    queryKey: ['dashboard', companyId, preset, customFrom, customTo, tz],
     queryFn: () =>
-      api<DashboardStats>('/dashboard/stats', { query: { companyId: companyId || undefined, days, tz } }),
+      api<DashboardStats>('/dashboard/stats', {
+        query: { companyId: companyId || undefined, tz, ...rangeQuery },
+      }),
+    enabled: customReady,
   });
 
   if (isLoading) return <Loading />;
   if (isError || !data) return <ErrorState message="Dashboard could not load." onRetry={() => void refetch()} />;
 
   const t = data.totals;
+  const rangeLabel =
+    data.dateFrom === data.dateTo ? data.dateFrom : `${data.dateFrom} → ${data.dateTo}`;
   return (
     <div>
       <PageHeader
         title="Dashboard"
-        subtitle={`Transfer and QA activity over the last ${days} days`}
+        subtitle={`${rangeLabel} · dialer time (${data.timezone})`}
         actions={
-          <select className="input w-32" value={days} onChange={(e) => setDays(Number(e.target.value))} aria-label="Time range">
-            <option value={7}>Last 7 days</option>
-            <option value={30}>Last 30 days</option>
-            <option value={90}>Last 90 days</option>
-          </select>
+          <div className="flex flex-wrap items-center gap-2">
+            <select
+              className="input w-36"
+              value={preset}
+              onChange={(e) => setPreset(e.target.value as typeof preset)}
+              aria-label="Time range"
+            >
+              <option value="1">Today</option>
+              <option value="7">Last 7 days</option>
+              <option value="15">Last 15 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="custom">Custom range</option>
+            </select>
+            {preset === 'custom' && (
+              <>
+                <input
+                  type="date"
+                  className="input w-40"
+                  value={customFrom}
+                  max={customTo}
+                  onChange={(e) => setCustomFrom(e.target.value)}
+                  aria-label="From date"
+                />
+                <input
+                  type="date"
+                  className="input w-40"
+                  value={customTo}
+                  min={customFrom}
+                  onChange={(e) => setCustomTo(e.target.value)}
+                  aria-label="To date"
+                />
+              </>
+            )}
+          </div>
         }
       />
 

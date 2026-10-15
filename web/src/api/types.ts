@@ -195,7 +195,9 @@ export interface SyncJob {
 }
 
 export interface DashboardStats {
-  days: number;
+  dateFrom: string;
+  dateTo: string;
+  timezone: string;
   totals: {
     transfers: number;
     transfer: number;
