@@ -593,6 +593,9 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
       if (!filename) continue;
       const startLocal = r.start_time ?? r.start ?? null;
       const startTime = startLocal ? localToUtc(startLocal, conn.timezone) : null;
+      // the lookup returns the lead's FULL history — months-old recordings
+      // are already purged on the dialer and outside our retention window
+      if (startTime && startTime < lookback) continue;
       // link to the lead's nearest call leg within 15 minutes
       let bestId: string | null = null;
       if (startTime) {
