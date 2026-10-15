@@ -7,7 +7,8 @@ import { calls, dialerServers, evaluations, qaFormVersions, qaForms, recordings,
 import { localToUtc } from '../vicidial/timezone.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
-import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
+import { hasPermission } from '../auth/permissions.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { answersSchema, formDefinitionSchema } from '../services/formSchema.js';
 import { scoreEvaluation } from '../services/scoring.js';
@@ -54,6 +55,10 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
     if (q.result === 'pass') where.push(eq(evaluations.passed, true));
     if (q.result === 'fail') where.push(and(eq(evaluations.passed, false), eq(evaluations.autoFailed, false))!);
     if (q.result === 'auto_fail') where.push(eq(evaluations.autoFailed, true));
+    // a restricted reviewer only ever sees their assigned methods
+    if (req.auth.allowedFormIds && !hasPermission(req.auth.permissions, 'qa.forms.manage')) {
+      where.push(inArray(qaForms.id, req.auth.allowedFormIds));
+    }
     if (q.agent) {
       const pat = `%${q.agent}%`;
       where.push(
@@ -143,6 +148,7 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
         evaluation: evaluations,
         reviewerName: users.name,
         formName: qaForms.name,
+        formIdOfEval: qaForms.id,
         formVersion: qaFormVersions.version,
         formSchema: qaFormVersions.schema,
         maxScore: qaFormVersions.maxScore,
@@ -155,6 +161,13 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(evaluations.id, id));
     if (!row) throw new NotFoundError('Evaluation not found');
     companyScope(req, row.evaluation.companyId);
+    if (
+      req.auth.allowedFormIds &&
+      !req.auth.allowedFormIds.includes(row.formIdOfEval) &&
+      !hasPermission(req.auth.permissions, 'qa.forms.manage')
+    ) {
+      throw new ForbiddenError('This evaluation method is not assigned to you');
+    }
 
     // the reviewer scores while listening — ship the call's recordings and
     // context so the player lives on the evaluation page itself
@@ -220,6 +233,13 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
 
     const [form] = await db.select().from(qaForms).where(eq(qaForms.id, body.formId));
     if (!form || form.companyId !== transfer.companyId) throw new NotFoundError('Form not found');
+    if (
+      req.auth.allowedFormIds &&
+      !req.auth.allowedFormIds.includes(form.id) &&
+      !hasPermission(req.auth.permissions, 'qa.forms.manage')
+    ) {
+      throw new ForbiddenError('This evaluation method is not assigned to you');
+    }
     if (form.state !== 'published' || form.currentVersion === 0) {
       throw new ValidationError('Form has no published version');
     }

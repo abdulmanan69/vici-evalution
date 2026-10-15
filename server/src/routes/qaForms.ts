@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, desc, eq, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, type SQL } from 'drizzle-orm';
+import { hasPermission } from '../auth/permissions.js';
 import { db } from '../db/client.js';
 import { qaForms, qaFormVersions } from '../db/schema.js';
 import { companyScope, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
@@ -25,6 +26,10 @@ export async function qaFormRoutes(app: FastifyInstance): Promise<void> {
     if (scope) where.push(eq(qaForms.companyId, scope));
     if (q.state && ['draft', 'published', 'archived'].includes(q.state)) {
       where.push(eq(qaForms.state, q.state as 'draft' | 'published' | 'archived'));
+    }
+    // a restricted reviewer only ever sees the methods assigned to them
+    if (req.auth.allowedFormIds && !hasPermission(req.auth.permissions, 'qa.forms.manage')) {
+      where.push(inArray(qaForms.id, req.auth.allowedFormIds));
     }
     const rows = await db
       .select()

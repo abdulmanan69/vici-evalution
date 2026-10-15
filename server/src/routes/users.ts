@@ -1,8 +1,8 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, eq, isNull, or, type SQL } from 'drizzle-orm';
+import { and, eq, inArray, isNull, or, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { roles, users } from '../db/schema.js';
+import { qaForms, roles, users } from '../db/schema.js';
 import { companyScope, isSuperAdmin, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
@@ -51,6 +51,7 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
         createdAt: users.createdAt,
         roleId: users.roleId,
         roleName: roles.name,
+        allowedFormIds: users.allowedFormIds,
       })
       .from(users)
       .innerJoin(roles, eq(users.roleId, roles.id))
@@ -119,6 +120,8 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
         roleId: z.string().uuid().optional(),
         status: z.enum(['active', 'disabled']).optional(),
         password: z.string().min(10).max(200).optional(),
+        /** restrict a reviewer to specific QA forms; null clears */
+        allowedFormIds: z.array(z.string().uuid()).max(50).nullable().optional(),
       })
       .parse(req.body);
     const [before] = await db.select().from(users).where(eq(users.id, id));
@@ -128,16 +131,28 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       throw new ForbiddenError('Cannot modify platform users');
     }
     if (body.roleId) await assertAssignableRole(req, body.roleId, before.companyId);
+    if (body.allowedFormIds && body.allowedFormIds.length > 0) {
+      const found = await db
+        .select({ id: qaForms.id })
+        .from(qaForms)
+        .where(and(inArray(qaForms.id, body.allowedFormIds), eq(qaForms.companyId, before.companyId ?? '')));
+      if (found.length !== new Set(body.allowedFormIds).size) {
+        throw new ValidationError('One or more forms do not belong to this company');
+      }
+    }
 
     const set: Partial<typeof users.$inferInsert> = { updatedAt: new Date() };
     if (body.name) set.name = body.name;
     if (body.roleId) set.roleId = body.roleId;
     if (body.status) set.status = body.status;
     if (body.password) set.passwordHash = await hashPassword(body.password);
+    if (body.allowedFormIds !== undefined) {
+      set.allowedFormIds = body.allowedFormIds && body.allowedFormIds.length > 0 ? body.allowedFormIds : null;
+    }
 
     const [row] = await db.update(users).set(set).where(eq(users.id, id)).returning();
-    if (body.status === 'disabled' || body.password || body.roleId) {
-      await revokeUserSessions(id); // permission or credential change kills sessions
+    if (body.status === 'disabled' || body.password || body.roleId || body.allowedFormIds !== undefined) {
+      await revokeUserSessions(id); // permission or restriction change kills sessions
     }
     await audit(req, {
       action: 'user.update',

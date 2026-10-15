@@ -11,6 +11,8 @@ export interface AuthContext {
   companyId: string | null;
   roleName: string;
   permissions: string[];
+  /** non-empty = the only QA forms this reviewer may see and use */
+  allowedFormIds: string[] | null;
 }
 
 export interface LoginResult {
@@ -85,5 +87,6 @@ function toAuthContext(
     companyId: user.companyId,
     roleName: role.name,
     permissions: role.permissions,
+    allowedFormIds: user.allowedFormIds && user.allowedFormIds.length > 0 ? user.allowedFormIds : null,
   };
 }

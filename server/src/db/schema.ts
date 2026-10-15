@@ -73,6 +73,9 @@ export const users = pgTable(
     passwordHash: text('password_hash').notNull(),
     name: text('name').notNull(),
     status: userStatusEnum('status').notNull().default('active'),
+    // null/empty = may use every QA form; otherwise the only forms this
+    // reviewer can see and evaluate with (set by managers)
+    allowedFormIds: jsonb('allowed_form_ids').$type<string[] | null>(),
     lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
