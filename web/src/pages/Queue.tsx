@@ -5,6 +5,7 @@ import { Download, Search } from 'lucide-react';
 import { api } from '../api/client';
 import type { Dialer, PageMeta, QueueItem, Transfer } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
+import { useAuth } from '../auth/AuthContext';
 import { Chip, EmptyState, ErrorState, Loading, PageHeader, Pagination, fmtDateTime, fmtDuration } from '../components/ui';
 
 const TITLES: Record<string, { title: string; subtitle: string }> = {
@@ -33,6 +34,9 @@ export function SaleTypeChip({ transfer }: { transfer: Transfer }) {
 export function QueuePage() {
   const { status = 'transfer' } = useParams();
   const { companyId } = useCompanyScope();
+  const { hasPerm } = useAuth();
+  // the dialer list is an admin endpoint — reviewers just see all dialers
+  const canListDialers = hasPerm('admin.dialers');
   const [page, setPage] = useState(1);
   const [search, setSearch] = useState('');
   const [searchInput, setSearchInput] = useState('');
@@ -48,6 +52,7 @@ export function QueuePage() {
     queryKey: ['dialers', companyId],
     queryFn: () => api<{ dialers: Dialer[] }>('/dialers', { query: { companyId: companyId || undefined } }),
     staleTime: 60_000,
+    enabled: canListDialers,
   });
 
   const { data, isLoading, isError, refetch } = useQuery({
@@ -101,14 +106,16 @@ export function QueuePage() {
             aria-label="Search by phone or lead ID"
           />
         </form>
-        <select className="input w-48" value={dialerId} onChange={(e) => setDialerId(e.target.value)} aria-label="Dialer">
-          <option value="">All dialers</option>
-          {dialers?.dialers.map((d) => (
-            <option key={d.id} value={d.id}>
-              {d.name}
-            </option>
-          ))}
-        </select>
+        {canListDialers && (
+          <select className="input w-48" value={dialerId} onChange={(e) => setDialerId(e.target.value)} aria-label="Dialer">
+            <option value="">All dialers</option>
+            {dialers?.dialers.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.name}
+              </option>
+            ))}
+          </select>
+        )}
         <select className="input w-44" value={matchStatus} onChange={(e) => setMatchStatus(e.target.value)} aria-label="Match status">
           <option value="">Any match status</option>
           <option value="pending_match">Pending match</option>
