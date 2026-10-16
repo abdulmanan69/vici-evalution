@@ -70,6 +70,8 @@ async function checkPendingRecordings(): Promise<void> {
         and(
           eq(recordings.isMock, false),
           sql`coalesce(${recordings.startTime}, ${recordings.createdAt}) > now() - make_interval(days => ${windowDays})`,
+          // a 0-second entry the dialer gave up on never gets a file
+          sql`not (${recordings.status} = 'missing' and ${recordings.lengthSec} = 0)`,
           sql`(${recordings.status} <> 'available'
                or ${recordings.locationUrl} is null
                or ${recordings.locationUrl} not like '%/RECORDINGS/MP3/%'

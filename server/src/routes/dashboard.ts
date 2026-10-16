@@ -82,12 +82,24 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
       .from(transfers)
       .where(and(...tWhere, eq(transfers.matchStatus, 'flagged')));
 
-    const rWhere: SQL[] = [eq(recordings.status, 'missing'), eq(recordings.isMock, false)];
-    if (scope) rWhere.push(eq(recordings.companyId, scope));
-    const missingRecordings = await db
-      .select({ n: count() })
-      .from(recordings)
-      .where(and(...rWhere));
+    // Calls QA reviews (transfer legs in this range) that have no playable
+    // recording although the call ended more than 10 minutes ago. Random
+    // 0-second dialer entries on unanswered dials are not counted — nothing
+    // was ever recorded for those.
+    const missing = await db.execute(sql`
+      select count(*)::int as n
+        from transfers t
+        join calls c on c.id in (t.fronter_call_id, t.closer_call_id, t.sale_call_id)
+       where t.is_mock = false
+         ${scope ? sql`and t.company_id = ${scope}` : sql``}
+         and coalesce(t.counted_at, t.xfer_time) >= ${since}
+         and coalesce(t.counted_at, t.xfer_time) <= ${until}
+         and coalesce(c.length_sec, 0) > 0
+         -- dropped in queue with no agent (VDCL/VDAD system users): never recorded
+         and upper(coalesce(c.vici_user_raw, '')) not in ('VDCL', 'VDAD')
+         and c.call_date + make_interval(secs => coalesce(c.length_sec, 0)) < now() - interval '10 minutes'
+         and not exists (select 1 from recordings r where r.call_id = c.id and r.status = 'available')`);
+    const missingRecordings = Number((missing.rows[0] as { n?: number } | undefined)?.n ?? 0);
 
     const eWhere: SQL[] = [
       eq(evaluations.status, 'completed'),
@@ -144,7 +156,7 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
         inboundSales: totals.inboundSales,
         closeRate: totalTransfers > 0 ? Math.round((totals.closedFromTransfers / totalTransfers) * 1000) / 10 : 0,
         flaggedMatches: flagged[0]?.n ?? 0,
-        missingRecordings: missingRecordings[0]?.n ?? 0,
+        missingRecordings,
         evaluationsCompleted: evalStats?.n ?? 0,
         avgQaScore: evalStats?.avgPercent ? Math.round(Number(evalStats.avgPercent) * 10) / 10 : null,
       },

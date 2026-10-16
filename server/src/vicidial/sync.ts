@@ -715,9 +715,9 @@ export async function lookupLeadRecordings(
     // the lookup returns the lead's FULL history — months-old recordings
     // are already purged on the dialer and outside our retention window
     if (startTime && startTime < lookback) continue;
-    const bestId = startTime
-      ? linkRecordingToCall(startTime, r.length_in_sec ? Number(r.length_in_sec) : null, leadCalls)
-      : null;
+    // '0' is a real value: a recording the dialer started and dropped at once
+    const lengthSec = r.length_in_sec !== undefined && /^\d+$/.test(r.length_in_sec) ? Number(r.length_in_sec) : null;
+    const bestId = startTime ? linkRecordingToCall(startTime, lengthSec, leadCalls) : null;
     // The file is named <YYYYMMDD-HHMMSS>_<phone> by the dialer. While it is
     // still recording the lookup has no URL, so the name is built from the
     // start time and the call's phone — the probe then finds the MP3 the
@@ -743,7 +743,7 @@ export async function lookupLeadRecordings(
         filename,
         locationUrl: location || null,
         startTime,
-        lengthSec: r.length_in_sec ? Number(r.length_in_sec) : null,
+        lengthSec,
       },
       bestId,
     );

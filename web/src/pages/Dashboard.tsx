@@ -111,7 +111,7 @@ export function DashboardPage() {
           label="Missing recordings"
           value={t.missingRecordings.toLocaleString()}
           accent={t.missingRecordings > 0 ? 'bad' : undefined}
-          sub="not found on dialer"
+          sub="transfer legs with no file 10+ min after hangup"
         />
         <StatTile label="Evaluations" value={t.evaluationsCompleted.toLocaleString()} sub="completed in range" />
         <StatTile label="Avg QA score" value={t.avgQaScore != null ? `${t.avgQaScore}%` : '—'} sub="completed evaluations" />

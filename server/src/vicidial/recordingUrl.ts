@@ -213,9 +213,12 @@ export async function refreshRecording(
     const ageMin = (now.getTime() - (rec.startTime ?? rec.createdAt).getTime()) / 60_000;
     // the dialer needs a few minutes after hangup to mix and convert a file
     const gaveUp = !opts.inProgress && ageMin > 30 && attempts >= 3;
+    // a recording the dialer started and dropped at once (0 s, no file ever)
+    // — e.g. an unanswered dial; there is nothing to fetch, stop asking
+    const ghost = !opts.inProgress && rec.lengthSec === 0 && ageMin > 10;
     patch = {
-      status: opts.inProgress ? 'pending' : gaveUp || rec.status === 'missing' ? 'missing' : 'pending',
-      checkAttempts: Math.min(attempts, 12),
+      status: opts.inProgress ? 'pending' : ghost || gaveUp || rec.status === 'missing' ? 'missing' : 'pending',
+      checkAttempts: ghost ? 12 : Math.min(attempts, 12),
       lastCheckedAt: now,
       updatedAt: now,
     };
