@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
-import { request } from 'undici';
+import { request, type Dispatcher } from 'undici';
 import { db } from '../db/client.js';
 import { calls, dialerServers, recordings } from '../db/schema.js';
 import { isCallInProgress } from '../services/callRecordings.js';
@@ -50,36 +50,50 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
 
     const headers: Record<string, string> = { ...recordingAuthHeader(conn) };
     if (req.headers.range) headers.range = req.headers.range;
-    const fetchUpstream = async (u: string) => {
+    // gone = the server said the file is not there; down = it did not answer
+    const fetchUpstream = async (u: string): Promise<{ res?: Dispatcher.ResponseData; gone?: boolean; down?: boolean }> => {
       try {
-        const res = await request(u, { method: 'GET', headers, headersTimeout: 15_000 });
-        if (res.statusCode < 400) return res;
+        const res = await request(u, { method: 'GET', headers, headersTimeout: 10_000 });
+        if (res.statusCode < 400) return { res };
         res.body.resume();
+        return res.statusCode === 404 || res.statusCode === 410 || res.statusCode === 403 ? { gone: true } : { down: true };
       } catch {
-        /* unreachable — try the other locations */
+        return { down: true };
       }
-      return null;
     };
 
-    let upstream = url ? await fetchUpstream(url) : null;
-    if (!upstream) {
+    let attempt = url ? await fetchUpstream(url) : { gone: true };
+    let upstream = attempt.res ?? null;
+    if (!upstream && attempt.gone) {
       // the stored URL went stale (a .wav the dialer converted to MP3, or no
       // URL yet) — find where the file lives now and remember it
-      const fresh = await resolveRecordingUrl(rec, conn);
-      if (fresh) upstream = await fetchUpstream(fresh);
-      if (fresh && upstream) {
-        await db
-          .update(recordings)
-          .set({
-            locationUrl: fresh,
-            status: 'available',
-            checkAttempts: isFinalMp3(fresh) ? 0 : 1,
-            lastCheckedAt: new Date(),
-            updatedAt: new Date(),
-          })
-          .where(eq(recordings.id, id));
-        url = fresh;
+      const { url: fresh, certain } = await resolveRecordingUrl(rec, conn);
+      if (fresh) {
+        attempt = await fetchUpstream(fresh);
+        upstream = attempt.res ?? null;
+        if (upstream) {
+          await db
+            .update(recordings)
+            .set({
+              locationUrl: fresh,
+              status: 'available',
+              checkAttempts: isFinalMp3(fresh) ? 0 : 1,
+              lastCheckedAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(recordings.id, id));
+          url = fresh;
+        }
+      } else if (!certain) {
+        attempt = { down: true };
       }
+    }
+    if (!upstream && attempt.down) {
+      // a slow dialer must not change what we know about the recording
+      return reply.code(503).send({
+        error: 'dialer_unreachable',
+        message: "The dialer's recording server did not answer — try again in a moment",
+      });
     }
     if (!upstream || !url) {
       // the repair job keeps retrying it with backoff

@@ -74,8 +74,11 @@ function CallLeg({
   /** the page is polling the dialer */
   checking: boolean;
 }) {
-  const playable = recordings.filter((r) => r.status === 'available');
   const inProgress = leg?.inProgress ?? (call ? call.lengthSec == null : false);
+  // a 0-second call is a disposition-only entry — its file is empty; the
+  // conversation (tagged onto this leg by the server) is what gets played
+  const dispoOnly = !inProgress && (leg?.lengthSec ?? call?.lengthSec ?? 1) === 0;
+  const playable = recordings.filter((r) => r.status === 'available' && (r.lengthSec ?? 1) > 0);
   const hasPending = recordings.some((r) => r.status === 'pending');
   const hasMissing = recordings.some((r) => r.status === 'missing');
   return (
@@ -124,17 +127,27 @@ function CallLeg({
             </div>
           </dl>
           <div className="mt-3 space-y-2">
+            {dispoOnly && (
+              <Note>
+                Disposition-only entry (0 s): the agent saved the result without a new call.
+                {playable.length > 0 ? ' The conversation on this lead:' : hasPending || checking ? ' Finding the conversation…' : ' No audio for this entry.'}
+              </Note>
+            )}
             {playable.map((rec) => (
               <div key={rec.id}>
-                <AudioPlayer recordingId={rec.id} label={rec.filename} lengthSec={rec.lengthSec} preload="metadata" />
-                {!rec.lengthSec && !inProgress && (
-                  <p className="mt-1 text-2xs text-ink-3">
-                    0-second dialer entry (disposition only) — hear the full call under the other legs below.
-                  </p>
+                {dispoOnly && (
+                  <div className="mb-1 flex flex-wrap items-center gap-x-2 text-2xs text-ink-2">
+                    <span className="font-mono">{fmtDateTime(rec.startTime)}</span>
+                    <DispoChip code={rec.callStatus} />
+                    <HangupChip termReason={rec.termReason} status={rec.callStatus} />
+                    <span className="font-mono text-ink-3">{fmtDuration(rec.lengthSec)}</span>
+                  </div>
                 )}
+                <AudioPlayer recordingId={rec.id} label={rec.filename} lengthSec={rec.lengthSec} preload="metadata" />
               </div>
             ))}
             {playable.length === 0 &&
+              !dispoOnly &&
               (inProgress ? (
                 <Note pulse>Call in progress — the recording appears here automatically a minute or two after it ends.</Note>
               ) : hasPending || checking ? (

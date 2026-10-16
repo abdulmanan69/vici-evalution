@@ -97,8 +97,13 @@ export function recordingAuthHeader(conn: DialerConnection): Record<string, stri
   };
 }
 
-/** true when the file is there and not empty */
-export async function probeUrl(url: string, conn: DialerConnection): Promise<boolean> {
+/**
+ * found = the file is there and not empty; absent = the server says it is
+ * not; unknown = the server did not answer (slow or down) — nothing learned.
+ */
+export type Probe = 'found' | 'absent' | 'unknown';
+
+export async function probeUrl(url: string, conn: DialerConnection): Promise<Probe> {
   try {
     const res = await request(url, {
       method: 'HEAD',
@@ -107,24 +112,36 @@ export async function probeUrl(url: string, conn: DialerConnection): Promise<boo
       bodyTimeout: 8_000,
     });
     res.body.resume();
-    if (res.statusCode < 200 || res.statusCode >= 300) return false;
-    const len = Number(res.headers['content-length'] ?? '1');
-    return !Number.isFinite(len) || len > 0;
+    if (res.statusCode >= 200 && res.statusCode < 300) {
+      const len = Number(res.headers['content-length'] ?? '1');
+      return !Number.isFinite(len) || len > 0 ? 'found' : 'absent';
+    }
+    if (res.statusCode === 404 || res.statusCode === 410 || res.statusCode === 403) return 'absent';
+    return 'unknown';
   } catch {
-    return false;
+    return 'unknown';
   }
 }
 
-/** The first candidate that answers, or null. */
+export interface Resolved {
+  url: string | null;
+  /** false when the dialer did not answer for some candidate — a null url then means "unknown", not "gone" */
+  certain: boolean;
+}
+
+/** The first candidate that answers, with whether a miss is trustworthy. */
 export async function resolveRecordingUrl(
   rec: { locationUrl: string | null; filename: string; dialerServerId: string },
   conn: DialerConnection,
-): Promise<string | null> {
+): Promise<Resolved> {
   const hosts = await knownRecordingHosts(rec.dialerServerId, conn.recordingBaseUrl);
+  let certain = true;
   for (const url of candidateUrls(rec, hosts)) {
-    if (await probeUrl(url, conn)) return url;
+    const p = await probeUrl(url, conn);
+    if (p === 'found') return { url, certain: true };
+    if (p === 'unknown') certain = false;
   }
-  return null;
+  return { url: null, certain };
 }
 
 /**
@@ -171,10 +188,14 @@ export async function refreshRecording(
   conn: DialerConnection,
   opts: { inProgress?: boolean } = {},
 ): Promise<RecordingRow> {
-  const url = await resolveRecordingUrl(rec, conn);
+  const { url, certain } = await resolveRecordingUrl(rec, conn);
   const now = new Date();
   let patch: Partial<RecordingRow>;
-  if (url && opts.inProgress && !isFinalMp3(url)) {
+  if (!url && !certain) {
+    // the dialer did not answer: a slow server must never turn a known
+    // recording into 'missing' — leave the state alone, try again later
+    patch = { lastCheckedAt: now, updatedAt: now };
+  } else if (url && opts.inProgress && !isFinalMp3(url)) {
     // the raw .wav is still being written: its header says 0 seconds and
     // browsers cannot play it — keep the location, stay pending until hangup
     patch = { locationUrl: url, status: 'pending', lastCheckedAt: now, updatedAt: now };

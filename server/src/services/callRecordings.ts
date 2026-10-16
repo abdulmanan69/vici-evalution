@@ -173,6 +173,36 @@ export async function recordingBundle(
           .limit(60);
   let rows = await load();
 
+  // A 0-second leg is a disposition-only entry: the agent saved the result
+  // on the lead without a new call. The conversation is that agent's longer
+  // call on the lead shortly before it — tag its recording with the leg so
+  // the page plays the real call instead of an empty file.
+  const tagConversations = () => {
+    for (const [leg, l] of Object.entries(legs) as Array<[Leg, LegState]>) {
+      if (l.inProgress || (l.lengthSec ?? 1) > 0) continue;
+      const legCall = legCalls[leg];
+      if (!legCall) continue;
+      const user = (legCall.viciUserRaw ?? '').toUpperCase();
+      const at = legCall.callDate.getTime();
+      const conv = rows
+        .filter((r) => {
+          const start = r.rec.startTime?.getTime();
+          return (
+            !!r.rec.callId &&
+            !legOfCall.has(r.rec.callId) &&
+            (r.rec.lengthSec ?? 0) > 0 &&
+            (r.callUser ?? '').toUpperCase() === user &&
+            start != null &&
+            at - start > 0 &&
+            at - start < 3 * 3600_000
+          );
+        })
+        .sort((a, b) => b.rec.startTime!.getTime() - a.rec.startTime!.getTime())[0];
+      if (conv?.rec.callId) legOfCall.set(conv.rec.callId, leg);
+    }
+  };
+  tagConversations();
+
   if (opts.refresh && opts.conn) {
     const conn = opts.conn;
     const deadline = now + REFRESH_CAP_MS;
@@ -192,6 +222,8 @@ export async function recordingBundle(
         if ((await Promise.race([lookup, sleep(deadline - Date.now())])) === 'done') rows = await load();
       }
     }
+
+    tagConversations();
 
     // leg recordings not yet verified on their final file: probe them now
     const unverified = rows.filter((r) => {
