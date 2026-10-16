@@ -274,7 +274,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
                   : sql`true`,
               ),
             )
-            .orderBy(recordings.startTime)
+            .orderBy(sql` desc nulls last`)
             .limit(40);
     const events = await db
       .select()

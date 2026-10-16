@@ -127,7 +127,7 @@ function LeadRecordings({ items }: { items: LeadRecording[] }) {
   return (
     <div className="card mt-4 p-4">
       <h2 className="mb-1 font-display text-sm font-bold">Other recordings on this lead</h2>
-      <p className="mb-3 text-2xs text-ink-3">Every call on this lead from 3 days before to 1 day after, oldest first.</p>
+      <p className="mb-3 text-2xs text-ink-3">Every call on this lead from 3 days before to 1 day after, newest first.</p>
       <div className="space-y-3">
         {items.map(({ recording: rec, callStatus, callSource, callUser, agentName }) => (
           <div key={rec.id} className="rounded-md border border-ink/10 p-3">

@@ -5,14 +5,71 @@ import { CheckCircle2, Save } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
 import { AudioPlayer } from '../components/AudioPlayer';
-import { Chip, ErrorState, Loading, PageHeader, fmtDateTime } from '../components/ui';
+import { Chip, ErrorState, Loading, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
 interface EvalRecording {
   id: string;
   filename: string;
   status: string;
   lengthSec: number | null;
-  leg: 'fronter' | 'closer';
+  startTime: string | null;
+  /** 'other' = another call on the same lead (callback, earlier attempt) */
+  leg: 'fronter' | 'closer' | 'sale' | 'other';
+  source: string | null;
+  callStatus: string | null;
+  agent: string | null;
+  agentUser: string | null;
+}
+
+const LEG_STYLE: Record<EvalRecording['leg'], { label: string; cls: string }> = {
+  fronter: { label: 'Fronter', cls: 'bg-info-soft text-info' },
+  closer: { label: 'Closer', cls: 'bg-brand-soft text-brand' },
+  sale: { label: 'Sale call', cls: 'bg-good-soft text-good' },
+  other: { label: 'Same lead', cls: 'bg-bg text-ink-2' },
+};
+
+function RecordingsPanel({ recordings }: { recordings: EvalRecording[] }) {
+  const [onlyThisCall, setOnlyThisCall] = useState(false);
+  const playable = recordings.filter((r) => r.status === 'available' && (r.lengthSec ?? 1) > 0);
+  const shown = onlyThisCall ? playable.filter((r) => r.leg !== 'other') : playable;
+  const others = playable.filter((r) => r.leg === 'other').length;
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center gap-2">
+        <h2 className="font-display text-sm font-bold">Recordings</h2>
+        <span className="text-2xs text-ink-3">newest first · {playable.length}</span>
+        {others > 0 && (
+          <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-2xs text-ink-2">
+            <input type="checkbox" checked={onlyThisCall} onChange={(e) => setOnlyThisCall(e.target.checked)} />
+            This call only
+          </label>
+        )}
+      </div>
+      {shown.length === 0 && (
+        <p className="text-2xs text-ink-3">No playable recording for this call yet — it may still be syncing from the dialer.</p>
+      )}
+      <div className="space-y-2">
+        {shown.map((r) => (
+          <div
+            key={r.id}
+            className={`rounded-md border p-2.5 ${r.leg === 'other' ? 'border-ink/10' : 'border-brand/30 bg-brand-soft/30'}`}
+          >
+            <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-2xs">
+              <span className={`chip ${LEG_STYLE[r.leg].cls}`}>{LEG_STYLE[r.leg].label}</span>
+              <span className="font-mono">{fmtDateTime(r.startTime)}</span>
+              <span className="truncate">
+                {r.agent ?? '—'}
+                {r.agentUser && r.agentUser !== r.agent && <span className="font-mono text-ink-3"> ({r.agentUser})</span>}
+              </span>
+              {r.callStatus && <span className="font-mono">{r.callStatus}</span>}
+              <span className="ml-auto font-mono text-ink-3">{fmtDuration(r.lengthSec)}</span>
+            </div>
+            <AudioPlayer recordingId={r.id} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 interface Detail {
@@ -194,7 +251,7 @@ export function EvaluationPage() {
   const ev = data.evaluation;
 
   return (
-    <div className="mx-auto max-w-3xl">
+    <div className="mx-auto max-w-[1700px]">
       <PageHeader
         title={data.formName}
         subtitle={`Version ${data.formVersion} · reviewer ${data.reviewerName} · pass at ${data.passThreshold}%`}
@@ -212,89 +269,91 @@ export function EvaluationPage() {
         }
       />
 
-      {data.call && (
-        <div className="sticky top-2 z-20 mt-2 rounded-lg border border-ink/10 bg-surface p-3 shadow-card">
-          <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
-            <span className="font-mono font-semibold">{data.call.phoneNumber ?? 'unknown number'}</span>
-            <span className="text-ink-2">
-              {data.call.fronterAgent && <>fronter: <strong>{data.call.fronterAgent}</strong></>}
-              {data.call.closerAgent && <> · closer: <strong>{data.call.closerAgent}</strong></>}
-              {data.call.closerStatus && <> · dispo <span className="font-mono">{data.call.closerStatus}</span></>}
-            </span>
-            <span className="font-mono text-2xs text-ink-3">{fmtDateTime(data.call.xferTime)}</span>
-            <Link to={`/transfers/${data.call.transferId}`} className="ml-auto text-2xs font-medium text-brand hover:underline">
-              Full call detail →
-            </Link>
-          </div>
-          <div className="space-y-2">
-            {data.recordings.filter((r) => r.status === 'available').map((r) => (
-              <div key={r.id} className="flex items-center gap-2">
-                <span className={`chip shrink-0 ${r.leg === 'closer' ? 'bg-brand-soft text-brand' : 'bg-info-soft text-info'}`}>
-                  {r.leg}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <AudioPlayer recordingId={r.id} />
+      <div className="mt-2 grid items-start gap-4 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+        {/* left: the call and every recording, pinned while the form scrolls */}
+        <aside className="card p-3 lg:sticky lg:top-2 lg:max-h-[calc(100vh-1rem)] lg:overflow-y-auto">
+          {data.call ? (
+            <>
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+                <span className="font-mono font-semibold">{data.call.phoneNumber ?? 'unknown number'}</span>
+                <Chip value={data.call.queueStatus} />
+                <span className="font-mono text-2xs text-ink-3">{fmtDateTime(data.call.xferTime)}</span>
+                <Link to={`/transfers/${data.call.transferId}`} className="ml-auto text-2xs font-medium text-brand hover:underline">
+                  Full call detail →
+                </Link>
+              </div>
+              <dl className="mt-2 grid grid-cols-3 gap-2 text-2xs">
+                <div>
+                  <dt className="label">Fronter</dt>
+                  <dd className="text-sm font-medium">{data.call.fronterAgent ?? '—'}</dd>
+                </div>
+                <div>
+                  <dt className="label">Closer</dt>
+                  <dd className="text-sm font-medium">{data.call.closerAgent ?? '—'}</dd>
+                </div>
+                <div>
+                  <dt className="label">Closer dispo</dt>
+                  <dd className="font-mono text-sm">{data.call.closerStatus ?? '—'}</dd>
+                </div>
+              </dl>
+              <RecordingsPanel recordings={data.recordings} />
+            </>
+          ) : (
+            <p className="text-sm text-ink-2">This evaluation is not linked to a call.</p>
+          )}
+        </aside>
+
+        {/* right: score and form */}
+        <div className="min-w-0 space-y-4">
+          {done && (
+            <div className={`card flex items-center gap-4 p-4 ${ev.autoFailed || !ev.passed ? 'bg-bad-soft' : 'bg-good-soft'}`}>
+              <div className="font-display text-3xl font-bold tabular-nums">{ev.percent}%</div>
+              <div className="text-sm">
+                <div className="font-semibold">
+                  {ev.autoFailed ? 'Automatic failure (critical question)' : ev.passed ? 'Passed' : 'Failed'}
+                </div>
+                <div className="text-ink-2">
+                  {ev.score} / {ev.maxScore} points · completed {fmtDateTime(ev.completedAt)}
                 </div>
               </div>
-            ))}
-            {data.recordings.filter((r) => r.status === 'available').length === 0 && (
-              <p className="text-2xs text-ink-3">
-                No playable recording for this call yet — it may still be syncing from the dialer.
-              </p>
-            )}
-          </div>
-        </div>
-      )}
-
-      {done && (
-        <div className={`card mt-3 flex items-center gap-4 p-4 ${ev.autoFailed || !ev.passed ? 'bg-bad-soft' : 'bg-good-soft'}`}>
-          <div className="font-display text-3xl font-bold tabular-nums">{ev.percent}%</div>
-          <div className="text-sm">
-            <div className="font-semibold">
-              {ev.autoFailed ? 'Automatic failure (critical question)' : ev.passed ? 'Passed' : 'Failed'}
+              <Chip value={ev.status} />
             </div>
-            <div className="text-ink-2">
-              {ev.score} / {ev.maxScore} points · completed {fmtDateTime(ev.completedAt)}
-            </div>
-          </div>
-          <Chip value={ev.status} />
-        </div>
-      )}
-      {message && <div className="mt-3 rounded-md bg-brand-soft px-3 py-2 text-sm text-brand">{message}</div>}
+          )}
+          {message && <div className="rounded-md bg-brand-soft px-3 py-2 text-sm text-brand">{message}</div>}
 
-      <div className="mt-4 space-y-4">
-        {data.formSchema.sections.map((section) => (
-          <div key={section.id} className="card p-4">
-            <h2 className="mb-3 font-display text-sm font-bold">{section.title}</h2>
-            <div className="space-y-4">
-              {section.questions.filter((q) => isVisible(q, answers)).map((q) => (
-                <div key={q.id}>
-                  <div className="mb-1.5 flex items-baseline gap-2">
-                    <span className="text-sm font-medium">{q.text}</span>
-                    {q.critical && <span className="chip bg-bad-soft text-bad">critical</span>}
-                    {q.required && <span className="text-2xs text-ink-3">required</span>}
-                    {q.weight > 0 && <span className="ml-auto font-mono text-2xs text-ink-3">{q.weight} pts</span>}
+          {data.formSchema.sections.map((section) => (
+            <div key={section.id} className="card p-4">
+              <h2 className="mb-3 font-display text-sm font-bold">{section.title}</h2>
+              <div className="grid gap-x-6 gap-y-4 2xl:grid-cols-2">
+                {section.questions.filter((q) => isVisible(q, answers)).map((q) => (
+                  <div key={q.id} className={q.type === 'text' ? '2xl:col-span-2' : ''}>
+                    <div className="mb-1.5 flex items-baseline gap-2">
+                      <span className="text-sm font-medium">{q.text}</span>
+                      {q.critical && <span className="chip bg-bad-soft text-bad">critical</span>}
+                      {q.required && <span className="text-2xs text-ink-3">required</span>}
+                      {q.weight > 0 && <span className="ml-auto font-mono text-2xs text-ink-3">{q.weight} pts</span>}
+                    </div>
+                    <AnswerControl
+                      q={q}
+                      value={answers[q.id]}
+                      disabled={done}
+                      onChange={(v) => setAnswers((a) => ({ ...a, [q.id]: v }))}
+                    />
                   </div>
-                  <AnswerControl
-                    q={q}
-                    value={answers[q.id]}
-                    disabled={done}
-                    onChange={(v) => setAnswers((a) => ({ ...a, [q.id]: v }))}
-                  />
-                </div>
-              ))}
+                ))}
+              </div>
             </div>
-          </div>
-        ))}
+          ))}
 
-        <div className="card space-y-3 p-4">
-          <div>
-            <label className="label">Reviewer comments</label>
-            <textarea className="input" rows={3} value={comments} onChange={(e) => setComments(e.target.value)} disabled={done} />
-          </div>
-          <div>
-            <label className="label">Coaching notes (shared with the agent's manager)</label>
-            <textarea className="input" rows={3} value={coaching} onChange={(e) => setCoaching(e.target.value)} disabled={done} />
+          <div className="card grid gap-3 p-4 xl:grid-cols-2">
+            <div>
+              <label className="label">Reviewer comments</label>
+              <textarea className="input" rows={3} value={comments} onChange={(e) => setComments(e.target.value)} disabled={done} />
+            </div>
+            <div>
+              <label className="label">Coaching notes (shared with the agent's manager)</label>
+              <textarea className="input" rows={3} value={coaching} onChange={(e) => setCoaching(e.target.value)} disabled={done} />
+            </div>
           </div>
         </div>
       </div>

@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
-import { and, count, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, inArray, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { calls, dialerServers, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
 import { localToUtc } from '../vicidial/timezone.js';
@@ -206,18 +206,58 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
           closerStatus: t.closerStatus,
           transferId: t.transfer.id,
         };
-        const legIds = [t.fronterCallId, t.closerCallId].filter((x): x is string => !!x);
-        if (legIds.length > 0) {
+        // this call's legs plus every other recording on the lead around it
+        // (callbacks, earlier attempts), newest first — the reviewer hears
+        // the whole story without leaving the form
+        const legIds = [t.fronterCallId, t.closerCallId, t.transfer.saleCallId].filter((x): x is string => !!x);
+        const leadId = t.transfer.viciLeadId;
+        const ref = t.transfer.xferTime;
+        const recCall = alias(calls, 'rc');
+        const recAgent = alias(viciAgents, 'ra');
+        const scope = [
+          legIds.length ? inArray(recordings.callId, legIds) : null,
+          leadId != null
+            ? and(
+                eq(recordings.dialerServerId, t.transfer.dialerServerId),
+                eq(recordings.viciLeadId, leadId),
+                gte(recordings.startTime, new Date(ref.getTime() - 3 * 86_400_000)),
+                lte(recordings.startTime, new Date(ref.getTime() + 86_400_000)),
+              )
+            : null,
+        ].filter((x): x is NonNullable<typeof x> => !!x);
+        if (scope.length > 0) {
           const recs = await db
-            .select()
+            .select({
+              rec: recordings,
+              callStatus: recCall.status,
+              callSource: recCall.source,
+              callUser: recCall.viciUserRaw,
+              agentName: recAgent.fullName,
+            })
             .from(recordings)
-            .where(inArray(recordings.callId, legIds));
-          callRecordings = recs.map((r) => ({
+            .leftJoin(recCall, eq(recordings.callId, recCall.id))
+            .leftJoin(recAgent, eq(recCall.viciAgentId, recAgent.id))
+            .where(or(...scope))
+            .orderBy(sql`${recordings.startTime} desc nulls last`)
+            .limit(60);
+          callRecordings = recs.map(({ rec: r, ...c }) => ({
             id: r.id,
             filename: r.filename,
             status: r.status,
             lengthSec: r.lengthSec,
-            leg: r.callId === t.fronterCallId ? 'fronter' : 'closer',
+            startTime: r.startTime,
+            leg:
+              r.callId === t.fronterCallId
+                ? 'fronter'
+                : r.callId === t.closerCallId
+                  ? 'closer'
+                  : r.callId && r.callId === t.transfer.saleCallId
+                    ? 'sale'
+                    : 'other',
+            source: c.callSource,
+            callStatus: c.callStatus,
+            agent: c.agentName ?? c.callUser,
+            agentUser: c.callUser,
           }));
         }
       }
