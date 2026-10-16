@@ -7,6 +7,7 @@ import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { NotFoundError } from '../lib/errors.js';
 import { toConnection } from '../vicidial/credentials.js';
+import { isFinalMp3, isHttpUrl, recordingAuthHeader, resolveRecordingUrl } from '../vicidial/recordingUrl.js';
 
 /**
  * Recordings are never exposed by predictable URLs. The browser only ever
@@ -40,30 +41,52 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
     // Resolve the upstream URL: absolute location from VICIdial, or
     // recordingBaseUrl + filename as fallback.
     let url: string | null = null;
-    if (rec.locationUrl && /^https?:\/\//i.test(rec.locationUrl)) {
+    if (isHttpUrl(rec.locationUrl)) {
       url = rec.locationUrl;
     } else if (conn.recordingBaseUrl) {
       url = `${conn.recordingBaseUrl}/${encodeURIComponent(rec.filename)}`;
     }
-    if (!url) throw new NotFoundError('No playable location known for this recording');
 
-    const headers: Record<string, string> = {};
+    const headers: Record<string, string> = { ...recordingAuthHeader(conn) };
     if (req.headers.range) headers.range = req.headers.range;
-    if (conn.recordingAuth) {
-      headers.authorization =
-        'Basic ' + Buffer.from(`${conn.recordingAuth.user}:${conn.recordingAuth.pass}`).toString('base64');
-    }
+    const fetchUpstream = async (u: string) => {
+      try {
+        const res = await request(u, { method: 'GET', headers, headersTimeout: 15_000 });
+        if (res.statusCode < 400) return res;
+        res.body.resume();
+      } catch {
+        /* unreachable — try the other locations */
+      }
+      return null;
+    };
 
-    const upstream = await request(url, { method: 'GET', headers, headersTimeout: 15_000 });
-    if (upstream.statusCode === 404) {
+    let upstream = url ? await fetchUpstream(url) : null;
+    if (!upstream) {
+      // the stored URL went stale (a .wav the dialer converted to MP3, or no
+      // URL yet) — find where the file lives now and remember it
+      const fresh = await resolveRecordingUrl(rec, conn);
+      if (fresh) upstream = await fetchUpstream(fresh);
+      if (fresh && upstream) {
+        await db
+          .update(recordings)
+          .set({
+            locationUrl: fresh,
+            status: 'available',
+            checkAttempts: isFinalMp3(fresh) ? 0 : 1,
+            lastCheckedAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(recordings.id, id));
+        url = fresh;
+      }
+    }
+    if (!upstream || !url) {
+      // the repair job keeps retrying it with backoff
       await db
         .update(recordings)
-        .set({ status: 'missing', lastCheckedAt: new Date(), updatedAt: new Date() })
+        .set({ status: 'pending', lastCheckedAt: null, updatedAt: new Date() })
         .where(eq(recordings.id, id));
-      throw new NotFoundError('Recording file missing on the dialer');
-    }
-    if (upstream.statusCode >= 400) {
-      throw new NotFoundError(`Upstream recording server returned ${upstream.statusCode}`);
+      throw new NotFoundError('Recording is not on the dialer yet — it will appear once the dialer finishes it');
     }
 
     await audit(req, {
@@ -78,7 +101,7 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
     // VICIdial recording webservers often send application/forcedownload,
     // which <audio> refuses — derive a real audio type from the extension.
     const upstreamType = (h['content-type'] as string | undefined)?.toLowerCase();
-    const ext = rec.filename.toLowerCase().split('.').pop();
+    const ext = url.toLowerCase().split('?')[0].split('.').pop();
     const extType =
       ext === 'wav' ? 'audio/wav' : ext === 'ogg' ? 'audio/ogg' : ext === 'gsm' ? 'audio/gsm' : 'audio/mpeg';
     reply.header('content-type', upstreamType?.startsWith('audio/') ? upstreamType : extType);

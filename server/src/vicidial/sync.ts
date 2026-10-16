@@ -29,6 +29,7 @@ import {
 import { decideMatch, DEFAULT_MATCH_OPTIONS, normalizePhone, type CloserCandidate } from './matcher.js';
 import { resolveMeaning, transition, type MappingRow } from './queueLogic.js';
 import type { AgentLogRow, DialerConnection, ViciCallRow } from './types.js';
+import { isFinalMp3, isHttpUrl, linkRecordingToCall } from './recordingUrl.js';
 import { normalizeRecordingRow } from './apiDerive.js';
 import { fetchUserStatsCalls, type UserStatsCall } from './webReport.js';
 import { sha256 } from '../lib/crypto.js';
@@ -603,6 +604,9 @@ async function syncRecordingsFromDb(
   if (unlinked > 0) stats.recordings_unlinked = unlinked;
 }
 
+const leadLookupBackoff = new Map<string, { tries: number; next: number }>();
+
+
 /** API fallback: recording_lookup per lead for recent calls missing recordings. */
 async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): Promise<void> {
   if (!conn.apiUser) {
@@ -617,25 +621,33 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
   const lookbackDays = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : 7;
   const lookback = new Date(Date.now() - lookbackDays * 24 * 3600 * 1000);
 
-  const candidates = await db
+  // Only answered calls (length > 0) can carry a recording; a call whose
+  // recording row exists but has no working file yet stays a candidate.
+  // Without the length filter, unanswered dials and 0-second disposition
+  // rows were re-queried every cycle and ate the whole time budget.
+  const rawCandidates = await db
     .select({ leadId: calls.viciLeadId })
     .from(calls)
-    .leftJoin(recordings, eq(recordings.callId, calls.id))
     .where(
       and(
         eq(calls.dialerServerId, conn.id),
         eq(calls.isMock, false),
         gte(calls.callDate, lookback),
-        isNull(recordings.id),
+        sql`coalesce(${calls.lengthSec}, 0) > 0`,
         sql`${calls.viciLeadId} is not null`,
+        sql`not exists (select 1 from recordings r where r.call_id = ${calls.id} and r.status = 'available')`,
       ),
     )
     .groupBy(calls.viciLeadId)
     .orderBy(
-      sql`max((exists(select 1 from transfers t where t.fronter_call_id = ${calls.id} or t.closer_call_id = ${calls.id}))::int) desc`,
+      sql`max((exists(select 1 from transfers t where t.fronter_call_id = ${calls.id} or t.closer_call_id = ${calls.id} or t.sale_call_id = ${calls.id}))::int) desc`,
       sql`max(${calls.callDate}) desc`,
     )
-    .limit(300);
+    .limit(2000);
+  // per-lead backoff (2, 4, 8 … 60 min) so a lead whose file is not out
+  // yet does not block the rest of the backlog
+  const now = Date.now();
+  const candidates = rawCandidates.filter((c) => (leadLookupBackoff.get(`${conn.id}:${c.leadId}`)?.next ?? 0) <= now);
 
   let found = 0;
   // a time budget keeps each sync cycle short so new calls and dispositions
@@ -653,14 +665,25 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     } catch {
       continue; // transient API failure — retried next cycle
     }
+    const key = `${conn.id}:${c.leadId}`;
+    const tries = (leadLookupBackoff.get(key)?.tries ?? 0) + 1;
+    leadLookupBackoff.set(key, { tries, next: Date.now() + Math.min(2 ** tries, 60) * 60_000 });
+    if (leadLookupBackoff.size > 50_000) {
+      for (const [k, v] of leadLookupBackoff) if (v.next < Date.now()) leadLookupBackoff.delete(k);
+    }
     // the lead's call legs, so each recording links to the right one
     const leadCalls = await db
-      .select({ id: calls.id, callDate: calls.callDate })
+      .select({ id: calls.id, callDate: calls.callDate, lengthSec: calls.lengthSec })
       .from(calls)
       .where(
-        and(eq(calls.dialerServerId, conn.id), eq(calls.viciLeadId, c.leadId), eq(calls.isMock, false)),
+        and(
+          eq(calls.dialerServerId, conn.id),
+          eq(calls.viciLeadId, c.leadId),
+          eq(calls.isMock, false),
+          gte(calls.callDate, lookback),
+        ),
       )
-      .limit(50);
+      .limit(500);
     for (const r of rows) {
       const location = r.location ?? r.url ?? '';
       const filename = r.filename ?? (location ? location.split('/').pop()! : '');
@@ -670,18 +693,9 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
       // the lookup returns the lead's FULL history — months-old recordings
       // are already purged on the dialer and outside our retention window
       if (startTime && startTime < lookback) continue;
-      // link to the lead's nearest call leg within 15 minutes
-      let bestId: string | null = null;
-      if (startTime) {
-        let bestDelta = 15 * 60_000;
-        for (const lc of leadCalls) {
-          const delta = Math.abs(lc.callDate.getTime() - startTime.getTime());
-          if (delta <= bestDelta) {
-            bestDelta = delta;
-            bestId = lc.id;
-          }
-        }
-      }
+      const bestId = startTime
+        ? linkRecordingToCall(startTime, r.length_in_sec ? Number(r.length_in_sec) : null, leadCalls)
+        : null;
       // either-key upsert — recording_lookup filenames can differ from the
       // recording_log ones for the same recording_id (format variants)
       await upsertRecordingByEitherKey(
@@ -1040,8 +1054,10 @@ async function upsertRecordingUnchecked(
   row: RecordingInput,
   callId: string | null,
 ): Promise<void> {
+  // a shifted lookup column can put a number where the URL belongs
+  const incomingUrl = isHttpUrl(row.locationUrl) ? row.locationUrl.trim() : null;
   const [existingRec] = await db
-    .select({ id: recordings.id })
+    .select({ id: recordings.id, locationUrl: recordings.locationUrl, status: recordings.status })
     .from(recordings)
     .where(
       and(
@@ -1054,16 +1070,24 @@ async function upsertRecordingUnchecked(
     )
     .limit(1);
   if (existingRec) {
+    // never trade a verified final MP3 for the dialer's temporary .wav or
+    // an empty location — the repair job owns URL upgrades from here
+    const keepUrl =
+      existingRec.status === 'available' &&
+      isHttpUrl(existingRec.locationUrl) &&
+      (!incomingUrl || (isFinalMp3(existingRec.locationUrl) && !isFinalMp3(incomingUrl)));
+    const urlChanged = !keepUrl && incomingUrl !== existingRec.locationUrl;
     await db
       .update(recordings)
       .set({
         ...(callId ? { callId } : {}),
         viciRecordingId: row.recordingId,
         viciLeadId: row.leadId,
-        filename: row.filename,
-        locationUrl: row.locationUrl,
+        ...(keepUrl ? {} : { filename: row.filename, locationUrl: incomingUrl }),
         lengthSec: row.lengthSec,
-        status: row.locationUrl ? 'available' : 'pending',
+        ...(urlChanged
+          ? { status: incomingUrl ? ('available' as const) : ('pending' as const), lastCheckedAt: null, checkAttempts: 0 }
+          : {}),
         updatedAt: new Date(),
       })
       .where(eq(recordings.id, existingRec.id));
@@ -1077,10 +1101,10 @@ async function upsertRecordingUnchecked(
         viciRecordingId: row.recordingId,
         viciLeadId: row.leadId,
         filename: row.filename,
-        locationUrl: row.locationUrl,
+        locationUrl: incomingUrl,
         startTime: row.startTime,
         lengthSec: row.lengthSec,
-        status: row.locationUrl ? 'available' : 'pending',
+        status: incomingUrl ? 'available' : 'pending',
         raw: { source: 'recording_lookup' },
       })
       .onConflictDoNothing();
