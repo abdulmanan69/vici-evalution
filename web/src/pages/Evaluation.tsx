@@ -75,12 +75,7 @@ function RecordingsPanel({
               <span className="ml-auto font-mono text-ink-3">{fmtDuration(r.lengthSec)}</span>
             </div>
             {r.status === 'available' ? (
-              <>
-                <AudioPlayer recordingId={r.id} />
-                {!r.final && r.leg !== 'other' && legs[r.leg]?.inProgress && (
-                  <p className="mt-1 text-2xs text-ink-3 animate-pulse">Live partial recording — the full file replaces it after hangup.</p>
-                )}
-              </>
+              <AudioPlayer recordingId={r.id} lengthSec={r.lengthSec} preload={r.leg === 'other' ? 'none' : 'metadata'} />
             ) : (
               <p className="text-2xs text-ink-3 animate-pulse">Preparing on the dialer — appears automatically.</p>
             )}

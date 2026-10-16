@@ -126,14 +126,11 @@ function CallLeg({
           <div className="mt-3 space-y-2">
             {playable.map((rec) => (
               <div key={rec.id}>
-                <AudioPlayer recordingId={rec.id} label={rec.filename} />
+                <AudioPlayer recordingId={rec.id} label={rec.filename} lengthSec={rec.lengthSec} preload="metadata" />
                 {!rec.lengthSec && !inProgress && (
                   <p className="mt-1 text-2xs text-ink-3">
                     0-second dialer entry (disposition only) — hear the full call under the other legs below.
                   </p>
-                )}
-                {!rec.final && inProgress && (
-                  <Note pulse>Live partial recording — the full file replaces it after hangup.</Note>
                 )}
               </div>
             ))}
@@ -174,7 +171,7 @@ function LeadRecordings({ items }: { items: RecordingItem[] }) {
               <span className="font-mono text-ink-3">{fmtDuration(rec.lengthSec)}</span>
             </div>
             {rec.status === 'available' ? (
-              <AudioPlayer recordingId={rec.id} label={rec.filename} />
+              <AudioPlayer recordingId={rec.id} label={rec.filename} lengthSec={rec.lengthSec} />
             ) : (
               <div className="flex items-center gap-2 text-2xs text-ink-2">
                 <Chip value={rec.status} />

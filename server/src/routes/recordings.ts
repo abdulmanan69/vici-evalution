@@ -2,7 +2,8 @@ import type { FastifyInstance } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { request } from 'undici';
 import { db } from '../db/client.js';
-import { dialerServers, recordings } from '../db/schema.js';
+import { calls, dialerServers, recordings } from '../db/schema.js';
+import { isCallInProgress } from '../services/callRecordings.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { NotFoundError } from '../lib/errors.js';
@@ -87,6 +88,17 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
         .set({ status: 'pending', lastCheckedAt: null, updatedAt: new Date() })
         .where(eq(recordings.id, id));
       throw new NotFoundError('Recording is not on the dialer yet — it will appear once the dialer finishes it');
+    }
+    if (!isFinalMp3(url)) {
+      // a raw .wav mid-call has no usable header (browsers see 0 s) — only
+      // serve it once the call has ended and the file is closed
+      const [call] = rec.callId
+        ? await db.select({ lengthSec: calls.lengthSec, status: calls.status }).from(calls).where(eq(calls.id, rec.callId))
+        : [];
+      if (isCallInProgress(call)) {
+        upstream.body.resume();
+        throw new NotFoundError('Still recording — the file becomes playable right after the call ends');
+      }
     }
 
     await audit(req, {

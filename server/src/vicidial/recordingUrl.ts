@@ -174,7 +174,11 @@ export async function refreshRecording(
   const url = await resolveRecordingUrl(rec, conn);
   const now = new Date();
   let patch: Partial<RecordingRow>;
-  if (url) {
+  if (url && opts.inProgress && !isFinalMp3(url)) {
+    // the raw .wav is still being written: its header says 0 seconds and
+    // browsers cannot play it — keep the location, stay pending until hangup
+    patch = { locationUrl: url, status: 'pending', lastCheckedAt: now, updatedAt: now };
+  } else if (url) {
     patch = {
       locationUrl: url,
       status: 'available',

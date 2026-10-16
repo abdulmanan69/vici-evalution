@@ -7,29 +7,62 @@ const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 /**
  * Streams through the authenticated proxy (/api/v1/recordings/:id/stream).
  * The session cookie rides along — recordings never have public URLs.
+ *
+ * Nothing downloads until play is pressed (`preload="none"`): a page can
+ * list dozens of recordings, and browsers cap concurrent media connections,
+ * so eager preloading left later players stuck at 0:00. The length comes
+ * from the dialer (`lengthSec`) so it shows before any audio is fetched.
  */
-export function AudioPlayer({ recordingId, label }: { recordingId: string; label?: string }) {
+export function AudioPlayer({
+  recordingId,
+  label,
+  lengthSec,
+  preload = 'none',
+}: {
+  recordingId: string;
+  label?: string;
+  /** the dialer's length, shown until the audio reports its own */
+  lengthSec?: number | null;
+  preload?: 'none' | 'metadata';
+}) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [time, setTime] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [mediaDuration, setMediaDuration] = useState(0);
   const [speed, setSpeed] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  const duration = mediaDuration > 0 && Number.isFinite(mediaDuration) ? mediaDuration : (lengthSec ?? 0);
 
   useEffect(() => {
     const a = audioRef.current;
     if (!a) return;
     const onTime = () => setTime(a.currentTime);
-    const onMeta = () => setDuration(a.duration || 0);
+    const onMeta = () => setMediaDuration(a.duration || 0);
+    const onPlaying = () => {
+      setLoading(false);
+      setPlaying(true);
+    };
+    const onPause = () => setPlaying(false);
     const onEnd = () => setPlaying(false);
-    const onErr = () => setError('Recording could not be loaded — it may be missing on the dialer.');
+    const onErr = () => {
+      setLoading(false);
+      setPlaying(false);
+      setError('Recording could not be loaded — the dialer may still be finishing it. Try again in a minute.');
+    };
     a.addEventListener('timeupdate', onTime);
     a.addEventListener('loadedmetadata', onMeta);
+    a.addEventListener('durationchange', onMeta);
+    a.addEventListener('playing', onPlaying);
+    a.addEventListener('pause', onPause);
     a.addEventListener('ended', onEnd);
     a.addEventListener('error', onErr);
     return () => {
       a.removeEventListener('timeupdate', onTime);
       a.removeEventListener('loadedmetadata', onMeta);
+      a.removeEventListener('durationchange', onMeta);
+      a.removeEventListener('playing', onPlaying);
+      a.removeEventListener('pause', onPause);
       a.removeEventListener('ended', onEnd);
       a.removeEventListener('error', onErr);
     };
@@ -42,7 +75,12 @@ export function AudioPlayer({ recordingId, label }: { recordingId: string; label
       a.pause();
       setPlaying(false);
     } else {
-      void a.play().then(() => setPlaying(true)).catch(() => setError('Playback failed.'));
+      setLoading(true);
+      a.playbackRate = speed;
+      void a.play().catch(() => {
+        setLoading(false);
+        setError('Playback failed — try again in a minute.');
+      });
     }
   };
 
@@ -59,15 +97,28 @@ export function AudioPlayer({ recordingId, label }: { recordingId: string; label
   };
 
   if (error) {
-    return <div className="rounded-md bg-bad-soft px-3 py-2 text-2xs text-bad">{error}</div>;
+    return (
+      <div className="flex items-center gap-2 rounded-md bg-bad-soft px-3 py-2 text-2xs text-bad">
+        <span>{error}</span>
+        <button
+          className="ml-auto shrink-0 underline"
+          onClick={() => {
+            setError(null);
+            audioRef.current?.load();
+          }}
+        >
+          Retry
+        </button>
+      </div>
+    );
   }
 
   return (
     <div className="flex items-center gap-2 rounded-md bg-bg px-3 py-2">
-      <audio ref={audioRef} src={`/api/v1/recordings/${recordingId}/stream`} preload="metadata" />
+      <audio ref={audioRef} src={`/api/v1/recordings/${recordingId}/stream`} preload={preload} />
       <button
         onClick={toggle}
-        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand text-white hover:bg-brand-dark"
+        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand text-white hover:bg-brand-dark ${loading ? 'animate-pulse' : ''}`}
         aria-label={playing ? 'Pause' : 'Play'}
       >
         {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
