@@ -625,8 +625,9 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
   // recording row exists but has no working file yet stays a candidate.
   // Without the length filter, unanswered dials and 0-second disposition
   // rows were re-queried every cycle and ate the whole time budget.
+  const isQaLeg = sql<number>`max((exists(select 1 from transfers t where t.fronter_call_id = ${calls.id} or t.closer_call_id = ${calls.id} or t.sale_call_id = ${calls.id}))::int)`;
   const rawCandidates = await db
-    .select({ leadId: calls.viciLeadId })
+    .select({ leadId: calls.viciLeadId, isQaLeg })
     .from(calls)
     .where(
       and(
@@ -640,14 +641,17 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     )
     .groupBy(calls.viciLeadId)
     .orderBy(
-      sql`max((exists(select 1 from transfers t where t.fronter_call_id = ${calls.id} or t.closer_call_id = ${calls.id} or t.sale_call_id = ${calls.id}))::int) desc`,
+      sql`${isQaLeg} desc`,
       sql`max(${calls.callDate}) desc`,
     )
     .limit(2000);
   // per-lead backoff (2, 4, 8 … 60 min) so a lead whose file is not out
   // yet does not block the rest of the backlog
   const now = Date.now();
-  const candidates = rawCandidates.filter((c) => (leadLookupBackoff.get(`${conn.id}:${c.leadId}`)?.next ?? 0) <= now);
+  // calls QA reviews (transfer legs) are never held back by the backoff
+  const candidates = rawCandidates.filter(
+    (c) => Number(c.isQaLeg) > 0 || (leadLookupBackoff.get(`${conn.id}:${c.leadId}`)?.next ?? 0) <= now,
+  );
 
   let found = 0;
   // a time budget keeps each sync cycle short so new calls and dispositions
