@@ -1,10 +1,10 @@
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ClipboardPlus, GitMerge, Radio } from 'lucide-react';
+import { ClipboardPlus, GitMerge, Radio, RefreshCw } from 'lucide-react';
 import { api } from '../api/client';
 import type { Call, Evaluation, QaForm, TransferEvent, Transfer } from '../api/types';
-import { useLiveRecordings, type LegState, type RecordingItem } from '../api/liveRecordings';
+import { fetchNote, useFetchRecordings, useLiveRecordings, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { useAuth } from '../auth/AuthContext';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
@@ -62,6 +62,8 @@ function CallLeg({
   recordings,
   pendingMatch,
   checking,
+  onFetch,
+  fetching,
 }: {
   title: string;
   call: Call | null;
@@ -73,6 +75,9 @@ function CallLeg({
   pendingMatch: boolean;
   /** the page is polling the dialer */
   checking: boolean;
+  /** 'Fetch from dialer' — the reviewer's explicit retry */
+  onFetch?: () => void;
+  fetching?: boolean;
 }) {
   const inProgress = leg?.inProgress ?? (call ? call.lengthSec == null : false);
   // a 0-second call is a disposition-only entry — its file is empty; the
@@ -157,6 +162,11 @@ function CallLeg({
               ) : (
                 <Note>No recording on the dialer for this call.</Note>
               ))}
+            {playable.length === 0 && !inProgress && onFetch && (
+              <button className="btn-secondary mt-1" onClick={onFetch} disabled={fetching}>
+                <RefreshCw size={12} className={fetching ? 'animate-spin' : ''} /> {fetching ? 'Fetching from dialer…' : 'Fetch from dialer'}
+              </button>
+            )}
           </div>
         </>
       )}
@@ -269,6 +279,7 @@ export function TransferDetailPage() {
   });
   // recordings follow the dialer live; everything else is the snapshot above
   const liveQ = useLiveRecordings(id);
+  const fetchRecs = useFetchRecordings(id);
 
   const { data: formsData } = useQuery({
     queryKey: ['forms', data?.transfer.companyId],
@@ -353,11 +364,23 @@ export function TransferDetailPage() {
           </span>
         )}
         {t.matchNotes && <span className="text-2xs text-ink-3">{t.matchNotes}</span>}
-        {checking && (
-          <span className="chip ml-auto flex items-center gap-1 bg-info-soft text-info animate-pulse" title="Recordings refresh themselves while the dialer is still finishing this call">
-            <Radio size={12} /> Live · checking the dialer every 8 s
-          </span>
-        )}
+        <span className="ml-auto flex flex-wrap items-center gap-2">
+          {checking && (
+            <span className="chip flex items-center gap-1 bg-info-soft text-info animate-pulse" title="Recordings refresh themselves while the dialer is still finishing this call">
+              <Radio size={12} /> Live · checking the dialer every 8 s
+            </span>
+          )}
+          {fetchNote(fetchRecs) && <span className="text-2xs text-ink-2">{fetchNote(fetchRecs)}</span>}
+          <button
+            className="btn-secondary"
+            onClick={() => fetchRecs.mutate()}
+            disabled={fetchRecs.isPending}
+            title="Ask the dialer for this call's recordings right now"
+          >
+            <RefreshCw size={12} className={fetchRecs.isPending ? 'animate-spin' : ''} />{' '}
+            {fetchRecs.isPending ? 'Fetching…' : 'Fetch from dialer'}
+          </button>
+        </span>
       </div>
 
       <div className="mb-3">
@@ -374,6 +397,8 @@ export function TransferDetailPage() {
             recordings={byLeg('fronter')}
             pendingMatch={false}
             checking={checking}
+            onFetch={() => fetchRecs.mutate()}
+            fetching={fetchRecs.isPending}
           />
         )}
         <CallLeg
@@ -385,6 +410,8 @@ export function TransferDetailPage() {
           recordings={byLeg('closer')}
           pendingMatch={pendingMatch}
           checking={checking}
+          onFetch={() => fetchRecs.mutate()}
+          fetching={fetchRecs.isPending}
         />
         {data.saleCall && (
           <CallLeg
@@ -396,6 +423,8 @@ export function TransferDetailPage() {
             recordings={byLeg('sale')}
             pendingMatch={false}
             checking={checking}
+            onFetch={() => fetchRecs.mutate()}
+            fetching={fetchRecs.isPending}
           />
         )}
       </div>

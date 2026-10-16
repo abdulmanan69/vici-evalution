@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CheckCircle2, Save } from 'lucide-react';
+import { CheckCircle2, RefreshCw, Save } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
-import { useLiveRecordings, type Leg, type LegState, type RecordingItem } from '../api/liveRecordings';
+import { fetchNote, useFetchRecordings, useLiveRecordings, type Leg, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
 import { Chip, ErrorState, Loading, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
@@ -20,10 +20,17 @@ function RecordingsPanel({
   recordings,
   legs,
   live,
+  onFetch,
+  fetching,
+  note,
 }: {
   recordings: RecordingItem[];
   legs: Partial<Record<Leg, LegState>>;
   live: boolean;
+  /** 'Fetch from dialer' — the reviewer's explicit retry */
+  onFetch: () => void;
+  fetching: boolean;
+  note: string | null;
 }) {
   const [onlyThisCall, setOnlyThisCall] = useState(false);
   // playable files, plus this call's own legs while the dialer still prepares them
@@ -41,6 +48,9 @@ function RecordingsPanel({
           newest first · {usable.filter((r) => r.status === 'available').length}
         </span>
         {live && <span className="chip bg-info-soft text-info animate-pulse">live · checking every 8 s</span>}
+        <button className="btn-secondary" onClick={onFetch} disabled={fetching} title="Ask the dialer for this call's recordings right now">
+          <RefreshCw size={12} className={fetching ? 'animate-spin' : ''} /> {fetching ? 'Fetching…' : 'Fetch from dialer'}
+        </button>
         {others > 0 && (
           <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-2xs text-ink-2">
             <input type="checkbox" checked={onlyThisCall} onChange={(e) => setOnlyThisCall(e.target.checked)} />
@@ -48,6 +58,7 @@ function RecordingsPanel({
           </label>
         )}
       </div>
+      {note && <p className="mb-2 text-2xs text-ink-2">{note}</p>}
       {shown.length === 0 && (
         <p className="text-2xs text-ink-3">
           {inProgress
@@ -230,6 +241,7 @@ export function EvaluationPage() {
   });
   // the recordings follow the dialer live while the call is still being finished
   const liveQ = useLiveRecordings(data?.call?.transferId);
+  const fetchRecs = useFetchRecordings(data?.call?.transferId);
 
   useEffect(() => {
     if (data) {
@@ -335,6 +347,9 @@ export function EvaluationPage() {
                 recordings={liveQ.data?.items ?? data.recordings}
                 legs={liveQ.data?.legs ?? {}}
                 live={liveQ.data?.live ?? false}
+                onFetch={() => fetchRecs.mutate()}
+                fetching={fetchRecs.isPending}
+                note={fetchNote(fetchRecs)}
               />
             </>
           ) : (

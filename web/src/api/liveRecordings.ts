@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from './client';
 
 export type Leg = 'fronter' | 'closer' | 'sale';
@@ -55,4 +55,28 @@ export function useLiveRecordings(transferId: string | null | undefined) {
     refetchInterval: (query) => (query.state.data?.live ? 8_000 : false),
     refetchIntervalInBackground: false,
   });
+}
+
+/**
+ * "Fetch from dialer": the reviewer's explicit retry. The server re-asks the
+ * dialer for the lead and re-probes every file for this call right now,
+ * then the page shows whatever came back.
+ */
+export function useFetchRecordings(transferId: string | null | undefined) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => api<LiveRecordings & { found: number }>(`/queues/detail/${transferId}/recordings/fetch`, { method: 'POST' }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(['transfer-recordings', transferId], data);
+    },
+  });
+}
+
+/** one line for the reviewer after a fetch */
+export function fetchNote(m: ReturnType<typeof useFetchRecordings>): string | null {
+  if (m.isError) return 'Fetch failed — the dialer did not answer. Try again in a moment.';
+  if (!m.isSuccess) return null;
+  const n = m.data.found;
+  if (n > 0) return `Fetched ${n} recording${n > 1 ? 's' : ''} from the dialer.`;
+  return 'Nothing new yet — the dialer has not finished this file. Try again in a minute.';
 }

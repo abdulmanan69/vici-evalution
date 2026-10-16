@@ -261,8 +261,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
   // request (a throttled lead lookup plus HEAD probes, capped at 2.5 s). The
   // page polls this while a call is up or a file is still being prepared, so
   // recordings show up without a refresh and without waiting for a sync cycle.
-  app.get('/detail/:transferId/recordings', { preHandler: [requirePermission('calls.view')] }, async (req) => {
-    const { transferId } = req.params as { transferId: string };
+  const liveRecordings = async (req: FastifyRequest, transferId: string, force: boolean) => {
     const [row] = await db
       .select({ transfer: transfers, fronterCall, closerCall, saleCall: saleCallLeg, dialer: dialerServers })
       .from(transfers)
@@ -287,9 +286,23 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const bundle = await recordingBundle(
       row.transfer,
       { fronter, closer: row.closerCall, sale: row.saleCall },
-      { refresh: !row.transfer.isMock, conn: toConnection(row.dialer) },
+      { refresh: !row.transfer.isMock, force, conn: toConnection(row.dialer) },
     );
     return { ...bundle, fronterFromLead };
+  };
+  app.get('/detail/:transferId/recordings', { preHandler: [requirePermission('calls.view')] }, async (req) => {
+    const { transferId } = req.params as { transferId: string };
+    return liveRecordings(req, transferId, false);
+  });
+  // "Fetch from dialer": a reviewer's explicit retry — ignores the throttles,
+  // re-asks the dialer for the lead and re-probes every file, missing ones too
+  app.post('/detail/:transferId/recordings/fetch', { preHandler: [requirePermission('calls.view')] }, async (req) => {
+    const { transferId } = req.params as { transferId: string };
+    const before = await liveRecordings(req, transferId, false);
+    const after = await liveRecordings(req, transferId, true);
+    const playableBefore = before.items.filter((i) => i.status === 'available').length;
+    const playableAfter = after.items.filter((i) => i.status === 'available').length;
+    return { ...after, found: Math.max(0, playableAfter - playableBefore) };
   });
 
   // Candidate closer calls for a flagged transfer, scored — for manual resolution.

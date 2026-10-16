@@ -118,9 +118,15 @@ const sleep = (ms: number) => new Promise<'timeout'>((r) => setTimeout(() => r('
 export async function recordingBundle(
   transfer: TransferRow,
   legCalls: Partial<Record<Leg, CallRow | null | undefined>>,
-  opts: { refresh?: boolean; conn?: DialerConnection | null } = {},
+  opts: {
+    refresh?: boolean;
+    conn?: DialerConnection | null;
+    /** a reviewer pressed "fetch": ignore throttles, retry missing files, wait longer */
+    force?: boolean;
+  } = {},
 ): Promise<RecordingBundle> {
   const now = Date.now();
+  const force = !!opts.force;
   const legs: Partial<Record<Leg, LegState>> = {};
   const legOfCall = new Map<string, Leg>();
   for (const leg of ['fronter', 'closer', 'sale'] as const) {
@@ -205,14 +211,14 @@ export async function recordingBundle(
 
   if (opts.refresh && opts.conn) {
     const conn = opts.conn;
-    const deadline = now + REFRESH_CAP_MS;
+    const deadline = now + (force ? 6_000 : REFRESH_CAP_MS);
 
     // a leg with no recording row yet: ask the dialer for the lead now
     // instead of waiting for the next sync cycle
     const rowless = callIds.filter((cid) => !rows.some((r) => r.rec.callId === cid));
-    if (rowless.length > 0 && leadId != null && conn.apiUser) {
+    if ((rowless.length > 0 || force) && leadId != null && conn.apiUser) {
       const key = `${conn.id}:${leadId}`;
-      if ((leadLookupAt.get(key) ?? 0) < now - LEAD_LOOKUP_EVERY_MS) {
+      if (force || (leadLookupAt.get(key) ?? 0) < now - LEAD_LOOKUP_EVERY_MS) {
         leadLookupAt.set(key, now);
         const lookback = new Date(now - (config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : 7) * 86_400_000);
         const lookup = lookupLeadRecordings(conn, leadId, lookback).then(
@@ -233,11 +239,11 @@ export async function recordingBundle(
       const verified = rec.status === 'available' && !!rec.locationUrl && isFinalMp3(rec.locationUrl);
       const checkedJustNow = (rec.lastCheckedAt?.getTime() ?? 0) > now - 15_000;
       const young = (rec.startTime ?? rec.createdAt).getTime() > now - 48 * 3600_000;
-      return !verified && !checkedJustNow && young;
+      return !verified && (force || (!checkedJustNow && young));
     });
     if (unverified.length > 0) {
       const fresh = new Map<string, RecordingRow>();
-      const probes = unverified.slice(0, 6).map((r) =>
+      const probes = unverified.slice(0, force ? 12 : 6).map((r) =>
         refreshRecording(r.rec, conn, { inProgress: legs[legOfCall.get(r.rec.callId!)!]?.inProgress })
           .then((u) => {
             fresh.set(u.id, u);
