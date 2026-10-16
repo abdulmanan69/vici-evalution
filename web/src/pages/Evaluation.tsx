@@ -4,40 +4,43 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2, Save } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
+import { useLiveRecordings, type Leg, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { AudioPlayer } from '../components/AudioPlayer';
+import { DispoChip, HangupChip } from '../components/DispoChip';
 import { Chip, ErrorState, Loading, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
-interface EvalRecording {
-  id: string;
-  filename: string;
-  status: string;
-  lengthSec: number | null;
-  startTime: string | null;
-  /** 'other' = another call on the same lead (callback, earlier attempt) */
-  leg: 'fronter' | 'closer' | 'sale' | 'other';
-  source: string | null;
-  callStatus: string | null;
-  agent: string | null;
-  agentUser: string | null;
-}
-
-const LEG_STYLE: Record<EvalRecording['leg'], { label: string; cls: string }> = {
+const LEG_STYLE: Record<RecordingItem['leg'], { label: string; cls: string }> = {
   fronter: { label: 'Fronter', cls: 'bg-info-soft text-info' },
   closer: { label: 'Closer', cls: 'bg-brand-soft text-brand' },
   sale: { label: 'Sale call', cls: 'bg-good-soft text-good' },
   other: { label: 'Same lead', cls: 'bg-bg text-ink-2' },
 };
 
-function RecordingsPanel({ recordings }: { recordings: EvalRecording[] }) {
+function RecordingsPanel({
+  recordings,
+  legs,
+  live,
+}: {
+  recordings: RecordingItem[];
+  legs: Partial<Record<Leg, LegState>>;
+  live: boolean;
+}) {
   const [onlyThisCall, setOnlyThisCall] = useState(false);
-  const playable = recordings.filter((r) => r.status === 'available' && (r.lengthSec ?? 1) > 0);
-  const shown = onlyThisCall ? playable.filter((r) => r.leg !== 'other') : playable;
-  const others = playable.filter((r) => r.leg === 'other').length;
+  // playable files, plus this call's own legs while the dialer still prepares them
+  const usable = recordings.filter(
+    (r) => (r.status === 'available' && (r.lengthSec ?? 1) > 0) || (r.status === 'pending' && r.leg !== 'other'),
+  );
+  const shown = onlyThisCall ? usable.filter((r) => r.leg !== 'other') : usable;
+  const others = usable.filter((r) => r.leg === 'other').length;
+  const inProgress = Object.values(legs).some((l) => l?.inProgress);
   return (
     <div className="mt-3">
-      <div className="mb-2 flex items-center gap-2">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
         <h2 className="font-display text-sm font-bold">Recordings</h2>
-        <span className="text-2xs text-ink-3">newest first · {playable.length}</span>
+        <span className="text-2xs text-ink-3">
+          newest first · {usable.filter((r) => r.status === 'available').length}
+        </span>
+        {live && <span className="chip bg-info-soft text-info animate-pulse">live · checking every 8 s</span>}
         {others > 0 && (
           <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-2xs text-ink-2">
             <input type="checkbox" checked={onlyThisCall} onChange={(e) => setOnlyThisCall(e.target.checked)} />
@@ -46,7 +49,13 @@ function RecordingsPanel({ recordings }: { recordings: EvalRecording[] }) {
         )}
       </div>
       {shown.length === 0 && (
-        <p className="text-2xs text-ink-3">No playable recording for this call yet — it may still be syncing from the dialer.</p>
+        <p className="text-2xs text-ink-3">
+          {inProgress
+            ? 'Call in progress — the recording appears here automatically a minute or two after it ends.'
+            : live
+              ? 'Recording is being prepared on the dialer — it appears here automatically.'
+              : 'No recording on the dialer for this call.'}
+        </p>
       )}
       <div className="space-y-2">
         {shown.map((r) => (
@@ -58,13 +67,23 @@ function RecordingsPanel({ recordings }: { recordings: EvalRecording[] }) {
               <span className={`chip ${LEG_STYLE[r.leg].cls}`}>{LEG_STYLE[r.leg].label}</span>
               <span className="font-mono">{fmtDateTime(r.startTime)}</span>
               <span className="truncate">
-                {r.agent ?? '—'}
-                {r.agentUser && r.agentUser !== r.agent && <span className="font-mono text-ink-3"> ({r.agentUser})</span>}
+                {r.agentName ?? r.callUser ?? '—'}
+                {r.callUser && r.callUser !== r.agentName && <span className="font-mono text-ink-3"> ({r.callUser})</span>}
               </span>
-              {r.callStatus && <span className="font-mono">{r.callStatus}</span>}
+              <DispoChip code={r.callStatus} />
+              <HangupChip termReason={r.termReason} inProgress={r.leg !== 'other' && legs[r.leg]?.inProgress} status={r.callStatus} />
               <span className="ml-auto font-mono text-ink-3">{fmtDuration(r.lengthSec)}</span>
             </div>
-            <AudioPlayer recordingId={r.id} />
+            {r.status === 'available' ? (
+              <>
+                <AudioPlayer recordingId={r.id} />
+                {!r.final && r.leg !== 'other' && legs[r.leg]?.inProgress && (
+                  <p className="mt-1 text-2xs text-ink-3 animate-pulse">Live partial recording — the full file replaces it after hangup.</p>
+                )}
+              </>
+            ) : (
+              <p className="text-2xs text-ink-3 animate-pulse">Preparing on the dialer — appears automatically.</p>
+            )}
           </div>
         ))}
       </div>
@@ -87,9 +106,13 @@ interface Detail {
     fronterAgent: string | null;
     closerAgent: string | null;
     closerStatus: string | null;
+    fronterTermReason: string | null;
+    closerTermReason: string | null;
+    closerInProgress: boolean;
     transferId: string;
   } | null;
-  recordings: EvalRecording[];
+  /** snapshot for the first paint; the live query takes over from there */
+  recordings: RecordingItem[];
 }
 
 type Answers = Record<string, string | number | boolean | null>;
@@ -210,6 +233,8 @@ export function EvaluationPage() {
     queryKey: ['evaluation', id],
     queryFn: () => api<Detail>(`/evaluations/${id}`),
   });
+  // the recordings follow the dialer live while the call is still being finished
+  const liveQ = useLiveRecordings(data?.call?.transferId);
 
   useEffect(() => {
     if (data) {
@@ -286,17 +311,36 @@ export function EvaluationPage() {
                 <div>
                   <dt className="label">Fronter</dt>
                   <dd className="text-sm font-medium">{data.call.fronterAgent ?? '—'}</dd>
+                  <dd className="mt-0.5">
+                    <HangupChip
+                      termReason={liveQ.data?.legs.fronter?.termReason ?? data.call.fronterTermReason}
+                      inProgress={liveQ.data?.legs.fronter?.inProgress}
+                      status={liveQ.data?.legs.fronter?.status ?? 'XFER'}
+                    />
+                  </dd>
                 </div>
                 <div>
                   <dt className="label">Closer</dt>
                   <dd className="text-sm font-medium">{data.call.closerAgent ?? '—'}</dd>
+                  <dd className="mt-0.5">
+                    <HangupChip
+                      termReason={liveQ.data?.legs.closer?.termReason ?? data.call.closerTermReason}
+                      inProgress={liveQ.data?.legs.closer?.inProgress ?? data.call.closerInProgress}
+                    />
+                  </dd>
                 </div>
                 <div>
                   <dt className="label">Closer dispo</dt>
-                  <dd className="font-mono text-sm">{data.call.closerStatus ?? '—'}</dd>
+                  <dd>
+                    <DispoChip code={liveQ.data?.legs.closer?.status ?? data.call.closerStatus} />
+                  </dd>
                 </div>
               </dl>
-              <RecordingsPanel recordings={data.recordings} />
+              <RecordingsPanel
+                recordings={liveQ.data?.items ?? data.recordings}
+                legs={liveQ.data?.legs ?? {}}
+                live={liveQ.data?.live ?? false}
+              />
             </>
           ) : (
             <p className="text-sm text-ink-2">This evaluation is not linked to a call.</p>

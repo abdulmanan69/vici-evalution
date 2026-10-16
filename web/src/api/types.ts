@@ -65,6 +65,8 @@ export interface DispoMapping {
 }
 
 export interface Call {
+  /** VICIdial term_reason: CALLER = customer hung up, AGENT = agent hung up */
+  termReason: string | null;
   id: string;
   dialerServerId: string;
   source: string;

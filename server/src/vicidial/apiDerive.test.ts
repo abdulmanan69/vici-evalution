@@ -33,6 +33,17 @@ describe('recording_lookup duration-column repair', () => {
     expect(row.lead_id).toBe('8203539');
   });
 
+  it('keeps a still-recording row (seconds, no URL yet) out of the location slot', () => {
+    const body = [
+      'start_time|user|recording_id|lead_id|location',
+      '2026-10-16 14:36:25|WTI1015|680777|8724694|192',
+    ].join('\n');
+    const [row] = parsePipeWithHeader(body).map(fixRecordingRow);
+    expect(row.location).toBe('');
+    expect(row.length_in_sec).toBe('192');
+    expect(row.recording_id).toBe('680777');
+  });
+
   it('leaves well-formed rows untouched', () => {
     const body = [
       'start_time|user|recording_id|lead_id|length_in_sec|location',

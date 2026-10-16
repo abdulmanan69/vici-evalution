@@ -63,14 +63,22 @@ describe('recording URL repair', () => {
       'http://10.0.0.2/RECORDINGS/MP3/20261015-174553_2016948873-all.mp3',
       'http://10.0.0.2/RECORDINGS/20261015-174553_2016948873-all.wav',
       'http://10.0.0.1/RECORDINGS/MP3/20261015-174553_2016948873-all.mp3',
+      'http://10.0.0.1/RECORDINGS/20261015-174553_2016948873-all.wav',
     ]);
   });
 
-  it('guesses every host when no URL is known yet', () => {
+  it('guesses every host when no URL is known yet, final MP3 before the live wav', () => {
     expect(candidateUrls({ locationUrl: null, filename: '20261015-164455_8652570707' }, ['http://a', 'http://b'])).toEqual([
       'http://a/RECORDINGS/MP3/20261015-164455_8652570707-all.mp3',
       'http://b/RECORDINGS/MP3/20261015-164455_8652570707-all.mp3',
+      'http://a/RECORDINGS/20261015-164455_8652570707-all.wav',
+      'http://b/RECORDINGS/20261015-164455_8652570707-all.wav',
     ]);
     expect(isFinalMp3('http://a/RECORDINGS/MP3/x-all.mp3')).toBe(true);
+  });
+
+  it('never guesses a path from a placeholder or numeric name', () => {
+    expect(candidateUrls({ locationUrl: null, filename: 'pending-680777' }, ['http://a'])).toEqual([]);
+    expect(candidateUrls({ locationUrl: '192', filename: '192' }, ['http://a'])).toEqual([]);
   });
 });

@@ -1,11 +1,13 @@
 import { useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ClipboardPlus, GitMerge } from 'lucide-react';
+import { ClipboardPlus, GitMerge, Radio } from 'lucide-react';
 import { api } from '../api/client';
-import type { Call, Evaluation, QaForm, Recording, TransferEvent, Transfer } from '../api/types';
+import type { Call, Evaluation, QaForm, TransferEvent, Transfer } from '../api/types';
+import { useLiveRecordings, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { useAuth } from '../auth/AuthContext';
 import { AudioPlayer } from '../components/AudioPlayer';
+import { DispoChip, HangupChip } from '../components/DispoChip';
 import { SaleTypeChip } from './Queue';
 import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
@@ -24,20 +26,14 @@ interface Detail {
   closerAgentUser: string | null;
   closerAgentName: string | null;
   dialerName: string;
-  recordings: Recording[];
   /** the fronter leg was found on the lead (sale-only rows, late call rows) */
   fronterFromLead: boolean;
-  leadRecordings: LeadRecording[];
+  /** snapshot for the first paint; the live query takes over from there */
+  recordingItems: RecordingItem[];
+  legs: Partial<Record<'fronter' | 'closer' | 'sale', LegState>>;
+  live: boolean;
   events: TransferEvent[];
   evaluations: Evaluation[];
-}
-
-interface LeadRecording {
-  recording: Recording;
-  callStatus: string | null;
-  callSource: string | null;
-  callUser: string | null;
-  agentName: string | null;
 }
 
 interface Candidate {
@@ -48,24 +44,52 @@ interface Candidate {
   match: { score: number; reasons: string[] };
 }
 
+function Note({ children, pulse }: { children: React.ReactNode; pulse?: boolean }) {
+  return (
+    <p className={`flex items-center gap-1.5 text-2xs text-ink-2 ${pulse ? 'animate-pulse' : ''}`}>
+      {pulse && <span className="inline-block h-1.5 w-1.5 rounded-full bg-info" />}
+      {children}
+    </p>
+  );
+}
+
 function CallLeg({
   title,
   call,
   agentName,
   agentUser,
+  leg,
   recordings,
+  pendingMatch,
+  checking,
 }: {
   title: string;
   call: Call | null;
   agentName: string | null;
   agentUser: string | null;
-  recordings: Recording[];
+  leg: LegState | undefined;
+  recordings: RecordingItem[];
+  /** no closer leg yet and the matcher is still looking */
+  pendingMatch: boolean;
+  /** the page is polling the dialer */
+  checking: boolean;
 }) {
+  const playable = recordings.filter((r) => r.status === 'available');
+  const inProgress = leg?.inProgress ?? (call ? call.lengthSec == null : false);
+  const hasPending = recordings.some((r) => r.status === 'pending');
+  const hasMissing = recordings.some((r) => r.status === 'missing');
   return (
     <div className="card p-4">
-      <h2 className="mb-3 font-display text-sm font-bold">{title}</h2>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <h2 className="font-display text-sm font-bold">{title}</h2>
+        {call && <HangupChip termReason={leg?.termReason ?? call.termReason} inProgress={inProgress} status={leg?.status ?? call.status} />}
+      </div>
       {!call ? (
-        <p className="text-sm text-ink-2">No linked call leg yet.</p>
+        pendingMatch ? (
+          <Note pulse>Closer leg not found yet — the closer may still be on the line. Checking automatically.</Note>
+        ) : (
+          <p className="text-sm text-ink-2">No linked call leg yet.</p>
+        )
       ) : (
         <>
           <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
@@ -78,7 +102,9 @@ function CallLeg({
             </div>
             <div>
               <dt className="label">Disposition</dt>
-              <dd className="font-mono">{call.status ?? '—'}</dd>
+              <dd>
+                <DispoChip code={leg?.status ?? call.status} />
+              </dd>
             </div>
             <div>
               <dt className="label">Start</dt>
@@ -86,7 +112,7 @@ function CallLeg({
             </div>
             <div>
               <dt className="label">Length</dt>
-              <dd className="font-mono">{fmtDuration(call.lengthSec)}</dd>
+              <dd className="font-mono">{inProgress ? 'in progress' : fmtDuration(leg?.lengthSec ?? call.lengthSec)}</dd>
             </div>
             <div>
               <dt className="label">Lead ID</dt>
@@ -98,24 +124,29 @@ function CallLeg({
             </div>
           </dl>
           <div className="mt-3 space-y-2">
-            {recordings.length === 0 && <p className="text-2xs text-ink-3">No recording linked to this leg.</p>}
-            {recordings.map((rec) =>
-              rec.status === 'available' ? (
-                <div key={rec.id}>
-                  <AudioPlayer recordingId={rec.id} label={rec.filename} />
-                  {!rec.lengthSec && (
-                    <p className="mt-1 text-2xs text-ink-3">
-                      0-second dialer entry (disposition only) — hear the full call under the other legs below.
-                    </p>
-                  )}
-                </div>
+            {playable.map((rec) => (
+              <div key={rec.id}>
+                <AudioPlayer recordingId={rec.id} label={rec.filename} />
+                {!rec.lengthSec && !inProgress && (
+                  <p className="mt-1 text-2xs text-ink-3">
+                    0-second dialer entry (disposition only) — hear the full call under the other legs below.
+                  </p>
+                )}
+                {!rec.final && inProgress && (
+                  <Note pulse>Live partial recording — the full file replaces it after hangup.</Note>
+                )}
+              </div>
+            ))}
+            {playable.length === 0 &&
+              (inProgress ? (
+                <Note pulse>Call in progress — the recording appears here automatically a minute or two after it ends.</Note>
+              ) : hasPending || checking ? (
+                <Note pulse>Recording is being prepared on the dialer — it appears here automatically.</Note>
+              ) : hasMissing ? (
+                <Note>The dialer has no recording file for this call.</Note>
               ) : (
-                <div key={rec.id} className="flex items-center gap-2 rounded-md bg-bg px-3 py-2 text-2xs text-ink-2">
-                  <Chip value={rec.status} />
-                  <span className="truncate font-mono">{rec.filename}</span>
-                </div>
-              ),
-            )}
+                <Note>No recording on the dialer for this call.</Note>
+              ))}
           </div>
         </>
       )}
@@ -123,21 +154,23 @@ function CallLeg({
   );
 }
 
-function LeadRecordings({ items }: { items: LeadRecording[] }) {
+function LeadRecordings({ items }: { items: RecordingItem[] }) {
   return (
     <div className="card mt-4 p-4">
       <h2 className="mb-1 font-display text-sm font-bold">Other recordings on this lead</h2>
       <p className="mb-3 text-2xs text-ink-3">Every call on this lead from 3 days before to 1 day after, newest first.</p>
       <div className="space-y-3">
-        {items.map(({ recording: rec, callStatus, callSource, callUser, agentName }) => (
+        {items.map((rec) => (
           <div key={rec.id} className="rounded-md border border-ink/10 p-3">
             <div className="mb-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-2xs">
               <span className="font-mono">{fmtDateTime(rec.startTime)}</span>
-              <span className="chip bg-bg text-ink-2">{callSource === 'vicidial_closer_log' ? 'Closer' : 'Fronter / outbound'}</span>
+              <span className="chip bg-bg text-ink-2">{rec.callSource === 'vicidial_closer_log' ? 'Closer' : 'Fronter / outbound'}</span>
               <span>
-                {agentName ?? callUser ?? '—'} {callUser && <span className="font-mono text-ink-3">({callUser})</span>}
+                {rec.agentName ?? rec.callUser ?? '—'}{' '}
+                {rec.callUser && <span className="font-mono text-ink-3">({rec.callUser})</span>}
               </span>
-              <span className="font-mono">{callStatus ?? '—'}</span>
+              <DispoChip code={rec.callStatus} />
+              <HangupChip termReason={rec.termReason} status={rec.callStatus} />
               <span className="font-mono text-ink-3">{fmtDuration(rec.lengthSec)}</span>
             </div>
             {rec.status === 'available' ? (
@@ -165,14 +198,14 @@ function LeadCard({ lead }: { lead: LeadInfo }) {
     .join(' ');
   const address = [s('address1'), s('address2'), s('address3')].filter(Boolean).join(', ');
   const cityLine = [s('city'), s('state'), s('postal_code')].filter(Boolean).join(', ');
-  const fields: Array<{ label: string; value: string; mono?: boolean }> = [
+  const fields: Array<{ label: string; value: string; mono?: boolean; dispo?: boolean }> = [
     { label: 'Name', value: name },
     { label: 'Phone', value: s('phone_number'), mono: true },
     { label: 'Alt phone', value: s('alt_phone'), mono: true },
     { label: 'Email', value: s('email'), mono: true },
     { label: 'Address', value: address },
     { label: 'City / State / ZIP', value: cityLine },
-    { label: 'Lead status', value: s('status'), mono: true },
+    { label: 'Lead status', value: s('status'), dispo: true },
     { label: 'Lead ID', value: s('lead_id'), mono: true },
     { label: 'List ID', value: s('list_id'), mono: true },
     { label: 'Vendor code', value: s('vendor_lead_code'), mono: true },
@@ -190,9 +223,15 @@ function LeadCard({ lead }: { lead: LeadInfo }) {
         {fields.map((f) => (
           <div key={f.label} className="min-w-0">
             <dt className="label">{f.label}</dt>
-            <dd className={`truncate ${f.mono ? 'font-mono text-[13px]' : ''}`} title={f.value}>
-              {f.value}
-            </dd>
+            {f.dispo ? (
+              <dd>
+                <DispoChip code={f.value} title="Current lead status on the dialer" />
+              </dd>
+            ) : (
+              <dd className={`truncate ${f.mono ? 'font-mono text-[13px]' : ''}`} title={f.value}>
+                {f.value}
+              </dd>
+            )}
           </div>
         ))}
       </dl>
@@ -218,6 +257,8 @@ export function TransferDetailPage() {
     queryKey: ['transfer', id],
     queryFn: () => api<Detail>(`/queues/detail/${id}`),
   });
+  // recordings follow the dialer live; everything else is the snapshot above
+  const liveQ = useLiveRecordings(id);
 
   const { data: formsData } = useQuery({
     queryKey: ['forms', data?.transfer.companyId],
@@ -246,6 +287,7 @@ export function TransferDetailPage() {
     onSuccess: () => {
       setResolveOpen(false);
       void queryClient.invalidateQueries({ queryKey: ['transfer', id] });
+      void queryClient.invalidateQueries({ queryKey: ['transfer-recordings', id] });
     },
   });
 
@@ -253,17 +295,20 @@ export function TransferDetailPage() {
   if (isError || !data) return <ErrorState message="Transfer could not load." onRetry={() => void refetch()} />;
 
   const t = data.transfer;
-  const fronterRecs = data.recordings.filter((r) => data.fronterCall && r.callId === data.fronterCall.id);
-  const closerRecs = data.recordings.filter((r) => data.closerCall && r.callId === data.closerCall.id);
-  const saleRecs = data.recordings.filter((r) => data.saleCall && r.callId === data.saleCall.id);
+  const live = liveQ.data;
+  const items = live?.items ?? data.recordingItems;
+  const legs = live?.legs ?? data.legs;
+  const checking = live?.live ?? data.live;
+  const byLeg = (leg: RecordingItem['leg']) => items.filter((r) => r.leg === leg);
   const saleOnly = t.kind !== 'transfer';
   const showFronter = !saleOnly || !!data.fronterCall;
   const legCount = (showFronter ? 1 : 0) + 1 + (data.saleCall ? 1 : 0);
   const fronterTitle = data.fronterFromLead
     ? saleOnly
-      ? "Fronter call on this lead"
-      : "Fronter leg (found on the lead)"
-    : "Fronter leg";
+      ? 'Fronter call on this lead'
+      : 'Fronter leg (found on the lead)'
+    : 'Fronter leg';
+  const pendingMatch = !data.closerCall && t.matchStatus === 'pending_match';
 
   return (
     <div>
@@ -293,9 +338,16 @@ export function TransferDetailPage() {
           <span className="font-mono text-2xs text-ink-2">confidence {t.matchConfidence}/100</span>
         )}
         {t.saleDisposition && (
-          <span className="chip bg-good-soft text-good">sale: {t.saleDisposition}</span>
+          <span className="flex items-center gap-1 text-2xs text-ink-2">
+            sale: <DispoChip code={t.saleDisposition} />
+          </span>
         )}
         {t.matchNotes && <span className="text-2xs text-ink-3">{t.matchNotes}</span>}
+        {checking && (
+          <span className="chip ml-auto flex items-center gap-1 bg-info-soft text-info animate-pulse" title="Recordings refresh themselves while the dialer is still finishing this call">
+            <Radio size={12} /> Live · checking the dialer every 8 s
+          </span>
+        )}
       </div>
 
       <div className="mb-3">
@@ -308,7 +360,10 @@ export function TransferDetailPage() {
             call={data.fronterCall}
             agentName={data.fronterAgentName}
             agentUser={data.fronterAgentUser}
-            recordings={fronterRecs}
+            leg={legs.fronter}
+            recordings={byLeg('fronter')}
+            pendingMatch={false}
+            checking={checking}
           />
         )}
         <CallLeg
@@ -316,7 +371,10 @@ export function TransferDetailPage() {
           call={data.closerCall}
           agentName={data.closerAgentName}
           agentUser={data.closerAgentUser}
-          recordings={closerRecs}
+          leg={legs.closer}
+          recordings={byLeg('closer')}
+          pendingMatch={pendingMatch}
+          checking={checking}
         />
         {data.saleCall && (
           <CallLeg
@@ -324,12 +382,15 @@ export function TransferDetailPage() {
             call={data.saleCall}
             agentName={data.saleCall.agentName}
             agentUser={data.saleCall.viciUserRaw}
-            recordings={saleRecs}
+            leg={legs.sale}
+            recordings={byLeg('sale')}
+            pendingMatch={false}
+            checking={checking}
           />
         )}
       </div>
 
-      {data.leadRecordings.length > 0 && <LeadRecordings items={data.leadRecordings} />}
+      {byLeg('other').length > 0 && <LeadRecordings items={byLeg('other')} />}
 
       {data.lead && <LeadCard lead={data.lead} />}
 
@@ -414,9 +475,9 @@ export function TransferDetailPage() {
                   {c.agentName ?? c.agentUser ?? c.call.viciUserRaw ?? 'Unknown agent'}{' '}
                   <span className="font-mono text-2xs text-ink-3">{c.dialerName}</span>
                 </div>
-                <div className="font-mono text-2xs text-ink-2">
+                <div className="flex flex-wrap items-center gap-x-2 font-mono text-2xs text-ink-2">
                   {fmtDateTime(c.call.callDate)} · {c.call.phoneNumber} · lead {c.call.viciLeadId ?? '—'} ·{' '}
-                  {c.call.status}
+                  <DispoChip code={c.call.status} />
                 </div>
                 <div className="mt-0.5 text-2xs text-ink-3">{c.match.reasons.join('; ')}</div>
               </div>

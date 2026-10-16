@@ -4,10 +4,11 @@ import { and, eq, sql } from 'drizzle-orm';
 import { config } from './config.js';
 import { runMigrations } from './db/migrate.js';
 import { db } from './db/client.js';
-import { dialerServers, recordings } from './db/schema.js';
+import { calls, dialerServers, recordings } from './db/schema.js';
 import { runDialerSync } from './vicidial/sync.js';
 import { toConnection } from './vicidial/credentials.js';
-import { isFinalMp3, resolveRecordingUrl } from './vicidial/recordingUrl.js';
+import { refreshRecording } from './vicidial/recordingUrl.js';
+import { isCallInProgress } from './services/callRecordings.js';
 
 /**
  * Background worker: schedules and runs per-dialer synchronization and
@@ -44,22 +45,27 @@ async function enqueueActiveDialers(): Promise<void> {
 let recordingCheckRunning = false;
 
 /**
- * Recording repair, every RECORDING_CHECK_SECONDS. Picks every recording in
- * the retention window that is not verified on its final MP3 location —
- * no URL yet, a temporary .wav, a broken URL, or marked missing — and
- * resolves the URL that works now (see recordingUrl.ts). Transfer legs go
- * first, newest first; failures back off exponentially (1, 2, 4 … 60 min)
- * and keep retrying until the retention window ends, so a recording that
- * shows up late is never lost.
+ * Recording repair, every RECORDING_CHECK_SECONDS. First re-links recent
+ * recordings to the right call (a closer's call row can land a cycle after
+ * its recording), then probes every recording in the retention window that
+ * is not verified on its final MP3 — no URL yet, a temporary .wav, a broken
+ * URL, or marked missing. Transfer legs and calls still up are probed every
+ * run; the rest back off exponentially (1, 2, 4 … 60 min) until the
+ * retention window ends, so a file that shows up late is never lost.
  */
 async function checkPendingRecordings(): Promise<void> {
   if (recordingCheckRunning) return;
   recordingCheckRunning = true;
   try {
+    await relinkRecentRecordings();
+
     const windowDays = config.RETENTION_DAYS > 0 ? config.RETENTION_DAYS : 7;
+    const isLeg = sql`exists (select 1 from transfers t where t.fronter_call_id = ${recordings.callId}
+      or t.closer_call_id = ${recordings.callId} or t.sale_call_id = ${recordings.callId})`;
     const rows = await db
-      .select()
+      .select({ rec: recordings, callLength: calls.lengthSec, callStatus: calls.status })
       .from(recordings)
+      .leftJoin(calls, eq(recordings.callId, calls.id))
       .where(
         and(
           eq(recordings.isMock, false),
@@ -69,15 +75,15 @@ async function checkPendingRecordings(): Promise<void> {
                or ${recordings.locationUrl} not like '%/RECORDINGS/MP3/%'
                or ${recordings.lastCheckedAt} is null
                or ${recordings.checkAttempts} > 0)`,
-          sql`(${recordings.lastCheckedAt} is null
-               or ${recordings.lastCheckedAt} < now() - make_interval(mins => least(power(2, ${recordings.checkAttempts})::int, 60)))`,
+          sql`(${recordings.lastCheckedAt} is null or ${recordings.lastCheckedAt} < now() - make_interval(secs =>
+               case when ${isLeg} or (${recordings.callId} is not null and ${calls.lengthSec} is null)
+                    then least(power(2, ${recordings.checkAttempts}) * 60,
+                               case when coalesce(${recordings.startTime}, ${recordings.createdAt}) > now() - interval '30 minutes'
+                                    then 50 else 300 end)
+                    else least(power(2, ${recordings.checkAttempts}) * 60, 3600) end))`,
         ),
       )
-      .orderBy(
-        sql`(exists (select 1 from transfers t where t.fronter_call_id = ${recordings.callId}
-               or t.closer_call_id = ${recordings.callId} or t.sale_call_id = ${recordings.callId})) desc`,
-        sql`${recordings.startTime} desc nulls last`,
-      )
+      .orderBy(sql`(${isLeg}) desc`, sql`${recordings.startTime} desc nulls last`)
       .limit(400);
     if (rows.length === 0) return;
 
@@ -94,37 +100,17 @@ async function checkPendingRecordings(): Promise<void> {
     let failed = 0;
     const queue = [...rows];
     const work = async () => {
-      for (let rec = queue.shift(); rec; rec = queue.shift()) {
-        const conn = await connFor(rec.dialerServerId);
+      for (let r = queue.shift(); r; r = queue.shift()) {
+        const conn = await connFor(r.rec.dialerServerId);
         if (!conn) continue;
-        const url = await resolveRecordingUrl(rec, conn);
-        const attempts = rec.checkAttempts + 1;
-        if (url) {
-          fixed += url !== rec.locationUrl || rec.status !== 'available' ? 1 : 0;
-          await db
-            .update(recordings)
-            .set({
-              locationUrl: url,
-              status: 'available',
-              // a .wav that still answers is re-checked until its MP3 exists
-              checkAttempts: isFinalMp3(url) ? 0 : 1,
-              lastCheckedAt: new Date(),
-              updatedAt: new Date(),
-            })
-            .where(eq(recordings.id, rec.id));
+        const before = r.rec;
+        const after = await refreshRecording(before, conn, {
+          inProgress: before.callId != null && isCallInProgress({ lengthSec: r.callLength, status: r.callStatus }),
+        });
+        if (after.status === 'available') {
+          if (after.locationUrl !== before.locationUrl || before.status !== 'available') fixed += 1;
         } else {
           failed += 1;
-          const ageMin = (Date.now() - (rec.startTime ?? rec.createdAt).getTime()) / 60_000;
-          await db
-            .update(recordings)
-            .set({
-              // the dialer needs a few minutes to finish and convert a file
-              status: ageMin > 30 && attempts >= 3 ? 'missing' : rec.status === 'missing' ? 'missing' : 'pending',
-              checkAttempts: Math.min(attempts, 12),
-              lastCheckedAt: new Date(),
-              updatedAt: new Date(),
-            })
-            .where(eq(recordings.id, rec.id));
         }
       }
     };
@@ -133,6 +119,31 @@ async function checkPendingRecordings(): Promise<void> {
   } finally {
     recordingCheckRunning = false;
   }
+}
+
+/**
+ * A recording is linked to its call by start/end time (recordingUrl.ts). The
+ * closer's call row can arrive a cycle after the recording did, so links from
+ * the last two hours are re-evaluated with the same rule, and recordings that
+ * found no call at all get a second chance for two days.
+ */
+async function relinkRecentRecordings(): Promise<void> {
+  await db.execute(sql`
+    with best as (
+      select r.id rid,
+        (select c.id from calls c
+          where c.dialer_server_id = r.dialer_server_id and c.vici_lead_id = r.vici_lead_id and not c.is_mock
+            and abs(extract(epoch from c.call_date - r.start_time)) <= 900
+          order by abs(extract(epoch from c.call_date - r.start_time))
+            + 0.5 * least(coalesce(abs(extract(epoch from c.call_date - r.start_time) + c.length_sec - r.length_sec), 0), 60)
+          limit 1) cid
+      from recordings r
+      where not r.is_mock and r.vici_lead_id is not null and r.start_time is not null
+        and (r.start_time > now() - interval '2 hours'
+             or (r.call_id is null and r.start_time > now() - interval '48 hours'))
+    )
+    update recordings r set call_id = best.cid, updated_at = now()
+      from best where r.id = best.rid and best.cid is not null and best.cid is distinct from r.call_id`);
 }
 
 /**

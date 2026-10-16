@@ -28,7 +28,7 @@ const envSchema = z.object({
   SYNC_HISTORICAL_DAYS: z.coerce.number().default(30),
   RECORDING_RETRY_MINUTES: z.coerce.number().default(10),
   /** how often the recording repair job runs */
-  RECORDING_CHECK_SECONDS: z.coerce.number().min(30).default(120),
+  RECORDING_CHECK_SECONDS: z.coerce.number().min(30).default(60),
   MATCH_AUTO_THRESHOLD: z.coerce.number().default(70),
   MATCH_FLAG_THRESHOLD: z.coerce.number().default(40),
 });

@@ -4,6 +4,7 @@ import { alias } from 'drizzle-orm/pg-core';
 import { and, count, desc, eq, gte, inArray, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { calls, dialerServers, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
+import { isFinalMp3 } from '../vicidial/recordingUrl.js';
 import { localToUtc } from '../vicidial/timezone.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
@@ -189,6 +190,9 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
           closerAgent: closerAgent.fullName,
           closerUser: closerAgent.viciUser,
           closerStatus: closerCall.status,
+          fronterTermReason: fronterCall.termReason,
+          closerTermReason: closerCall.termReason,
+          closerLength: closerCall.lengthSec,
         })
         .from(transfers)
         .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
@@ -204,6 +208,9 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
           fronterAgent: t.fronterAgent ?? t.fronterUser,
           closerAgent: t.closerAgent ?? t.closerUser,
           closerStatus: t.closerStatus,
+          fronterTermReason: t.fronterTermReason,
+          closerTermReason: t.closerTermReason,
+          closerInProgress: t.closerCallId != null && t.closerLength == null,
           transferId: t.transfer.id,
         };
         // this call's legs plus every other recording on the lead around it
@@ -232,6 +239,7 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
               callStatus: recCall.status,
               callSource: recCall.source,
               callUser: recCall.viciUserRaw,
+              termReason: recCall.termReason,
               agentName: recAgent.fullName,
             })
             .from(recordings)
@@ -242,10 +250,12 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
             .limit(60);
           callRecordings = recs.map(({ rec: r, ...c }) => ({
             id: r.id,
+            callId: r.callId,
             filename: r.filename,
             status: r.status,
             lengthSec: r.lengthSec,
             startTime: r.startTime,
+            final: r.status === 'available' && !!r.locationUrl && isFinalMp3(r.locationUrl),
             leg:
               r.callId === t.fronterCallId
                 ? 'fronter'
@@ -254,10 +264,11 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
                   : r.callId && r.callId === t.transfer.saleCallId
                     ? 'sale'
                     : 'other',
-            source: c.callSource,
             callStatus: c.callStatus,
-            agent: c.agentName ?? c.callUser,
-            agentUser: c.callUser,
+            callSource: c.callSource,
+            callUser: c.callUser,
+            agentName: c.agentName,
+            termReason: c.termReason,
           }));
         }
       }

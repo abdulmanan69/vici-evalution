@@ -48,9 +48,10 @@ export function candidateUrls(
   const base = recordingBaseName(rec.filename);
   if (/^\d{8}-\d{6}_/.test(base)) {
     const origin = loc ? new URL(loc).origin : null;
-    for (const h of origin ? [origin, ...hosts.filter((x) => x !== origin)] : hosts) {
-      out.push(`${h}/RECORDINGS/MP3/${base}-all.mp3`);
-    }
+    const ordered = origin ? [origin, ...hosts.filter((x) => x !== origin)] : hosts;
+    for (const h of ordered) out.push(`${h}/RECORDINGS/MP3/${base}-all.mp3`);
+    // the raw file while the dialer is still recording (plays as a partial)
+    for (const h of ordered) out.push(`${h}/RECORDINGS/${base}-all.wav`);
   }
   return [...new Set(out)];
 }
@@ -156,4 +157,44 @@ export function linkRecordingToCall(
     }
   }
   return bestId;
+}
+
+export type RecordingRow = typeof recordings.$inferSelect;
+
+/**
+ * Probe the dialer for this recording now and store the outcome. While the
+ * call is still up (`inProgress`) a file that is not there yet stays
+ * 'pending' and does not count toward 'missing'.
+ */
+export async function refreshRecording(
+  rec: RecordingRow,
+  conn: DialerConnection,
+  opts: { inProgress?: boolean } = {},
+): Promise<RecordingRow> {
+  const url = await resolveRecordingUrl(rec, conn);
+  const now = new Date();
+  let patch: Partial<RecordingRow>;
+  if (url) {
+    patch = {
+      locationUrl: url,
+      status: 'available',
+      // a .wav that still answers is re-checked until its MP3 exists
+      checkAttempts: isFinalMp3(url) ? 0 : 1,
+      lastCheckedAt: now,
+      updatedAt: now,
+    };
+  } else {
+    const attempts = opts.inProgress ? rec.checkAttempts : rec.checkAttempts + 1;
+    const ageMin = (now.getTime() - (rec.startTime ?? rec.createdAt).getTime()) / 60_000;
+    // the dialer needs a few minutes after hangup to mix and convert a file
+    const gaveUp = !opts.inProgress && ageMin > 30 && attempts >= 3;
+    patch = {
+      status: opts.inProgress ? 'pending' : gaveUp || rec.status === 'missing' ? 'missing' : 'pending',
+      checkAttempts: Math.min(attempts, 12),
+      lastCheckedAt: now,
+      updatedAt: now,
+    };
+  }
+  await db.update(recordings).set(patch).where(eq(recordings.id, rec.id));
+  return { ...rec, ...patch };
 }

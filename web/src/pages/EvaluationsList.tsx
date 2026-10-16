@@ -3,6 +3,7 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Download, Headphones, X } from 'lucide-react';
 import { api } from '../api/client';
+import { DispoChip } from '../components/DispoChip';
 import type { Evaluation, FormDefinition, FormQuestion, PageMeta } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
 import { useCompanyScope } from '../components/Layout';
@@ -129,7 +130,7 @@ function Drawer({ id, onClose }: { id: string; onClose: () => void }) {
                 <div className="mt-0.5 text-2xs text-ink-2">
                   {data.call.fronterAgent && <>fronter {data.call.fronterAgent}</>}
                   {data.call.closerAgent && <> · closer {data.call.closerAgent}</>}
-                  {data.call.closerStatus && <> · dispo <span className="font-mono">{data.call.closerStatus}</span></>}
+                  {data.call.closerStatus && <> · <DispoChip code={data.call.closerStatus} /></>}
                 </div>
               </div>
             )}

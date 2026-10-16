@@ -162,6 +162,11 @@ export function fixRecordingRow(row: Record<string, string>): Record<string, str
     delete fixed.__extra0;
     return fixed;
   }
+  // still recording: the row carries the seconds so far and no URL yet, so
+  // the seconds land in the 'location' slot — never treat them as a path
+  if (extra === undefined && row.location !== undefined && /^\d+$/.test(row.location)) {
+    return { ...row, length_in_sec: row.location, location: '' };
+  }
   return row;
 }
 

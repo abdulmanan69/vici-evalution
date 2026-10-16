@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
 import { Download, Search } from 'lucide-react';
 import { api } from '../api/client';
+import { DispoChip } from '../components/DispoChip';
 import type { Dialer, PageMeta, QueueItem, Transfer } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
 import { useAuth } from '../auth/AuthContext';
@@ -193,7 +194,7 @@ export function QueuePage() {
                     )}
                   </td>
                   <td className="td">
-                    {row.closerStatus ? <span className="font-mono text-2xs">{row.closerStatus}</span> : '—'}
+                    <DispoChip code={row.closerStatus} />
                   </td>
                   <td className="td">
                     <Chip value={row.transfer.matchStatus} />

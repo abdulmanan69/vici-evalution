@@ -663,61 +663,93 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
       break;
     }
     if (c.leadId == null) continue;
-    let rows: Array<Record<string, string>>;
-    try {
-      rows = await api.recordingLookup({ leadId: c.leadId });
-    } catch {
-      continue; // transient API failure — retried next cycle
-    }
+    const n = await lookupLeadRecordings(conn, c.leadId, lookback, api);
+    if (n == null) continue; // transient API failure — retried next cycle
+    found += n;
     const key = `${conn.id}:${c.leadId}`;
     const tries = (leadLookupBackoff.get(key)?.tries ?? 0) + 1;
     leadLookupBackoff.set(key, { tries, next: Date.now() + Math.min(2 ** tries, 60) * 60_000 });
     if (leadLookupBackoff.size > 50_000) {
       for (const [k, v] of leadLookupBackoff) if (v.next < Date.now()) leadLookupBackoff.delete(k);
     }
-    // the lead's call legs, so each recording links to the right one
-    const leadCalls = await db
-      .select({ id: calls.id, callDate: calls.callDate, lengthSec: calls.lengthSec })
-      .from(calls)
-      .where(
-        and(
-          eq(calls.dialerServerId, conn.id),
-          eq(calls.viciLeadId, c.leadId),
-          eq(calls.isMock, false),
-          gte(calls.callDate, lookback),
-        ),
-      )
-      .limit(500);
-    for (const r of rows) {
-      const location = r.location ?? r.url ?? '';
-      const filename = r.filename ?? (location ? location.split('/').pop()! : '');
-      if (!filename) continue;
-      const startLocal = r.start_time ?? r.start ?? null;
-      const startTime = startLocal ? localToUtc(startLocal, conn.timezone) : null;
-      // the lookup returns the lead's FULL history — months-old recordings
-      // are already purged on the dialer and outside our retention window
-      if (startTime && startTime < lookback) continue;
-      const bestId = startTime
-        ? linkRecordingToCall(startTime, r.length_in_sec ? Number(r.length_in_sec) : null, leadCalls)
-        : null;
-      // either-key upsert — recording_lookup filenames can differ from the
-      // recording_log ones for the same recording_id (format variants)
-      await upsertRecordingByEitherKey(
-        conn,
-        {
-          recordingId: r.recording_id ? Number(r.recording_id) : null,
-          leadId: c.leadId,
-          filename,
-          locationUrl: location || null,
-          startTime,
-          lengthSec: r.length_in_sec ? Number(r.length_in_sec) : null,
-        },
-        bestId,
-      );
-      found += 1;
-    }
   }
   stats.recordings_api_found = found;
+}
+
+/**
+ * recording_lookup for one lead: upserts every recording inside the window
+ * and links each to the lead's call by start/end time. Returns how many it
+ * saw, or null when the dialer did not answer. Shared by the sync cycle and
+ * the call page's live check.
+ */
+export async function lookupLeadRecordings(
+  conn: DialerConnection,
+  leadId: number,
+  lookback: Date,
+  api: ViciApiClient = new ViciApiClient(conn),
+): Promise<number | null> {
+  let rows: Array<Record<string, string>>;
+  try {
+    rows = await api.recordingLookup({ leadId });
+  } catch {
+    return null;
+  }
+  // the lead's call legs, so each recording links to the right one
+  const leadCalls = await db
+    .select({ id: calls.id, callDate: calls.callDate, lengthSec: calls.lengthSec, phoneNumber: calls.phoneNumber })
+    .from(calls)
+    .where(
+      and(
+        eq(calls.dialerServerId, conn.id),
+        eq(calls.viciLeadId, leadId),
+        eq(calls.isMock, false),
+        gte(calls.callDate, lookback),
+      ),
+    )
+    .limit(500);
+  let found = 0;
+  for (const r of rows) {
+    const location = isHttpUrl(r.location) ? r.location.trim() : isHttpUrl(r.url) ? r.url.trim() : '';
+    const startLocal = r.start_time ?? r.start ?? null;
+    const startTime = startLocal ? localToUtc(startLocal, conn.timezone) : null;
+    // the lookup returns the lead's FULL history — months-old recordings
+    // are already purged on the dialer and outside our retention window
+    if (startTime && startTime < lookback) continue;
+    const bestId = startTime
+      ? linkRecordingToCall(startTime, r.length_in_sec ? Number(r.length_in_sec) : null, leadCalls)
+      : null;
+    // The file is named <YYYYMMDD-HHMMSS>_<phone> by the dialer. While it is
+    // still recording the lookup has no URL, so the name is built from the
+    // start time and the call's phone — the probe then finds the MP3 the
+    // moment the dialer writes it, before the lookup even reports it.
+    const phone =
+      leadCalls.find((c) => c.id === bestId)?.phoneNumber ?? leadCalls.find((c) => c.phoneNumber)?.phoneNumber ?? null;
+    const derived =
+      startLocal && phone && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(startLocal)
+        ? `${startLocal.slice(0, 10).replace(/-/g, '')}-${startLocal.slice(11).replace(/:/g, '')}_${phone.replace(/\D/g, '')}`
+        : null;
+    const filename =
+      (location ? location.split('/').pop()! : '') ||
+      derived ||
+      (r.recording_id ? `pending-${r.recording_id}` : '');
+    if (!filename) continue;
+    // either-key upsert — recording_lookup filenames can differ from the
+    // recording_log ones for the same recording_id (format variants)
+    await upsertRecordingByEitherKey(
+      conn,
+      {
+        recordingId: r.recording_id ? Number(r.recording_id) : null,
+        leadId,
+        filename,
+        locationUrl: location || null,
+        startTime,
+        lengthSec: r.length_in_sec ? Number(r.length_in_sec) : null,
+      },
+      bestId,
+    );
+    found += 1;
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
 import { and, count, desc, eq, gte, ilike, lte, or, sql, type SQL } from 'drizzle-orm';
@@ -7,9 +7,7 @@ import {
   calls,
   campaigns,
   dialerServers,
-  dispositionMappings,
   evaluations,
-  recordings,
   transferEvents,
   transfers,
   viciAgents,
@@ -25,6 +23,7 @@ import { scoreCandidate, DEFAULT_MATCH_OPTIONS } from '../vicidial/matcher.js';
 import { localToUtc } from '../vicidial/timezone.js';
 import { toConnection } from '../vicidial/credentials.js';
 import { getPooledDbClient } from '../vicidial/dbPool.js';
+import { findFronterOnLead, recordingBundle, toRecordingRows } from '../services/callRecordings.js';
 
 /** A reviewer limited to certain forms only reaches the matching queues. */
 function assertQueueAllowed(auth: AuthContext, queue: string): void {
@@ -34,8 +33,22 @@ function assertQueueAllowed(auth: AuthContext, queue: string): void {
   }
 }
 
+/**
+ * Who may open a call: the Transfers queue lists every transfer, so access
+ * to it covers any call; a task assigned by a manager grants access regardless.
+ */
+async function assertTransferAccess(req: FastifyRequest, transfer: typeof transfers.$inferSelect): Promise<void> {
+  companyScope(req, transfer.companyId);
+  if (await hasActiveTask(req.auth.userId, transfer.id)) return;
+  if (!req.auth.allowedQueues?.includes('transfer')) assertQueueAllowed(req.auth, transfer.queueStatus);
+  if (!(await canReviewTransfer(req.auth, transfer))) {
+    throw new ForbiddenError("This call's agent is not assigned to you");
+  }
+}
+
 const fronterCall = alias(calls, 'fronter_call');
 const closerCall = alias(calls, 'closer_call');
+const saleCallLeg = alias(calls, 'sale_call');
 const fronterAgent = alias(viciAgents, 'fronter_agent');
 const closerAgent = alias(viciAgents, 'closer_agent');
 
@@ -167,17 +180,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       .innerJoin(dialerServers, eq(transfers.dialerServerId, dialerServers.id))
       .where(eq(transfers.id, transferId));
     if (!row) throw new NotFoundError('Transfer not found');
-    companyScope(req, row.transfer.companyId);
-    // the Transfers queue lists every transfer, so access to it covers any call
-    // a task assigned by a manager grants access to that call regardless
-    if (!(await hasActiveTask(req.auth.userId, row.transfer.id))) {
-      if (!req.auth.allowedQueues?.includes('transfer')) {
-        assertQueueAllowed(req.auth, row.transfer.queueStatus);
-      }
-      if (!(await canReviewTransfer(req.auth, row.transfer))) {
-        throw new ForbiddenError("This call's agent is not assigned to you");
-      }
-    }
+    await assertTransferAccess(req, row.transfer);
 
     // a sale made on a later call of the lead is shown as its own leg
     let saleCall: (typeof calls.$inferSelect & { agentName: string | null }) | null = null;
@@ -191,91 +194,23 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const leadId = row.transfer.viciLeadId ?? row.fronterCall?.viciLeadId ?? row.closerCall?.viciLeadId ?? null;
-    const refTime = row.transfer.xferTime;
-
-    // Sales with no transfer row of their own (callback / inbound) and
-    // transfers whose call row has not landed yet still show the lead's
-    // fronter: the latest XFER call on the lead up to 3 days before.
     let fronterFromLead = false;
     if (!row.fronterCall && leadId != null) {
-      const codes = (
-        await db
-          .select({ code: dispositionMappings.dispositionCode })
-          .from(dispositionMappings)
-          .where(
-            and(
-              eq(dispositionMappings.companyId, row.transfer.companyId),
-              eq(dispositionMappings.meaning, 'transfer'),
-              eq(dispositionMappings.active, true),
-            ),
-          )
-      ).map((m) => m.code.toUpperCase());
-      if (codes.length) {
-        const [f] = await db
-          .select({ call: calls, agentUser: viciAgents.viciUser, agentName: viciAgents.fullName })
-          .from(calls)
-          .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
-          .where(
-            and(
-              eq(calls.dialerServerId, row.transfer.dialerServerId),
-              eq(calls.source, 'vicidial_log'),
-              eq(calls.viciLeadId, leadId),
-              sql`upper(coalesce(${calls.status}, '')) in (${sql.join(codes.map((c) => sql`${c}`), sql`, `)})`,
-              gte(calls.callDate, new Date(refTime.getTime() - 3 * 86_400_000)),
-              lte(calls.callDate, new Date(refTime.getTime() + 30 * 60_000)),
-            ),
-          )
-          // the real conversation, not a 0-second dispo row
-          .orderBy(sql`(coalesce(${calls.lengthSec}, 0) > 0) desc`, desc(calls.callDate))
-          .limit(1);
-        if (f) {
-          row.fronterCall = f.call;
-          row.fronterAgentUser = f.agentUser ?? f.call.viciUserRaw;
-          row.fronterAgentName = f.agentName;
-          fronterFromLead = true;
-        }
+      const f = await findFronterOnLead(row.transfer, leadId);
+      if (f) {
+        row.fronterCall = f.call;
+        row.fronterAgentUser = f.agentUser;
+        row.fronterAgentName = f.agentName;
+        fronterFromLead = true;
       }
     }
-
-    const callIds = [row.fronterCall?.id, row.closerCall?.id, saleCall?.id].filter((x): x is string => !!x);
-    const recRows = callIds.length
-      ? await db
-          .select()
-          .from(recordings)
-          .where(or(...callIds.map((id) => eq(recordings.callId, id))))
-      : [];
-
-    // every other recording on the lead around this call, for context
-    const leadRecordings =
-      leadId == null
-        ? []
-        : await db
-            .select({
-              recording: recordings,
-              callStatus: calls.status,
-              callSource: calls.source,
-              callUser: calls.viciUserRaw,
-              agentName: viciAgents.fullName,
-            })
-            .from(recordings)
-            .leftJoin(calls, eq(recordings.callId, calls.id))
-            .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
-            .where(
-              and(
-                eq(recordings.dialerServerId, row.transfer.dialerServerId),
-                eq(recordings.viciLeadId, leadId),
-                gte(recordings.startTime, new Date(refTime.getTime() - 3 * 86_400_000)),
-                lte(recordings.startTime, new Date(refTime.getTime() + 86_400_000)),
-                callIds.length
-                  ? sql`(${recordings.callId} is null or ${recordings.callId} not in (${sql.join(
-                      callIds.map((id) => sql`${id}`),
-                      sql`, `,
-                    )}))`
-                  : sql`true`,
-              ),
-            )
-            .orderBy(sql`${recordings.startTime} desc nulls last`)
-            .limit(40);
+    // the snapshot for the first paint — the page then follows the live
+    // endpoint below, which re-checks the dialer
+    const bundle = await recordingBundle(row.transfer, {
+      fronter: row.fronterCall,
+      closer: row.closerCall,
+      sale: saleCall,
+    });
     const events = await db
       .select()
       .from(transferEvents)
@@ -309,7 +244,52 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    return { ...row, fronterFromLead, saleCall, lead, recordings: recRows, leadRecordings, events, evaluations: evals };
+    return {
+      ...row,
+      fronterFromLead,
+      saleCall,
+      lead,
+      ...toRecordingRows(bundle),
+      legs: bundle.legs,
+      live: bundle.live,
+      events,
+      evaluations: evals,
+    };
+  });
+
+  // Live recordings for a call: re-checked against the dialer on every
+  // request (a throttled lead lookup plus HEAD probes, capped at 2.5 s). The
+  // page polls this while a call is up or a file is still being prepared, so
+  // recordings show up without a refresh and without waiting for a sync cycle.
+  app.get('/detail/:transferId/recordings', { preHandler: [requirePermission('calls.view')] }, async (req) => {
+    const { transferId } = req.params as { transferId: string };
+    const [row] = await db
+      .select({ transfer: transfers, fronterCall, closerCall, saleCall: saleCallLeg, dialer: dialerServers })
+      .from(transfers)
+      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
+      .leftJoin(closerCall, eq(transfers.closerCallId, closerCall.id))
+      .leftJoin(saleCallLeg, eq(transfers.saleCallId, saleCallLeg.id))
+      .innerJoin(dialerServers, eq(transfers.dialerServerId, dialerServers.id))
+      .where(eq(transfers.id, transferId));
+    if (!row) throw new NotFoundError('Transfer not found');
+    await assertTransferAccess(req, row.transfer);
+
+    let fronter = row.fronterCall;
+    let fronterFromLead = false;
+    const leadId = row.transfer.viciLeadId ?? fronter?.viciLeadId ?? row.closerCall?.viciLeadId ?? null;
+    if (!fronter && leadId != null) {
+      const f = await findFronterOnLead(row.transfer, leadId);
+      if (f) {
+        fronter = f.call;
+        fronterFromLead = true;
+      }
+    }
+    const bundle = await recordingBundle(
+      row.transfer,
+      { fronter, closer: row.closerCall, sale: row.saleCall },
+      { refresh: !row.transfer.isMock, conn: toConnection(row.dialer) },
+    );
+    return { ...bundle, fronterFromLead };
   });
 
   // Candidate closer calls for a flagged transfer, scored — for manual resolution.
