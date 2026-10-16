@@ -8,10 +8,9 @@ import { fetchNote, useFetchRecordings, useLiveRecordings, type LegState, type R
 import { useAuth } from '../auth/AuthContext';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
+import { LeadCard, type LeadInfo } from '../components/LeadCard';
 import { SaleTypeChip } from './Queue';
 import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
-
-type LeadInfo = Record<string, string | number | null>;
 
 interface Detail {
   transfer: Transfer;
@@ -21,6 +20,8 @@ interface Detail {
   /** a later call of the lead that carried the sale */
   saleCall: (Call & { agentName: string | null }) | null;
   lead: LeadInfo | null;
+  /** the list's custom_<id> fields, when the dialer has them */
+  leadCustom: LeadInfo | null;
   fronterAgentUser: string | null;
   fronterAgentName: string | null;
   closerAgentUser: string | null;
@@ -208,63 +209,6 @@ function LeadRecordings({ items }: { items: RecordingItem[] }) {
   );
 }
 
-function LeadCard({ lead }: { lead: LeadInfo }) {
-  const s = (k: string): string => {
-    const v = lead[k];
-    return v === null || v === undefined || v === '' ? '' : String(v);
-  };
-  const name = [s('title'), s('first_name'), s('middle_initial'), s('last_name')]
-    .filter(Boolean)
-    .join(' ');
-  const address = [s('address1'), s('address2'), s('address3')].filter(Boolean).join(', ');
-  const cityLine = [s('city'), s('state'), s('postal_code')].filter(Boolean).join(', ');
-  const fields: Array<{ label: string; value: string; mono?: boolean; dispo?: boolean }> = [
-    { label: 'Name', value: name },
-    { label: 'Phone', value: s('phone_number'), mono: true },
-    { label: 'Alt phone', value: s('alt_phone'), mono: true },
-    { label: 'Email', value: s('email'), mono: true },
-    { label: 'Address', value: address },
-    { label: 'City / State / ZIP', value: cityLine },
-    { label: 'Lead status', value: s('status'), dispo: true },
-    { label: 'Lead ID', value: s('lead_id'), mono: true },
-    { label: 'List ID', value: s('list_id'), mono: true },
-    { label: 'Vendor code', value: s('vendor_lead_code'), mono: true },
-    { label: 'Times called', value: s('called_count'), mono: true },
-    { label: 'Last call', value: s('last_local_call_time'), mono: true },
-    { label: 'Entered', value: s('entry_date'), mono: true },
-    { label: 'Security phrase', value: s('security_phrase') },
-  ].filter((f) => f.value !== '');
-  const comments = s('comments');
-
-  return (
-    <div className="card mt-4 p-4">
-      <h2 className="mb-3 font-display text-sm font-bold">Lead details</h2>
-      <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm md:grid-cols-3 lg:grid-cols-4">
-        {fields.map((f) => (
-          <div key={f.label} className="min-w-0">
-            <dt className="label">{f.label}</dt>
-            {f.dispo ? (
-              <dd>
-                <DispoChip code={f.value} title="Current lead status on the dialer" />
-              </dd>
-            ) : (
-              <dd className={`truncate ${f.mono ? 'font-mono text-[13px]' : ''}`} title={f.value}>
-                {f.value}
-              </dd>
-            )}
-          </div>
-        ))}
-      </dl>
-      {comments && (
-        <div className="mt-3 rounded-md bg-bg px-3 py-2 text-sm">
-          <span className="label">Comments</span>
-          <p className="whitespace-pre-wrap">{comments}</p>
-        </div>
-      )}
-    </div>
-  );
-}
-
 export function TransferDetailPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
@@ -431,7 +375,7 @@ export function TransferDetailPage() {
 
       {byLeg('other').length > 0 && <LeadRecordings items={byLeg('other')} />}
 
-      {data.lead && <LeadCard lead={data.lead} />}
+      {data.lead && <LeadCard lead={data.lead} custom={data.leadCustom} />}
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <div className="card p-4">

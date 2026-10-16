@@ -46,6 +46,53 @@ async function assertTransferAccess(req: FastifyRequest, transfer: typeof transf
   }
 }
 
+type LeadFields = Record<string, unknown> | null;
+
+/**
+ * Lead details, fetched live from the dialer by primary key through a cached
+ * pool. Capped at 2.5 s and always optional — a page never waits on or fails
+ * because of lead info. Dialer-local timestamps become ISO (UTC) so the UI
+ * shows them in the viewer's chosen zone; the list's name and campaign ride
+ * along as list_name / list_campaign.
+ */
+async function loadLeadInfo(dialerServerId: string, leadId: number | null): Promise<{ lead: LeadFields; leadCustom: LeadFields }> {
+  const empty = { lead: null, leadCustom: null };
+  if (leadId == null) return empty;
+  try {
+    const [dialerRow] = await db.select().from(dialerServers).where(eq(dialerServers.id, dialerServerId));
+    if (!dialerRow) return empty;
+    const conn = toConnection(dialerRow);
+    const client = getPooledDbClient(conn);
+    if (!client) return empty;
+    const info = await Promise.race([
+      client.fetchLead(leadId),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+    ]);
+    if (!info) return empty;
+    const toIso = (rec: Record<string, unknown>) => {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(rec)) {
+        out[k] =
+          typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v) && !v.startsWith('0000')
+            ? localToUtc(v, conn.timezone).toISOString()
+            : v;
+      }
+      return out;
+    };
+    return {
+      lead: {
+        ...toIso(info.lead),
+        list_name: info.list?.list_name ?? null,
+        list_campaign: info.list?.campaign_id ?? null,
+        list_active: info.list?.active ?? null,
+      },
+      leadCustom: info.custom ? toIso(info.custom) : null,
+    };
+  } catch {
+    return empty;
+  }
+}
+
 const fronterCall = alias(calls, 'fronter_call');
 const closerCall = alias(calls, 'closer_call');
 const saleCallLeg = alias(calls, 'sale_call');
@@ -222,33 +269,14 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(evaluations.transferId, transferId))
       .orderBy(desc(evaluations.createdAt));
 
-    // Lead details, fetched live from the dialer by primary key through a
-    // cached pool. Capped at 2.5s and always optional — the page never
-    // waits on or fails because of lead info.
-    let lead: Record<string, unknown> | null = null;
-    if (leadId != null) {
-      try {
-        const [dialerRow] = await db
-          .select()
-          .from(dialerServers)
-          .where(eq(dialerServers.id, row.transfer.dialerServerId));
-        const client = dialerRow ? getPooledDbClient(toConnection(dialerRow)) : null;
-        if (client) {
-          lead = await Promise.race([
-            client.fetchLead(leadId),
-            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
-          ]);
-        }
-      } catch {
-        lead = null;
-      }
-    }
+    const { lead, leadCustom } = await loadLeadInfo(row.transfer.dialerServerId, leadId);
 
     return {
       ...row,
       fronterFromLead,
       saleCall,
       lead,
+      leadCustom,
       ...toRecordingRows(bundle),
       legs: bundle.legs,
       live: bundle.live,
@@ -294,6 +322,21 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const { transferId } = req.params as { transferId: string };
     return liveRecordings(req, transferId, false);
   });
+  // Lead details for the evaluation page — same access rules as the call
+  app.get('/detail/:transferId/lead', { preHandler: [requirePermission('calls.view')] }, async (req) => {
+    const { transferId } = req.params as { transferId: string };
+    const [t] = await db.select().from(transfers).where(eq(transfers.id, transferId));
+    if (!t) throw new NotFoundError('Transfer not found');
+    await assertTransferAccess(req, t);
+    let leadId = t.viciLeadId;
+    const legId = t.fronterCallId ?? t.closerCallId ?? t.saleCallId;
+    if (leadId == null && legId) {
+      const [c] = await db.select({ leadId: calls.viciLeadId }).from(calls).where(eq(calls.id, legId));
+      leadId = c?.leadId ?? null;
+    }
+    return loadLeadInfo(t.dialerServerId, leadId);
+  });
+
   // "Fetch from dialer": a reviewer's explicit retry — ignores the throttles,
   // re-asks the dialer for the lead and re-probes every file, missing ones too
   app.post('/detail/:transferId/recordings/fetch', { preHandler: [requirePermission('calls.view')] }, async (req) => {

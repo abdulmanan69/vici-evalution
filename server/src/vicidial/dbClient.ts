@@ -15,6 +15,21 @@ import type {
  * export. Only SELECT statements are issued; grant the configured MySQL user
  * SELECT-only privileges.
  */
+export interface LeadInfo {
+  lead: Record<string, unknown>;
+  list: Record<string, unknown> | null;
+  custom: Record<string, unknown> | null;
+}
+
+/** VICIdial stores line breaks in free text as "!N" (carriage returns as "!R"). */
+export function decodeViciText<T extends Record<string, unknown>>(row: T): T {
+  const out: Record<string, unknown> = { ...row };
+  for (const [k, v] of Object.entries(out)) {
+    if (typeof v === 'string' && v.includes('!')) out[k] = v.replace(/!R/g, '').replace(/!N/g, '\n');
+  }
+  return out as T;
+}
+
 export class ViciDbClient {
   private pool: mysql.Pool;
 
@@ -183,18 +198,41 @@ export class ViciDbClient {
   }
 
   /** One lead's details for the call page — primary-key lookup, milliseconds. */
-  async fetchLead(leadId: number): Promise<Record<string, unknown> | null> {
-    const [rows] = await this.pool.query(
-      `SELECT lead_id, status, list_id, phone_number, alt_phone, title, first_name,
-              middle_initial, last_name, address1, address2, address3, city, state,
-              postal_code, country_code, email, vendor_lead_code, source_id,
-              security_phrase, comments, called_count, last_local_call_time, entry_date
-         FROM vicidial_list
-        WHERE lead_id = ?
-        LIMIT 1`,
-      [leadId],
-    );
-    return (rows as Record<string, unknown>[])[0] ?? null;
+  /**
+   * Everything the dialer holds on a lead: the full vicidial_list row, its
+   * list (name, campaign) and the list's custom fields when the list has a
+   * custom_<list_id> table. Free text comes back with VICIdial's "!N" line
+   * breaks decoded.
+   */
+  async fetchLead(leadId: number): Promise<LeadInfo | null> {
+    const [rows] = await this.pool.query(`SELECT * FROM vicidial_list WHERE lead_id = ? LIMIT 1`, [leadId]);
+    const lead = (rows as Record<string, unknown>[])[0];
+    if (!lead) return null;
+    let list: Record<string, unknown> | null = null;
+    let custom: Record<string, unknown> | null = null;
+    const listId = Number(lead.list_id);
+    if (Number.isFinite(listId)) {
+      try {
+        const [l] = await this.pool.query(
+          `SELECT list_id, list_name, campaign_id, active, list_description FROM vicidial_lists WHERE list_id = ? LIMIT 1`,
+          [listId],
+        );
+        list = (l as Record<string, unknown>[])[0] ?? null;
+      } catch {
+        list = null;
+      }
+      try {
+        const table = `custom_${Math.trunc(listId)}`;
+        const [t] = await this.pool.query(`SHOW TABLES LIKE ?`, [table]);
+        if ((t as unknown[]).length > 0) {
+          const [c] = await this.pool.query(`SELECT * FROM \`${table}\` WHERE lead_id = ? LIMIT 1`, [leadId]);
+          custom = (c as Record<string, unknown>[])[0] ?? null;
+        }
+      } catch {
+        custom = null; // the read-only user may not see custom tables
+      }
+    }
+    return { lead: decodeViciText(lead), list, custom: custom ? decodeViciText(custom) : null };
   }
 
   async fetchUsers(): Promise<ViciUserRow[]> {

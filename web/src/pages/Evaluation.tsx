@@ -7,6 +7,7 @@ import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
 import { fetchNote, useFetchRecordings, useLiveRecordings, type Leg, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
+import { LeadCard, type LeadInfo } from '../components/LeadCard';
 import { Chip, ErrorState, Loading, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
 const LEG_STYLE: Record<RecordingItem['leg'], { label: string; cls: string }> = {
@@ -242,6 +243,13 @@ export function EvaluationPage() {
   // the recordings follow the dialer live while the call is still being finished
   const liveQ = useLiveRecordings(data?.call?.transferId);
   const fetchRecs = useFetchRecordings(data?.call?.transferId);
+  // the lead's full record from the dialer, beside the recordings
+  const leadQ = useQuery({
+    queryKey: ['transfer-lead', data?.call?.transferId],
+    queryFn: () => api<{ lead: LeadInfo | null; leadCustom: LeadInfo | null }>(`/queues/detail/${data?.call?.transferId}/lead`),
+    enabled: !!data?.call?.transferId,
+    staleTime: 60_000,
+  });
 
   useEffect(() => {
     if (data) {
@@ -351,6 +359,7 @@ export function EvaluationPage() {
                 fetching={fetchRecs.isPending}
                 note={fetchNote(fetchRecs)}
               />
+              {leadQ.data?.lead && <LeadCard lead={leadQ.data.lead} custom={leadQ.data.leadCustom} compact />}
             </>
           ) : (
             <p className="text-sm text-ink-2">This evaluation is not linked to a call.</p>
