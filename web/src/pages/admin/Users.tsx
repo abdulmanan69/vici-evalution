@@ -31,6 +31,14 @@ interface Role {
   description: string | null;
 }
 
+/** what each role is for, in the words a manager uses */
+const ROLE_LABELS: Record<string, string> = {
+  super_admin: 'Super admin — every company, dialer and user on the platform',
+  company_admin: 'Company admin — users, dialer connection, dispositions and QA team for this company',
+  qa_manager: 'QA manager — forms, reviewer assignments, tasks and all reports (can evaluate too)',
+  qa_reviewer: 'QA reviewer — evaluates the calls assigned to them',
+};
+
 export function UsersPage() {
   const { companyId } = useCompanyScope();
   const { isSuperAdmin, user: me } = useAuth();
@@ -222,11 +230,12 @@ export function UsersPage() {
             <select className="input" value={form.roleId} onChange={(e) => setForm({ ...form, roleId: e.target.value })}>
               <option value="">— choose a role —</option>
               {rolesData?.roles
-                .filter((r) => isSuperAdmin || r.companyId !== null)
+                // the company's own roles, plus super admin for super admins; the
+                // platform-level copies of company roles are templates, never assigned
+                .filter((r) => r.companyId !== null || (isSuperAdmin && r.name === 'super_admin'))
                 .map((r) => (
                   <option key={r.id} value={r.id}>
-                    {r.name.replace(/_/g, ' ')}
-                    {r.companyId === null ? ' (platform)' : ''}
+                    {ROLE_LABELS[r.name] ?? r.name.replace(/_/g, ' ')}
                   </option>
                 ))}
             </select>
