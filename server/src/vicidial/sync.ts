@@ -505,12 +505,19 @@ async function upsertCall(
     .onConflictDoUpdate({
       target: [calls.dialerServerId, calls.source, calls.viciUniqueId],
       targetWhere: sql`vici_uniqueid is not null`,
-      // dispositions and lengths arrive late/corrected — refresh them
+      // dispositions and lengths arrive late/corrected — refresh them; so
+      // does the agent: a closer-group call is written under the queue's
+      // system user (VDCL) and only carries the closer once they pick up
       set: {
         status: row.status,
         lengthSec: row.length_in_sec,
         termReason: row.term_reason,
         phoneNumber: row.phone_number,
+        viciUserRaw: row.user,
+        viciAgentId: row.user ? (agentMap.get(row.user) ?? null) : null,
+        campaignId,
+        ingroupId,
+        listId: row.list_id,
         raw: row,
         lastSyncedAt: now,
       },
@@ -1274,6 +1281,39 @@ async function syncAgentDispositions(
  * time). Transfers whose XFER the agent took back are removed unless QA
  * work already hangs off them.
  */
+/**
+ * A sub-5-second XFER call is the agent saving the result on a quick manual
+ * re-dial after the real call (14 of 14 such transfers this week never found
+ * a closer because the matcher looked an hour too late). The conversation —
+ * and the handoff the closer leg follows — is that agent's longer call on the
+ * lead within the previous 3 hours; use it as the fronter leg. The
+ * disposition still counts on its own day via counted_at.
+ */
+async function preferConversation(
+  dialerServerId: string,
+  call: typeof calls.$inferSelect | undefined,
+): Promise<typeof calls.$inferSelect | undefined> {
+  if (!call || call.lengthSec == null || call.lengthSec >= 5 || call.viciLeadId == null) return call;
+  const [conv] = await db
+    .select()
+    .from(calls)
+    .where(
+      and(
+        eq(calls.dialerServerId, dialerServerId),
+        eq(calls.source, 'vicidial_log'),
+        eq(calls.viciLeadId, call.viciLeadId),
+        call.viciUserRaw ? sql`upper(${calls.viciUserRaw}) = upper(${call.viciUserRaw})` : sql`true`,
+        sql`coalesce(${calls.lengthSec}, 0) >= 5`,
+        gte(calls.callDate, new Date(call.callDate.getTime() - 3 * 3600_000)),
+        lte(calls.callDate, call.callDate),
+        sql`not exists (select 1 from transfers t where t.fronter_call_id = ${calls.id})`,
+      ),
+    )
+    .orderBy(desc(calls.callDate))
+    .limit(1);
+  return conv ?? call;
+}
+
 async function findAgentCall(
   dialerServerId: string,
   r: typeof agentDispositions.$inferSelect,
@@ -1351,7 +1391,7 @@ async function buildTransfersFromAgentLog(
       // the call row may land after the disposition — link it once it does,
       // so the transfer gets its recording and can match its closer leg
       if (!existing.fronterCallId) {
-        const call = await findAgentCall(conn.id, r, codes);
+        const call = await preferConversation(conn.id, await findAgentCall(conn.id, r, codes));
         if (call) {
           try {
             await db
@@ -1389,6 +1429,7 @@ async function buildTransfersFromAgentLog(
           .limit(1)
       : [];
     if (!fronter) fronter = (await findAgentCall(conn.id, r, codes)) as typeof fronter;
+    fronter = (await preferConversation(conn.id, fronter)) as typeof fronter;
 
     if (fronter) {
       // a transfer built earlier from the call record — adopt it

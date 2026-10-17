@@ -62,6 +62,7 @@ function CallLeg({
   leg,
   recordings,
   pendingMatch,
+  noCloser,
   checking,
   onFetch,
   fetching,
@@ -74,6 +75,8 @@ function CallLeg({
   recordings: RecordingItem[];
   /** no closer leg yet and the matcher is still looking */
   pendingMatch: boolean;
+  /** the dialer has no closer-side call for this transfer */
+  noCloser: boolean;
   /** the page is polling the dialer */
   checking: boolean;
   /** 'Fetch from dialer' — the reviewer's explicit retry */
@@ -81,10 +84,12 @@ function CallLeg({
   fetching?: boolean;
 }) {
   const inProgress = leg?.inProgress ?? (call ? call.lengthSec == null : false);
-  // a 0-second call is a disposition-only entry — its file is empty; the
-  // conversation (tagged onto this leg by the server) is what gets played
-  const dispoOnly = !inProgress && (leg?.lengthSec ?? call?.lengthSec ?? 1) === 0;
-  const playable = recordings.filter((r) => r.status === 'available' && (r.lengthSec ?? 1) > 0);
+  // a call under 5 s is a disposition-only entry (0 s: no call; 1-4 s: a quick
+  // re-dial to save the result) — the conversation the server tagged onto this
+  // leg is what gets played
+  const legLen = leg?.lengthSec ?? call?.lengthSec ?? null;
+  const dispoOnly = !inProgress && legLen != null && legLen < 5;
+  const playable = recordings.filter((r) => r.status === 'available' && (r.lengthSec ?? 1) >= 5);
   const hasPending = recordings.some((r) => r.status === 'pending');
   const hasMissing = recordings.some((r) => r.status === 'missing');
   return (
@@ -96,6 +101,11 @@ function CallLeg({
       {!call ? (
         pendingMatch ? (
           <Note pulse>Closer leg not found yet — the closer may still be on the line. Checking automatically.</Note>
+        ) : noCloser ? (
+          <Note>
+            No closer-side call on the dialer for this transfer: it did not reach a closer (dropped in queue, sent to an
+            outside number, or dispositioned XFER without a transfer).
+          </Note>
         ) : (
           <p className="text-sm text-ink-2">No linked call leg yet.</p>
         )
@@ -135,7 +145,7 @@ function CallLeg({
           <div className="mt-3 space-y-2">
             {dispoOnly && (
               <Note>
-                Disposition-only entry (0 s): the agent saved the result without a new call.
+                {legLen === 0 ? 'Disposition-only entry (0 s): the agent saved the result without a new call.' : `Very short call (${legLen} s): the agent saved the result on a quick re-dial, not a conversation.`}
                 {playable.length > 0 ? ' The conversation on this lead:' : hasPending || checking ? ' Finding the conversation…' : ' No audio for this entry.'}
               </Note>
             )}
@@ -273,7 +283,11 @@ export function TransferDetailPage() {
       ? 'Fronter call on this lead'
       : 'Fronter leg (found on the lead)'
     : 'Fronter leg';
-  const pendingMatch = !data.closerCall && t.matchStatus === 'pending_match';
+  // the matcher keeps looking for 30 min; after that (or once it gave up) the
+  // honest answer is that the dialer has no closer leg for this transfer
+  const minutesSinceXfer = (Date.now() - new Date(t.xferTime).getTime()) / 60_000;
+  const pendingMatch = !data.closerCall && t.matchStatus === 'pending_match' && minutesSinceXfer < 30;
+  const noCloser = !data.closerCall && !pendingMatch && t.kind === 'transfer';
 
   return (
     <div>
@@ -340,6 +354,7 @@ export function TransferDetailPage() {
             leg={legs.fronter}
             recordings={byLeg('fronter')}
             pendingMatch={false}
+            noCloser={false}
             checking={checking}
             onFetch={() => fetchRecs.mutate()}
             fetching={fetchRecs.isPending}
@@ -353,6 +368,7 @@ export function TransferDetailPage() {
           leg={legs.closer}
           recordings={byLeg('closer')}
           pendingMatch={pendingMatch}
+          noCloser={noCloser}
           checking={checking}
           onFetch={() => fetchRecs.mutate()}
           fetching={fetchRecs.isPending}
@@ -366,6 +382,7 @@ export function TransferDetailPage() {
             leg={legs.sale}
             recordings={byLeg('sale')}
             pendingMatch={false}
+            noCloser={false}
             checking={checking}
             onFetch={() => fetchRecs.mutate()}
             fetching={fetchRecs.isPending}

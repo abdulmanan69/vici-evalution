@@ -179,13 +179,14 @@ export async function recordingBundle(
           .limit(60);
   let rows = await load();
 
-  // A 0-second leg is a disposition-only entry: the agent saved the result
-  // on the lead without a new call. The conversation is that agent's longer
-  // call on the lead shortly before it — tag its recording with the leg so
-  // the page plays the real call instead of an empty file.
+  // A leg under 5 seconds is a disposition-only entry: the agent saved the
+  // result on the lead with a quick re-dial (or no call at all). The
+  // conversation is that agent's longer call on the lead shortly before it —
+  // tag its recording with the leg so the page plays the real call instead
+  // of an empty or 1-second file.
   const tagConversations = () => {
     for (const [leg, l] of Object.entries(legs) as Array<[Leg, LegState]>) {
-      if (l.inProgress || (l.lengthSec ?? 1) > 0) continue;
+      if (l.inProgress || (l.lengthSec ?? 99) >= 5) continue;
       const legCall = legCalls[leg];
       if (!legCall) continue;
       const user = (legCall.viciUserRaw ?? '').toUpperCase();
