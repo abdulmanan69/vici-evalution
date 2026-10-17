@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Plus, RefreshCw, Satellite } from 'lucide-react';
 import { api, ApiError } from '../../api/client';
@@ -56,12 +56,49 @@ const EMPTY: DialerForm = {
   recordingAuthPass: '',
 };
 
+// Every IANA zone the browser knows, with the common call-centre ones first.
+// Typing a zone by hand was error-prone, and a wrong zone shifts every count.
+const COMMON_ZONES = [
+  'America/New_York',
+  'America/Chicago',
+  'America/Denver',
+  'America/Phoenix',
+  'America/Los_Angeles',
+  'Asia/Karachi',
+  'Asia/Dubai',
+  'Asia/Manila',
+  'Asia/Kolkata',
+  'Europe/London',
+  'UTC',
+];
+const ALL_ZONES: string[] = (() => {
+  try {
+    const intl = Intl as unknown as { supportedValuesOf?: (key: string) => string[] };
+    return intl.supportedValuesOf?.('timeZone') ?? [];
+  } catch {
+    return [];
+  }
+})();
+function zoneOffset(tz: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' }).formatToParts(new Date());
+    return parts.find((x) => x.type === 'timeZoneName')?.value ?? '';
+  } catch {
+    return '';
+  }
+}
 export function DialersPage() {
   const { companyId } = useCompanyScope();
   const { isSuperAdmin } = useAuth();
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState<Dialer | 'new' | null>(null);
   const [form, setForm] = useState<DialerForm>(EMPTY);
+  const zoneOptions = useMemo(() => {
+    const all = ALL_ZONES.filter((z) => !COMMON_ZONES.includes(z));
+    const offsets: Record<string, string> = {};
+    for (const z of [...COMMON_ZONES, ...all]) offsets[z] = zoneOffset(z);
+    return { all, offsets };
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>({});
 
@@ -234,8 +271,28 @@ export function DialersPage() {
               <option value="api">API only (limited)</option>
             </select>
           </Field>
-          <Field label="Server timezone" hint="IANA zone the dialer logs in, e.g. America/New_York">
-            <input className="input font-mono" value={form.timezone} onChange={(e) => setForm({ ...form, timezone: e.target.value })} />
+          <Field label="Server timezone" hint="The zone the dialer logs its times in — every count here is per dialer day.">
+            <select className="input font-mono" value={form.timezone} onChange={(e) => setForm({ ...form, timezone: e.target.value })}>
+              {!zoneOptions.all.includes(form.timezone) && !COMMON_ZONES.includes(form.timezone) && (
+                <option value={form.timezone}>{form.timezone}</option>
+              )}
+              <optgroup label="Common">
+                {COMMON_ZONES.map((z) => (
+                  <option key={z} value={z}>
+                    {z} ({zoneOptions.offsets[z]})
+                  </option>
+                ))}
+              </optgroup>
+              {zoneOptions.all.length > 0 && (
+                <optgroup label="All zones">
+                  {zoneOptions.all.map((z) => (
+                    <option key={z} value={z}>
+                      {z} ({zoneOptions.offsets[z]})
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </select>
           </Field>
           <Field label="API user">
             <input className="input" value={form.apiUser} onChange={(e) => setForm({ ...form, apiUser: e.target.value })} autoComplete="off" />
