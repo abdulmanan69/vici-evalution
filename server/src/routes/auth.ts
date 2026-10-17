@@ -41,7 +41,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       reply.setCookie(SESSION_COOKIE, result.token, {
         httpOnly: true,
         sameSite: 'lax',
-        secure: config.COOKIE_SECURE,
+        // 'auto' marks the cookie Secure only when the request came in over
+      // HTTPS (trustProxy reads X-Forwarded-Proto), so a login behind Coolify,
+      // Caddy or plain HTTP all work; COOKIE_SECURE=true forces it on
+      secure: config.COOKIE_SECURE ? true : 'auto',
         path: '/',
         expires: result.expiresAt,
       });
