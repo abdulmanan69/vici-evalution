@@ -602,6 +602,8 @@ export const syncJobs = pgTable(
     windowStart: timestamp('window_start', { withTimezone: true }),
     windowEnd: timestamp('window_end', { withTimezone: true }),
     stats: jsonb('stats'),
+    /** live progress while running: stage, percent, detail, ETA (see SyncProgress in sync.ts) */
+    progress: jsonb('progress'),
     error: text('error'),
     startedAt: timestamp('started_at', { withTimezone: true }),
     finishedAt: timestamp('finished_at', { withTimezone: true }),

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { and, desc, eq, gte, inArray, isNull, lte, or, sql } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { db } from '../db/client.js';
@@ -49,6 +50,110 @@ const MATCH_WINDOW_AFTER_MS = 10 * 60 * 1000;
 const PENDING_GRACE_MS = 2 * 60 * 60 * 1000; // keep pending this long before 'unmatched'
 
 /** Full sync pass for one dialer. Idempotent — safe to re-run at any time. */
+/** Live progress of a running sync, stored on the job row for the UI. */
+export interface SyncProgress {
+  stage: string;
+  /** what the stage does, in the reviewer's words */
+  label: string;
+  /** overall 0–100 across every stage of this sync */
+  percent: number;
+  /** e.g. "12,340 calls · day 3 of 7" */
+  detail: string | null;
+  /** from elapsed time and percent; null until there is enough to go on */
+  etaSeconds: number | null;
+  startedAt: string;
+  updatedAt: string;
+}
+
+const STAGES: Record<string, { label: string; weight: number }> = {
+  roster: { label: 'Reading agents, campaigns and in-groups', weight: 2 },
+  calls: { label: 'Importing outbound calls', weight: 40 },
+  closer_calls: { label: 'Importing closer calls', weight: 8 },
+  recordings: { label: 'Reading the recording log', weight: 4 },
+  dispositions: { label: 'Reading agent dispositions (XFER)', weight: 14 },
+  api_calls: { label: 'Importing calls through the API', weight: 60 },
+  api_recordings: { label: 'Looking up recordings', weight: 6 },
+  transfers: { label: 'Building transfers', weight: 14 },
+  matching: { label: 'Matching transfers to closer legs', weight: 6 },
+  sales: { label: 'Attributing sales', weight: 3 },
+  queues: { label: 'Filing calls into queues', weight: 3 },
+};
+
+/**
+ * Weighted stage progress written to sync_jobs.progress at most every 1.5 s
+ * (and on every stage change). Best effort: a failed write never fails a sync.
+ */
+class ProgressReporter {
+  private doneWeight = 0;
+  private current: { key: string; label: string; weight: number } | null = null;
+  private fraction = 0;
+  private detail: string | null = null;
+  private lastWrite = 0;
+  private readonly total: number;
+  private readonly startedAt = Date.now();
+
+  constructor(
+    private readonly jobId: string,
+    private readonly stageKeys: string[],
+  ) {
+    this.total = stageKeys.reduce((s, k) => s + (STAGES[k]?.weight ?? 0), 0) || 1;
+  }
+
+  async stage(key: string): Promise<void> {
+    if (this.current) this.doneWeight += this.current.weight;
+    this.current = { key, label: STAGES[key]?.label ?? key, weight: STAGES[key]?.weight ?? 0 };
+    this.fraction = 0;
+    this.detail = null;
+    await this.flush(true);
+  }
+
+  async tick(fraction: number, detail?: string | null): Promise<void> {
+    this.fraction = Math.max(0, Math.min(1, fraction));
+    if (detail !== undefined) this.detail = detail;
+    await this.flush(false);
+  }
+
+  async finish(): Promise<void> {
+    this.doneWeight = this.total;
+    this.current = null;
+    this.fraction = 1;
+    this.detail = null;
+    await this.flush(true);
+  }
+
+  snapshot(): SyncProgress {
+    const raw = ((this.doneWeight + (this.current?.weight ?? 0) * this.fraction) / this.total) * 100;
+    const percent = Math.round(Math.min(100, raw) * 10) / 10;
+    const elapsed = (Date.now() - this.startedAt) / 1000;
+    // the first stages are quick, so an estimate before ~1 min / 5 % runs wild
+    const etaSeconds =
+      percent >= 100 ? 0 : percent >= 5 && elapsed >= 45 ? Math.round((elapsed * (100 - percent)) / percent) : null;
+    return {
+      stage: this.current?.key ?? 'done',
+      label: this.current?.label ?? 'Finished',
+      percent,
+      detail: this.detail,
+      etaSeconds,
+      startedAt: new Date(this.startedAt).toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  private async flush(force: boolean): Promise<void> {
+    const now = Date.now();
+    if (!force && now - this.lastWrite < 1500) return;
+    this.lastWrite = now;
+    try {
+      await db.update(syncJobs).set({ progress: this.snapshot() }).where(eq(syncJobs.id, this.jobId));
+    } catch {
+      /* progress is best effort */
+    }
+  }
+}
+
+const progressStore = new AsyncLocalStorage<ProgressReporter>();
+const progress = (): ProgressReporter | undefined => progressStore.getStore();
+
 export async function runDialerSync(
   dialerServerId: string,
   opts: { full?: boolean } = {},
@@ -101,55 +206,86 @@ export async function runDialerSync(
     .values({ dialerServerId, jobType: opts.full ? 'full' : 'incremental', status: 'running', startedAt: new Date() })
     .returning();
 
+  const usesDb = (conn.sourceMode === 'db' || conn.sourceMode === 'hybrid') && !!conn.db;
+  const stageKeys = usesDb
+    ? [
+        'roster',
+        'calls',
+        'closer_calls',
+        'recordings',
+        'dispositions',
+        ...(conn.sourceMode === 'hybrid' ? ['api_recordings'] : []),
+        'transfers',
+        'matching',
+        'sales',
+        'queues',
+      ]
+    : ['api_calls', 'transfers', 'matching', 'sales', 'queues'];
+  const reporter = new ProgressReporter(job.id, stageKeys);
+
   let viciDb: ViciDbClient | null = null;
-  try {
-    if ((conn.sourceMode === 'db' || conn.sourceMode === 'hybrid') && conn.db) {
-      viciDb = new ViciDbClient(conn);
-      await syncRoster(conn, viciDb, stats);
-      await syncCallStream(conn, viciDb, 'vicidial_log', stats, opts.full);
-      await syncCallStream(conn, viciDb, 'vicidial_closer_log', stats, opts.full);
-      await syncRecordingsFromDb(conn, viciDb, stats, opts.full);
-      await syncAgentDispositions(conn, viciDb, stats, opts.full);
-    } else if (conn.sourceMode === 'api') {
-      // No DB access: synthesize call records from recording_lookup +
-      // lead_all_info (verified shapes on this build — see docs).
-      await syncApiOnly(conn, stats, opts.full);
-    } else {
-      notes.push('No usable data source configured (db credentials missing).');
+  return progressStore.run(reporter, async () => {
+    try {
+      if (usesDb) {
+        viciDb = new ViciDbClient(conn);
+        await reporter.stage('roster');
+        await syncRoster(conn, viciDb, stats);
+        await reporter.stage('calls');
+        await syncCallStream(conn, viciDb, 'vicidial_log', stats, opts.full);
+        await reporter.stage('closer_calls');
+        await syncCallStream(conn, viciDb, 'vicidial_closer_log', stats, opts.full);
+        await reporter.stage('recordings');
+        await syncRecordingsFromDb(conn, viciDb, stats, opts.full);
+        await reporter.stage('dispositions');
+        await syncAgentDispositions(conn, viciDb, stats, opts.full);
+      } else if (conn.sourceMode === 'api') {
+        // No DB access: synthesize call records from recording_lookup +
+        // lead_all_info (verified shapes on this build — see docs).
+        await reporter.stage('api_calls');
+        await syncApiOnly(conn, stats, opts.full);
+      } else {
+        notes.push('No usable data source configured (db credentials missing).');
+      }
+
+      if (conn.sourceMode === 'hybrid') {
+        await reporter.stage('api_recordings');
+        await syncRecordingsFromApi(conn, stats);
+      }
+
+      await reporter.stage('transfers');
+      await buildTransfers(conn, stats, opts.full);
+      await reporter.stage('matching');
+      await matchPendingTransfers(conn.companyId, stats);
+      await reporter.stage('sales');
+      await attributeSales(conn.companyId, stats);
+      await reporter.stage('queues');
+      await updateQueueStatuses(conn.companyId, stats);
+      await reporter.finish();
+
+      await db
+        .update(dialerServers)
+        .set({ lastSeenAt: new Date(), updatedAt: new Date() })
+        .where(eq(dialerServers.id, dialerServerId));
+      await db
+        .update(syncJobs)
+        .set({ status: 'success', stats, progress: reporter.snapshot(), finishedAt: new Date() })
+        .where(eq(syncJobs.id, job.id));
+      return stats;
+    } catch (err) {
+      await db
+        .update(syncJobs)
+        .set({
+          status: 'failed',
+          stats,
+          error: err instanceof Error ? err.message : String(err),
+          finishedAt: new Date(),
+        })
+        .where(eq(syncJobs.id, job.id));
+      throw err;
+    } finally {
+      await viciDb?.close();
     }
-
-    if (conn.sourceMode === 'hybrid') {
-      await syncRecordingsFromApi(conn, stats);
-    }
-
-    await buildTransfers(conn, stats, opts.full);
-    await matchPendingTransfers(conn.companyId, stats);
-    await attributeSales(conn.companyId, stats);
-    await updateQueueStatuses(conn.companyId, stats);
-
-    await db
-      .update(dialerServers)
-      .set({ lastSeenAt: new Date(), updatedAt: new Date() })
-      .where(eq(dialerServers.id, dialerServerId));
-    await db
-      .update(syncJobs)
-      .set({ status: 'success', stats, finishedAt: new Date() })
-      .where(eq(syncJobs.id, job.id));
-    return stats;
-  } catch (err) {
-    await db
-      .update(syncJobs)
-      .set({
-        status: 'failed',
-        stats,
-        error: err instanceof Error ? err.message : String(err),
-        finishedAt: new Date(),
-      })
-      .where(eq(syncJobs.id, job.id));
-    throw err;
-  } finally {
-    await viciDb?.close();
-  }
+  });
 }
 
 function fmtOffset(min: number): string {
@@ -358,8 +494,20 @@ async function syncCallStream(
   let skippedNoUid = 0;
   let maxSeen: Date | null = null;
 
-  const runPass = async (archive: boolean, passSinceUtc: Date): Promise<void> => {
+  // progress: how far through the time window each pass is, in dialer days
+  const windowStart = full ? initialWindowStart(full) : sinceUtc;
+  const totalDays = Math.max(1, Math.ceil((untilUtc.getTime() - windowStart.getTime()) / 86_400_000));
+  const runPass = async (archive: boolean, passSinceUtc: Date, share: [number, number]): Promise<void> => {
     let cursorUtc = passSinceUtc;
+    const span = Math.max(1, untilUtc.getTime() - passSinceUtc.getTime());
+    const report = async (at: Date) => {
+      const frac = Math.min(1, Math.max(0, (at.getTime() - passSinceUtc.getTime()) / span));
+      const day = Math.min(totalDays, Math.max(1, Math.floor((at.getTime() - windowStart.getTime()) / 86_400_000) + 1));
+      await progress()?.tick(
+        share[0] + (share[1] - share[0]) * frac,
+        `${imported.toLocaleString()} calls · day ${day} of ${totalDays}`,
+      );
+    };
     for (;;) {
       const sinceLocal = utcToLocalString(cursorUtc, conn.timezone);
       const untilLocal = utcToLocalString(untilUtc, conn.timezone);
@@ -369,9 +517,12 @@ async function syncCallStream(
           : await viciDb.fetchCloserCalls(sinceLocal, untilLocal, BATCH_LIMIT, archive);
       if (rows.length === 0) break;
 
+      let n = 0;
       for (const row of rows) {
         const callDateUtc = localToUtc(row.call_date, conn.timezone);
         if (!maxSeen || callDateUtc > maxSeen) maxSeen = callDateUtc;
+        n += 1;
+        if (n % 500 === 0) await report(callDateUtc);
         if (!row.uniqueid) {
           skippedNoUid += 1;
           continue;
@@ -384,6 +535,7 @@ async function syncCallStream(
       // advance window past the last processed row (equal timestamps re-read via overlap)
       const last = rows[rows.length - 1];
       cursorUtc = localToUtc(last.call_date, conn.timezone);
+      await report(cursorUtc);
     }
   };
 
@@ -391,14 +543,14 @@ async function syncCallStream(
   // job keep little or nothing in the live tables beyond the current day.
   if (full) {
     try {
-      await runPass(true, initialWindowStart(full));
+      await runPass(true, initialWindowStart(full), [0, 0.85]);
     } catch (err) {
       (stats.notes as string[]).push(
         `${source}_archive not readable: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
   }
-  await runPass(false, sinceUtc);
+  await runPass(false, sinceUtc, full ? [0.85, 1] : [0, 1]);
   const cursorAfter = maxSeen;
 
   // Realtime refresh. A call is written when it starts (status INCALL) and
@@ -588,6 +740,10 @@ async function syncRecordingsFromDb(
       imported += 1;
     }
 
+    await progress()?.tick(
+      Math.min(1, (cursorUtc.getTime() - passSinceUtc.getTime()) / Math.max(1, untilUtc.getTime() - passSinceUtc.getTime())),
+      `${imported.toLocaleString()} recordings`,
+    );
     if (rows.length < BATCH_LIMIT) break;
     const last = rows[rows.length - 1];
     if (!last.start_time) break;
@@ -664,7 +820,8 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
   // a time budget keeps each sync cycle short so new calls and dispositions
   // land within a minute; the backlog drains over the following cycles
   const deadline = Date.now() + RECORDING_LOOKUP_BUDGET_MS;
-  for (const c of candidates) {
+  for (const [i, c] of candidates.entries()) {
+    await progress()?.tick(i / Math.max(1, candidates.length), `${found} recordings found`);
     if (Date.now() > deadline) {
       (stats.notes as string[]).push('recording lookup time budget reached — continuing next cycle');
       break;
@@ -1247,7 +1404,10 @@ async function syncAgentDispositions(
         set: values,
       });
   };
-  for (const r of rows) await upsert(r);
+  for (const [i, r] of rows.entries()) {
+    await upsert(r);
+    if (i % 200 === 0) await progress()?.tick((0.6 * i) / Math.max(1, rows.length), `${rows.length.toLocaleString()} XFER dispositions`);
+  }
 
   // an XFER the agent later changed shows up only when re-read by id
   const kept = await db
@@ -1262,6 +1422,7 @@ async function syncAgentDispositions(
   let changed = 0;
   for (let i = 0; i < kept.length; i += 1000) {
     const chunk = kept.slice(i, i + 1000);
+    await progress()?.tick(0.6 + (0.4 * i) / Math.max(1, kept.length), `re-checking ${kept.length.toLocaleString()} dispositions`);
     const current = await viciDb.fetchAgentLogByIds(chunk.map((k) => k.agentLogId));
     const before = new Map(chunk.map((k) => [k.agentLogId, (k.status ?? '').toUpperCase()]));
     for (const r of current) {
@@ -1380,7 +1541,8 @@ async function buildTransfersFromAgentLog(
   let created = 0;
   let adopted = 0;
   let relinked = 0;
-  for (const r of rows) {
+  for (const [i, r] of rows.entries()) {
+    if (i % 50 === 0) await progress()?.tick(i / Math.max(1, rows.length), `${created} transfers built`);
     if (!isTransfer(r)) continue;
     const [existing] = await db
       .select({ id: transfers.id, fronterCallId: transfers.fronterCallId, matchStatus: transfers.matchStatus })
@@ -1734,7 +1896,8 @@ async function matchPendingTransfers(companyId: string, stats: SyncStats): Promi
   let flagged = 0;
   let unmatched = 0;
 
-  for (const t of pending) {
+  for (const [i, t] of pending.entries()) {
+    if (i % 20 === 0) await progress()?.tick(i / Math.max(1, pending.length), `${matched} matched`);
     const winStart = new Date(t.xferTime.getTime() - MATCH_WINDOW_BEFORE_MS);
     const winEnd = new Date(t.xferTime.getTime() + MATCH_WINDOW_AFTER_MS);
     // candidates across ALL of the company's dialers (same- and cross-dialer)

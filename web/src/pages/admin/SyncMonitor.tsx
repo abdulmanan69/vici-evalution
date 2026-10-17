@@ -5,6 +5,7 @@ import { api } from '../../api/client';
 import type { PageMeta, SyncJob } from '../../api/types';
 import { useCompanyScope } from '../../components/Layout';
 import { Chip, ErrorState, Loading, PageHeader, Pagination, fmtDateTime } from '../../components/ui';
+import { SyncProgressView } from '../../components/SyncProgress';
 
 interface DialerStatus {
   dialerServerId: string;
@@ -17,6 +18,8 @@ interface DialerStatus {
   clockDriftSec: number | null;
   timeCheckedAt: string | null;
   lastJob: SyncJob | null;
+  /** the sync in flight right now, with its live progress */
+  runningJob: SyncJob | null;
   cursors: { stream: string; lastTimestamp: string | null }[];
 }
 
@@ -34,7 +37,8 @@ export function SyncMonitorPage() {
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['sync-status', companyId],
     queryFn: () => api<{ statuses: DialerStatus[] }>('/sync/status', { query: { companyId: companyId || undefined } }),
-    refetchInterval: 15_000, // live view while syncs run
+    // every 4 s while a sync is running, otherwise 15 s
+    refetchInterval: (q) => (q.state.data?.statuses.some((s) => s.runningJob) ? 4_000 : 15_000),
   });
 
   const { data: jobs } = useQuery({
@@ -99,7 +103,12 @@ export function SyncMonitorPage() {
                     <span className="chip bg-good-soft text-good">clock in sync</span>
                   ))}
               </div>
-              {s.lastJob && (
+              {s.runningJob && (
+                <div className="mt-3">
+                  <SyncProgressView job={s.runningJob} />
+                </div>
+              )}
+              {s.lastJob && !s.runningJob && (
                 <div className="mt-1 flex items-center gap-2 text-2xs">
                   <Chip value={s.lastJob.status} />
                   <span className="font-mono text-ink-3">
@@ -150,7 +159,9 @@ export function SyncMonitorPage() {
                     <Chip value={job.status} />
                   </td>
                   <td className="td max-w-md truncate font-mono text-2xs text-ink-2">
-                    {job.error ?? (job.stats ? JSON.stringify(job.stats) : '—')}
+                    {job.status === 'running' && job.progress
+                      ? `${job.progress.percent.toFixed(0)}% · ${job.progress.label}${job.progress.detail ? ` · ${job.progress.detail}` : ''}`
+                      : (job.error ?? (job.stats ? JSON.stringify(job.stats) : '—'))}
                   </td>
                 </tr>
               ))}

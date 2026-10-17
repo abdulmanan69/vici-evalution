@@ -194,12 +194,24 @@ export interface PageMeta {
   totalPages: number;
 }
 
+/** live progress of a running sync (sync_jobs.progress) */
+export interface SyncProgress {
+  stage: string;
+  label: string;
+  percent: number;
+  detail: string | null;
+  etaSeconds: number | null;
+  startedAt: string;
+  updatedAt: string;
+}
+
 export interface SyncJob {
   id: string;
   dialerServerId: string;
   jobType: string;
   status: 'queued' | 'running' | 'success' | 'failed';
   stats: Record<string, unknown> | null;
+  progress: SyncProgress | null;
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;

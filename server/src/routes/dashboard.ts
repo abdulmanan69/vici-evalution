@@ -2,7 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { and, avg, count, eq, gte, lte, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { dialerServers, evaluations, recordings, transfers } from '../db/schema.js';
+import { dialerServers, evaluations, transfers } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { localToUtc, utcToLocalString } from '../vicidial/timezone.js';
 import { ValidationError } from '../lib/errors.js';

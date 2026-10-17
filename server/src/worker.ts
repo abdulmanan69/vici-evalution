@@ -182,10 +182,11 @@ async function applyRetention(): Promise<void> {
 async function main(): Promise<void> {
   await runMigrations();
 
-  // a restart mid-sync leaves job rows stuck at 'running' — close them out
+  // a restart mid-sync leaves job rows stuck at 'running'; this worker is the
+  // only thing that runs syncs, so every such row is stale — close them out
   await db.execute(sql`
     update sync_jobs set status = 'failed', error = 'interrupted by worker restart', finished_at = now()
-     where status = 'running' and started_at < now() - interval '30 minutes'`);
+     where status = 'running'`);
 
   const worker = new Worker(
     'vici-sync',

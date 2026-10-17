@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { and, count, desc, eq, inArray, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { dialerServers, syncCursors, syncJobs } from '../db/schema.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
@@ -34,6 +34,19 @@ export async function syncRoutes(app: FastifyInstance): Promise<void> {
         .where(eq(syncJobs.dialerServerId, d.id))
         .orderBy(desc(syncJobs.createdAt))
         .limit(1);
+      const [runningJob] = await db
+        .select()
+        .from(syncJobs)
+        .where(
+          and(
+            eq(syncJobs.dialerServerId, d.id),
+            eq(syncJobs.status, 'running'),
+            // still reporting — a worker restart can leave a row at 'running'
+            sql`coalesce((${syncJobs.progress}->>'updatedAt')::timestamptz, ${syncJobs.startedAt}) > now() - interval '5 minutes'`,
+          ),
+        )
+        .orderBy(sql`(${syncJobs.jobType} = 'full') desc`, desc(syncJobs.createdAt))
+        .limit(1);
       statuses.push({
         dialerServerId: d.id,
         name: d.name,
@@ -45,6 +58,7 @@ export async function syncRoutes(app: FastifyInstance): Promise<void> {
         clockDriftSec: d.clockDriftSec,
         timeCheckedAt: d.timeCheckedAt,
         lastJob: lastJob ?? null,
+        runningJob: runningJob ?? null,
         cursors: cursors.filter((c) => c.dialerServerId === d.id),
       });
     }

@@ -57,6 +57,13 @@
       "when": 1792094175031,
       "tag": "0007_agent-dispositions",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1792278847205,
+      "tag": "0008_sync-progress",
+      "breakpoints": true
     }
   ]
 }
