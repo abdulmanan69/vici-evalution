@@ -1,0 +1,29 @@
+# HTTPS front door with automatic Let's Encrypt certificates (Caddy).
+#
+#   In .env:   DOMAIN=qa.example.com   WEB_BIND=127.0.0.1   COOKIE_SECURE=true
+#   Then:      docker compose -f docker-compose.yml -f docker-compose.https.yml up -d --build
+#
+# Ports 80 and 443 must reach this server from the internet for the
+# certificate to be issued; the DNS A record must point here first.
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      - web
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  caddydata:
+  caddyconfig:

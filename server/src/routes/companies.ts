@@ -7,6 +7,7 @@ import { requirePermission, isSuperAdmin } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../lib/errors.js';
 import { ROLE_PRESETS } from '../auth/permissions.js';
+import { ensureDefaultForms } from '../services/ensureDefaultForms.js';
 
 const companySchema = z.object({
   name: z.string().min(2).max(200),
@@ -60,6 +61,8 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
         isSystem: true,
       });
     }
+    // every company starts with the built-in TRA / Unclosed / Closed scorecards
+    await ensureDefaultForms(row.id, req.auth.userId);
     await audit(req, { action: 'company.create', entityType: 'company', entityId: row.id, after: row, companyId: row.id });
     return reply.status(201).send({ company: row });
   });

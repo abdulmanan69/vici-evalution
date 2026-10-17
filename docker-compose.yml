@@ -1,5 +1,13 @@
 name: vici-qa
 
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://${POSTGRES_USER:-vici_qa}:${POSTGRES_PASSWORD:-change-me-strong-password}@postgres:5432/${POSTGRES_DB:-vici_qa}
+  REDIS_URL: redis://redis:6379
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -16,7 +24,8 @@ services:
       timeout: 3s
       retries: 20
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    logging: *logging
 
   redis:
     image: redis:7-alpine
@@ -29,50 +38,59 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
+    logging: *logging
 
   api:
     build: ./server
     restart: unless-stopped
     command: ["node", "dist/index.js"]
     env_file: .env
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-vici_qa}:${POSTGRES_PASSWORD:-change-me-strong-password}@postgres:5432/${POSTGRES_DB:-vici_qa}
-      REDIS_URL: redis://redis:6379
+    environment: *app-env
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # the web container proxies /api internally; expose the API itself only
+    # on localhost (set API_BIND=0.0.0.0 to reach it from other machines)
     ports:
-      - "${API_PORT:-8080}:8080"
+      - "${API_BIND:-127.0.0.1}:${API_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 10
       start_period: 20s
+    logging: *logging
 
   worker:
     build: ./server
     restart: unless-stopped
     command: ["node", "dist/worker.js"]
     env_file: .env
-    environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-vici_qa}:${POSTGRES_PASSWORD:-change-me-strong-password}@postgres:5432/${POSTGRES_DB:-vici_qa}
-      REDIS_URL: redis://redis:6379
+    environment: *app-env
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    logging: *logging
 
   web:
     build: ./web
     restart: unless-stopped
     depends_on:
       - api
+    # WEB_BIND=127.0.0.1 when a TLS proxy (docker-compose.https.yml) fronts it
     ports:
-      - "${WEB_PORT:-3000}:80"
+      - "${WEB_BIND:-0.0.0.0}:${WEB_PORT:-3000}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging: *logging
 
 volumes:
   pgdata:

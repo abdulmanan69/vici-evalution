@@ -18,6 +18,7 @@ import { config } from '../config.js';
 import { hashPassword } from '../lib/crypto.js';
 import { ROLE_PRESETS } from '../auth/permissions.js';
 import { runMigrations } from './migrate.js';
+import { ensureDefaultForms } from '../services/ensureDefaultForms.js';
 
 /**
  * Idempotent seed: system roles + bootstrap super admin. With SEED_DEMO=true
@@ -62,6 +63,14 @@ export async function seed(): Promise<void> {
     console.log(`Super admin created: ${config.SUPERADMIN_EMAIL}`);
   }
 
+  // every company carries the built-in TRA / Unclosed / Closed scorecards;
+  // idempotent, so a form that was archived comes back on the next start
+  // (managers can also do this from QA forms -> "Load default forms")
+  const [bootstrapAdmin] = await db.select({ id: users.id }).from(users).where(eq(users.email, config.SUPERADMIN_EMAIL));
+  for (const company of await db.select({ id: companies.id, name: companies.name }).from(companies)) {
+    const r = await ensureDefaultForms(company.id, bootstrapAdmin?.id ?? null);
+    if (r.created.length) console.log(`Default QA forms loaded for ${company.name}: ${r.created.join(', ')}`);
+  }
   if (config.SEED_DEMO) {
     await seedDemo(roleIds);
   }

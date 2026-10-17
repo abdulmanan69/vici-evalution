@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { Link, Navigate, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery } from '@tanstack/react-query';
-import { Plus } from 'lucide-react';
+import { Plus, RotateCcw } from 'lucide-react';
 import { api } from '../api/client';
 import type { QaForm } from '../api/types';
 import { useAuth } from '../auth/AuthContext';
@@ -40,6 +40,24 @@ export function FormsPage() {
 
   const createBlocked = isSuperAdmin && !companyId;
 
+  // the built-in TRA / Unclosed / Closed scorecards — brings back any that
+  // were archived, never touches the ones already here
+  const loadDefaults = useMutation({
+    mutationFn: () =>
+      api<{ created: string[]; existing: string[] }>('/qa/forms/load-defaults', {
+        method: 'POST',
+        body: { companyId: companyId || undefined },
+      }),
+    onSuccess: () => void refetch(),
+  });
+  const defaultsNote = loadDefaults.isError
+    ? 'The default forms could not be loaded.'
+    : loadDefaults.isSuccess
+      ? loadDefaults.data.created.length > 0
+        ? `Loaded: ${loadDefaults.data.created.join(', ')}.`
+        : 'All default forms are already here.'
+      : null;
+
   // the builder is a manager tool; reviewers reach forms through evaluations
   if (!hasPerm('qa.forms.manage')) return <Navigate to="/" replace />;
 
@@ -50,19 +68,34 @@ export function FormsPage() {
         subtitle="Scorecards your reviewers fill in — versioned on every publish"
         actions={
           hasPerm('qa.forms.manage') && (
-            <button className="btn-primary" onClick={() => setCreateOpen(true)}>
-              <Plus size={14} /> New form
-            </button>
+            <>
+              <button
+                className="btn-secondary"
+                onClick={() => loadDefaults.mutate()}
+                disabled={createBlocked || loadDefaults.isPending}
+                title="Bring back the built-in TRA / Unclosed / Closed scorecards if any is missing"
+              >
+                <RotateCcw size={14} className={loadDefaults.isPending ? 'animate-spin' : ''} />{' '}
+                {loadDefaults.isPending ? 'Loading…' : 'Load default forms'}
+              </button>
+              <button className="btn-primary" onClick={() => setCreateOpen(true)}>
+                <Plus size={14} /> New form
+              </button>
+            </>
           )
         }
       />
+      {defaultsNote && <div className="mb-3 rounded-md bg-brand-soft px-3 py-2 text-sm text-brand">{defaultsNote}</div>}
 
       {isLoading ? (
         <Loading />
       ) : isError || !data ? (
         <ErrorState message="Forms could not load." onRetry={() => void refetch()} />
       ) : data.forms.length === 0 ? (
-        <EmptyState title="No QA forms yet" hint="Create a form, add sections and questions, then publish it." />
+        <EmptyState
+          title="No QA forms yet"
+          hint="Press “Load default forms” for the built-in TRA / Unclosed / Closed scorecards, or create your own."
+        />
       ) : (
         <div className="card overflow-x-auto">
           <table className="w-full text-sm">

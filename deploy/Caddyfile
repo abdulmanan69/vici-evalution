@@ -1,0 +1,7 @@
+{$DOMAIN} {
+    encode gzip
+    # recordings stream through the API; never buffer them
+    reverse_proxy web:80 {
+        flush_interval -1
+    }
+}

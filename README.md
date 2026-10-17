@@ -1,92 +1,258 @@
 # VICIdial QA Platform
 
-Enterprise quality-assurance platform for VICIdial call centers: syncs real call
-logs and recordings from one or many dialer servers, tracks fronter→closer
-transfers (same-dialer and cross-dialer), and gives QA teams versioned
-scorecards, secure recording playback, and full admin/audit tooling — all
-multi-company with strict data isolation.
+**Call-quality review for VICIdial call centres — counts that match the dialer, recordings that appear the moment the dialer has them, and scorecards your reviewers actually finish.**
 
-## Stack
+Built for fronter → closer operations: every XFER a fronter makes is tracked to the closer who took it, filed as **Transfer → Unclosed → Closed**, matched to its recordings, and handed to QA with the lead's full record beside the audio. Multi-company, role-based, audited, and shipped as five Docker containers.
 
-| Piece | Technology |
+> Built and maintained by **Abdul Manan**.
+
+---
+
+## Contents
+
+1. [What you get](#what-you-get)
+2. [How it works](#how-it-works)
+3. [Install on a server (10 minutes)](#install-on-a-server-10-minutes)
+4. [Connect your VICIdial](#connect-your-vicidial)
+5. [Built-in QA forms](#built-in-qa-forms)
+6. [Day-to-day operations](#day-to-day-operations)
+7. [Configuration](#configuration)
+8. [Security](#security)
+9. [Troubleshooting](#troubleshooting)
+10. [Project layout & development](#project-layout--development)
+
+---
+
+## What you get
+
+### Queues that agree with the dialer
+| Queue | What lands here |
 |---|---|
-| API | Node.js 22, TypeScript, Fastify 5 |
-| Worker | BullMQ (Redis) — scheduled dialer sync + recording checks |
-| Database | PostgreSQL 16, Drizzle ORM, SQL migrations |
-| VICIdial sources | Non-Agent API + read-only MySQL (per dialer, configurable) |
-| Frontend | React 18, Vite, Tailwind, TanStack Query |
-| Packaging | Docker Compose (postgres, redis, api, worker, web) |
+| **Transfers** | every XFER a fronter dispositioned — built from VICIdial's own agent log, so the daily count equals the *Agent Status Detail* report to the call |
+| **Unclosed** | transfers whose closer leg ended in anything other than a sale |
+| **Closed** | every sale: on the transfer, on a later callback of the same lead, or straight into the closer group — equals the dialer's SALE count |
 
-## Quick start
+Counts are per **dialer day** (the dialer's time zone), with a header switch to show times in the reviewer's own zone. Verified day by day and agent by agent against VICIdial's reports.
+
+### Recordings, live
+- A call page shows **Call in progress → Being prepared on the dialer → playable**, refreshing itself every 8 seconds only while something can still change.
+- The platform knows how VICIdial names files, so a recording is found the moment the dialer writes it — before the dialer's own list even reports it.
+- Stale links heal themselves on play; a **Fetch from dialer** button forces an immediate re-check.
+- 0-second "disposition only" entries are recognised and the real conversation is played instead.
+- Every leg shows **who hung up** (customer / agent / handoff) and every disposition is a colour-coded pill.
+
+### QA that fits the workflow
+- **Three built-in scorecards** — TRA (fronter), Unclosed and Closed (closer) — plus a form builder with weights, critical/auto-fail questions, ratings, dropdowns and conditional questions. Every publish is an immutable version; old scores never change.
+- **Evaluation page**: recordings and the lead's full record on the left, the form on the right. Nothing to switch between.
+- **Daily tasks**: managers assign a dialer day's calls, per method, to a reviewer — all of them or a sample.
+- **Reviewer scoping**: limit a reviewer to specific methods/queues and to specific dialer agents.
+- **Reports**: evaluations spreadsheet with one column per question (CSV), QA performance by agent and by reviewer, agent activity straight from the dialer (live + archived days).
+
+### Enterprise basics
+Multi-company with strict data isolation · roles & permissions (super admin, company admin, QA manager, reviewer) · full audit log · encrypted dialer credentials · 7-day rolling retention that **keeps every evaluated call forever** · recordings only ever streamed through the authenticated API, never by public URL.
+
+---
+
+## How it works
+
+```
+                 ┌──────────────────────────── your VICIdial ────────────────────────────┐
+                 │  Non-Agent API   ·   read-only MySQL (vicidial_log, closer_log,       │
+                 │  (recordings,       agent_log, vicidial_list …)   ·   recording web   │
+                 │   agents, leads)                                       server (MP3)   │
+                 └───────▲──────────────────────────▲─────────────────────────▲──────────┘
+                         │ every 60 s                │                         │ HEAD/GET
+          ┌──────────────┴──────────────┐   ┌────────┴────────┐       ┌────────┴────────┐
+          │  worker  (BullMQ)           │   │  api  (Fastify) │◄──────┤  web  (nginx)   │◄── browser
+          │  sync · match · recordings  │   │  REST + auth +  │       │  React app +    │
+          │  retention · repair         │   │  recording proxy│       │  /api proxy     │
+          └──────────────┬──────────────┘   └────────┬────────┘       └─────────────────┘
+                         │                           │
+                 ┌───────▼───────────────────────────▼───────┐   ┌───────────┐
+                 │              PostgreSQL 16                 │   │   Redis   │
+                 └────────────────────────────────────────────┘   └───────────┘
+```
+
+**Sync** reads the dialer every minute: calls (outbound + closer-group), the agent log (the source of truth for XFER counts), recordings and the agent roster. Calls are re-read for 12 hours because VICIdial writes a row at call start and rewrites it on disposition.
+**Match** links each transfer to its closer leg by lead, phone and timing (auto ≥ 70, flagged 40–69 for a manager to resolve).
+**Recordings** are linked to calls by start/end time, verified on the dialer's final MP3, and repaired every minute until the retention window ends.
+
+More depth: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/VICIDIAL_INTEGRATION.md](docs/VICIDIAL_INTEGRATION.md)
+
+---
+
+## Install on a server (10 minutes)
+
+**Requirements:** a Linux server (Ubuntu 22.04/24.04 or Debian 12), 2 vCPU, 4 GB RAM, 40 GB disk, outbound access to your dialer. Docker is installed for you if missing.
+
+### Option A — HTTPS with your own domain (recommended)
+
+Point a DNS **A record** (e.g. `qa.example.com`) at the server, open ports **80** and **443**, then:
 
 ```bash
-cp .env.example .env
-# edit .env: set POSTGRES_PASSWORD, APP_ENCRYPTION_KEY (openssl rand -hex 32),
-# SUPERADMIN_EMAIL / SUPERADMIN_PASSWORD
-
-docker compose up -d --build
+git clone https://github.com/abdulmanan69/vici-evalution.git vici-qa
+cd vici-qa
+./deploy/install.sh qa.example.com
 ```
 
-Open http://localhost:3000 and sign in with the super-admin credentials from
-`.env`. Migrations and the seed run automatically when the API starts.
+Certificates are issued automatically (Let's Encrypt via Caddy) and renewed forever.
 
-Optional demo data: set `SEED_DEMO=true` before first boot to create a
-"Demo Company (MOCK DATA)" with synthetic, clearly flagged (`is_mock=true`)
-calls — mock rows are excluded from real queues, stats and sync.
-
-## Connecting your VICIdial servers
-
-1. Sign in as super admin → **Companies** → create the company.
-2. Pick the company in the top scope selector → **Dialer servers** → *Add dialer*:
-   - **Base URL** — the dialer web root (hosts `/vicidial/non_agent_api.php`).
-   - **API user/pass** — your existing VICIdial API user.
-   - **MySQL host/db/user/pass** — read-only (SELECT-only) access to the
-     `asterisk` database. This is the recommended call-log source; the
-     Non-Agent API has no full call-log export (see
-     [docs/VICIDIAL_INTEGRATION.md](docs/VICIDIAL_INTEGRATION.md)).
-   - **Server timezone** — the IANA zone the dialer logs in (VICIdial stores
-     local time); wrong timezone = wrongly linked calls.
-3. Press **Test connection** — both the API and MySQL checks must pass.
-4. **Dispositions** → map your codes explicitly: `XFER → Transfer`, each sale
-   code → `Sale`. Nothing is ever treated as a sale by its name alone.
-5. **Sync monitor** → *Sync all active dialers* (first run imports
-   `SYNC_HISTORICAL_DAYS` of history; the worker then polls every
-   `SYNC_POLL_SECONDS`).
-6. **Agents** → classify fronters/closers. **QA forms** → build and publish a
-   scorecard. Queues fill up under Transfers / Unclosed / Closed.
-
-## Development
+### Option B — plain HTTP on a port
 
 ```bash
-# backend (needs local postgres+redis, or: docker compose up -d postgres redis)
-cd server && npm install
-npm run migrate && npm run seed
-npm run dev          # API on :8080
-npm run dev:worker   # sync worker
-
-# frontend
-cd web && npm install
-npm run dev          # :3000, proxies /api to :8080
-
-# tests (46 unit tests: matching, scoring, dispositions, timezone, crypto)
-cd server && npm test
+git clone https://github.com/abdulmanan69/vici-evalution.git vici-qa
+cd vici-qa
+./deploy/install.sh
 ```
 
-## Repository layout
+The app is on `http://<server-ip>:3000` (change `WEB_PORT` in `.env`). Use this only inside a private network or behind your own reverse proxy.
+
+The installer writes `.env` with **random secrets**, builds and starts the five containers, waits for the API, and prints the super-admin login. Database migrations run automatically at every start. Re-running the installer is safe.
+
+### After the first login
+1. **Change the super-admin password** (top-right menu).
+2. **Companies** → create your company, then pick it in the scope selector.
+3. **Dialer servers** → add your dialer (next section) and press **Test connection**.
+4. **Dispositions** → map your codes (`XFER → Transfer`, each sale code → `Sale`).
+5. **Users** → invite managers and reviewers; **QA team** → assign agents and methods.
+6. Queues fill within a minute; the first sync imports the retention window.
+
+---
+
+## Connect your VICIdial
+
+You need two things from the dialer. Hand [DB-ACCESS-REQUEST.md](DB-ACCESS-REQUEST.md) to whoever administers it — it asks for exactly this, nothing more.
+
+**1. An API user** (user level 9 with API access) — used for recordings, agent lists and lead lookups.
+
+**2. A read-only MySQL user** on the `asterisk` database, reachable from this server:
+
+```sql
+CREATE USER 'qa_readonly'@'<this-server-ip>' IDENTIFIED BY '<strong password>';
+GRANT SELECT ON asterisk.* TO 'qa_readonly'@'<this-server-ip>';
+FLUSH PRIVILEGES;
+```
+
+The platform only ever runs `SELECT`s, mostly small time-bounded reads against indexed columns; the load on the dialer is negligible.
+
+In **Dialer servers → Add dialer** enter the web root (`https://your-dialer`), the API user, the MySQL host/database/user/password, the recording web server if it differs, and the **dialer's time zone** (e.g. `America/New_York`). The time zone matters: VICIdial stores local times, and every count here is per dialer day. The platform also reads the dialer's clock on every sync and warns if the configured zone disagrees.
+
+Press **Test connection**: both the API and the MySQL checks must pass.
+
+---
+
+## Built-in QA forms
+
+Every company starts with three published scorecards (identical closer forms by design):
+
+| Form | For | Queue | Pass mark |
+|---|---|---|---|
+| **TRA – Transfer Call (Fronter)** | fronters | Transfers | 66 % |
+| **Unclosed – Closer Call** | closers | Unclosed | 90 % |
+| **Closed – Closer Call** | closers | Closed | 90 % |
+
+They are ordinary forms: edit them, add questions, re-publish (each publish is a new version; past evaluations keep theirs). If one is archived or lost, **QA forms → Load default forms** brings back whatever is missing without touching the rest. The same happens automatically at every start and when a company is created. The definitions live in [`server/src/services/defaultForms.ts`](server/src/services/defaultForms.ts).
+
+---
+
+## Day-to-day operations
+
+| Task | Command |
+|---|---|
+| Update to the latest version | `./deploy/update.sh` |
+| Back up the database (keeps the newest 14) | `./deploy/backup.sh` |
+| Nightly backup | `crontab -e` → `15 2 * * * /opt/vici-qa/deploy/backup.sh >> /var/log/vici-qa-backup.log 2>&1` |
+| Restore a backup | `./deploy/restore.sh backups/vici-qa-20261018-021500.sql.gz` |
+| Status | `docker compose ps` |
+| Logs (API / worker) | `docker compose logs -f api` · `docker compose logs -f worker` |
+| Restart everything | `docker compose restart` |
+| Full re-sync of a dialer | **Dialer servers → Sync (full)** |
+
+**Retention.** Un-reviewed calls, transfers and recordings older than `RETENTION_DAYS` (default 7) are deleted nightly. Anything with an evaluation, or flagged, is kept forever — nothing a reviewer touched is ever lost. Recordings are never copied; they stay on the dialer and stream through the API on demand.
+
+**Health.** `GET /healthz` on the API (and through the web container) answers `200` when the database and Redis are reachable; `Dialer servers` shows the last sync, its duration and any warnings (time-zone mismatch, unmapped dispositions, archive access).
+
+---
+
+## Configuration
+
+All settings live in `.env` (template: [`.env.example`](.env.example)). The installer fills the secrets.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `NODE_ENV` | `production` | production refuses to start with the placeholder encryption key |
+| `WEB_PORT` / `WEB_BIND` | `3000` / `0.0.0.0` | where the app listens; `WEB_BIND=127.0.0.1` behind the HTTPS proxy |
+| `API_PORT` / `API_BIND` | `8080` / `127.0.0.1` | the API; the web container reaches it internally |
+| `DOMAIN` | *(empty)* | enables the HTTPS overlay (`docker-compose.https.yml`) |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | — | database credentials (Postgres is bound to localhost only) |
+| `APP_ENCRYPTION_KEY` | — | 32-byte hex key that encrypts dialer credentials at rest |
+| `SESSION_TTL_HOURS` | `12` | login session length |
+| `COOKIE_SECURE` | `false` | `true` behind HTTPS |
+| `SUPERADMIN_EMAIL` / `SUPERADMIN_PASSWORD` | — | bootstrap account, created on first start |
+| `RETENTION_DAYS` | `7` | rolling window for un-reviewed data (0 = keep everything) |
+| `SYNC_POLL_SECONDS` | `60` | how often each dialer syncs |
+| `SYNC_LOOKBACK_MINUTES` | `15` | overlap re-read on every incremental sync |
+| `SYNC_HISTORICAL_DAYS` | `30` | history imported on a full sync (capped by retention) |
+| `RECORDING_CHECK_SECONDS` | `60` | recording repair job cadence |
+| `MATCH_AUTO_THRESHOLD` / `MATCH_FLAG_THRESHOLD` | `70` / `40` | fronter→closer match scores for auto-link and manual review |
+| `SEED_DEMO` | `false` | creates a clearly flagged demo company with synthetic data |
+
+---
+
+## Security
+
+- Dialer passwords are encrypted with `APP_ENCRYPTION_KEY` and never returned by the API.
+- Recordings are streamed only through `/api/v1/recordings/:id/stream`, behind login, permission and company checks; the dialer's URLs are never exposed to the browser.
+- Postgres and the API are bound to `127.0.0.1`; only the web port (or Caddy's 80/443) faces the network.
+- Every change — users, roles, forms, dispositions, dialer settings, evaluations, playback — is written to the audit log.
+- Sessions are HTTP-only cookies; set `COOKIE_SECURE=true` under HTTPS (the installer does when a domain is given).
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `port is already allocated` on start | another service owns `WEB_PORT`; change it in `.env` and `docker compose up -d` |
+| **Test connection** fails on MySQL | the dialer's firewall/`bind-address` or the user's host (`'qa_readonly'@'<this-server-ip>'`) — ask the dialer admin to allow this server's public IP |
+| A transfer shows *Closer leg not found* | the dialer has no closer-side call for it (dropped in queue, outside number, or XFER saved without a transfer) — the page says so after 30 min |
+| A recording says *Being prepared on the dialer* for long | the dialer converts files 1–3 min after hangup; press **Fetch from dialer**; if it stays, the dialer never produced the file (the dialer's own lead page will show the same) |
+| Counts differ from the dialer by a few | check the dialer **time zone** on the dialer server page and the **Dispositions** mapping — every XFER code must map to *Transfer*, every sale code to *Sale* |
+| `502` right after a restart | nginx is waiting for the API; it re-resolves within 10 s |
+| Lost the super-admin password | it is in `.env` as `SUPERADMIN_PASSWORD` at install time; otherwise reset it from **Users** with another admin |
+
+---
+
+## Project layout & development
 
 ```
+deploy/                  install.sh · update.sh · backup.sh · restore.sh · Caddyfile
 docker-compose.yml       postgres + redis + api + worker + web
+docker-compose.https.yml Caddy overlay for automatic HTTPS
 server/
-  drizzle/               generated SQL migrations
-  src/db/                schema, migrator, seed
-  src/auth/              sessions, RBAC permissions, company scoping
-  src/routes/            REST API (auth, queues, recordings, QA, admin…)
-  src/vicidial/          API/MySQL adapters, timezone, matcher, queue logic, sync
-  src/services/          QA form schema + scoring engine
-  src/worker.ts          BullMQ schedulers/processors
-web/src/                 React app (queues, call detail, form builder, admin)
-docs/                    architecture + VICIdial integration notes
+  drizzle/               SQL migrations (applied automatically at start)
+  src/db/                schema, migrator, seed (roles, super admin, default forms)
+  src/auth/              sessions, permissions, company scoping
+  src/routes/            REST API (queues, recordings, QA forms, tasks, reports, admin…)
+  src/services/          default forms · form schema & scoring · live recordings
+  src/vicidial/          API + MySQL adapters, sync, matcher, recording URL repair
+  src/worker.ts          BullMQ schedulers (sync, recording repair, retention)
+web/src/                 React app (queues, call pages, evaluation, forms, reports, admin)
+docs/                    architecture and VICIdial integration notes
 ```
 
-More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) ·
-[docs/VICIDIAL_INTEGRATION.md](docs/VICIDIAL_INTEGRATION.md)
+Local development:
+
+```bash
+docker compose up -d postgres redis
+cd server && npm install && npm run migrate && npm run seed
+npm run dev            # API on :8080
+npm run dev:worker     # sync worker
+cd ../web && npm install && npm run dev   # :3000, proxies /api to :8080
+
+cd server && npm test  # unit tests: matching, scoring, dispositions, time zones, recording URLs
+```
+
+---
+
+© 2026 Abdul Manan. All rights reserved.

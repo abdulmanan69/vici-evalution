@@ -10,3 +10,6 @@ coverage/
 *.png
 *.yml.snapshot
 login-snap.md
+
+# server-side database dumps (deploy/backup.sh)
+backups/

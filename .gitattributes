@@ -1,0 +1,6 @@
+# shell scripts and container configs must stay LF for Linux servers
+*.sh            text eol=lf
+deploy/**       text eol=lf
+Dockerfile      text eol=lf
+*.yml           text eol=lf
+*.conf          text eol=lf

@@ -8,6 +8,7 @@ import { companyScope, requiredCompanyScope, requirePermission } from '../auth/p
 import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
 import { formDefinitionSchema, formMaxScore } from '../services/formSchema.js';
+import { ensureDefaultForms } from '../services/ensureDefaultForms.js';
 
 const formMetaSchema = z.object({
   companyId: z.string().uuid().optional(),
@@ -38,6 +39,16 @@ export async function qaFormRoutes(app: FastifyInstance): Promise<void> {
       .where(where.length ? and(...where) : undefined)
       .orderBy(desc(qaForms.updatedAt));
     return { forms: rows };
+  });
+
+  // Built-in scorecards (TRA / Unclosed / Closed): loads any the company is
+  // missing — e.g. after one was archived — without touching existing forms.
+  app.post('/load-defaults', { preHandler: [requirePermission('qa.forms.manage')] }, async (req) => {
+    const body = z.object({ companyId: z.string().uuid().optional() }).parse(req.body ?? {});
+    const companyId = requiredCompanyScope(req, body.companyId);
+    const result = await ensureDefaultForms(companyId, req.auth.userId);
+    await audit(req, { action: 'qa_form.load_defaults', entityType: 'qa_form', entityId: companyId, after: result, companyId });
+    return result;
   });
 
   // the builder is a manager tool — reviewers get the form schema through
