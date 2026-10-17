@@ -457,7 +457,7 @@ function TaskTable({ isManager, refreshKey }: { isManager: boolean; refreshKey: 
                           <Play size={12} /> Start
                         </button>
                       ) : (
-                        <Link to={`/transfers/${r.task.transferId}`} className="font-medium text-brand hover:underline">
+                        <Link to={`/transfers/${r.task.transferId}${r.task.queue ? `?from=${r.task.queue}` : ''}`} className="font-medium text-brand hover:underline">
                           Open call
                         </Link>
                       )}

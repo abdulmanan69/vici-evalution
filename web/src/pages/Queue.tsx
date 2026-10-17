@@ -204,7 +204,7 @@ export function QueuePage() {
                   </td>
                   <td className="td text-ink-2">{row.dialerName}</td>
                   <td className="td">
-                    <Link to={`/transfers/${row.transfer.id}`} className="font-medium text-brand hover:underline">
+                    <Link to={`/transfers/${row.transfer.id}?from=${status}`} className="font-medium text-brand hover:underline">
                       Open
                     </Link>
                   </td>

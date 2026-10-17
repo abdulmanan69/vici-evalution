@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { ClipboardPlus, GitMerge, Radio, RefreshCw } from 'lucide-react';
 import { api } from '../api/client';
@@ -221,6 +221,12 @@ function LeadRecordings({ items }: { items: RecordingItem[] }) {
 
 export function TransferDetailPage() {
   const { id = '' } = useParams();
+  // the queue the reviewer came from decides which method is recommended:
+  // Transfers reviews the fronter (TRA), Unclosed / Closed review the closer
+  const [search] = useSearchParams();
+  const fromParam = search.get('from');
+  const from: 'transfer' | 'unclosed' | 'closed' | null =
+    fromParam === 'transfer' || fromParam === 'unclosed' || fromParam === 'closed' ? fromParam : null;
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { hasPerm } = useAuth();
@@ -250,9 +256,20 @@ export function TransferDetailPage() {
     enabled: resolveOpen,
   });
 
+  // a fronter form evaluates the fronter leg, a closer form the closer leg
+  const legForForm = (f: QaForm) => {
+    const fronter = data?.fronterCall ?? null;
+    const closer = data?.saleCall ?? data?.closerCall ?? null;
+    return f.queue === 'transfer' || f.target === 'fronter' ? (fronter ?? closer) : (closer ?? fronter);
+  };
   const startEval = useMutation({
-    mutationFn: (formId: string) =>
-      api<{ evaluation: Evaluation }>('/evaluations', { method: 'POST', body: { transferId: id, formId } }),
+    mutationFn: (f: QaForm) => {
+      const leg = legForForm(f) as (Call & { viciAgentId?: string | null }) | null;
+      return api<{ evaluation: Evaluation }>('/evaluations', {
+        method: 'POST',
+        body: { transferId: id, formId: f.id, callId: leg?.id, targetAgentId: leg?.viciAgentId ?? undefined },
+      });
+    },
     onSuccess: (res) => navigate(`/qa/evaluations/${res.evaluation.id}`),
   });
 
@@ -287,6 +304,22 @@ export function TransferDetailPage() {
   // honest answer is that the dialer has no closer leg for this transfer
   const minutesSinceXfer = (Date.now() - new Date(t.xferTime).getTime()) / 60_000;
   const pendingMatch = !data.closerCall && t.matchStatus === 'pending_match' && minutesSinceXfer < 30;
+  // forms that fit this call: any-queue forms, the fronter form when there is
+  // a fronter leg, the closer form of the call's current status, and whatever
+  // the queue you came from uses — that one is listed first
+  const hasFronter = !!data.fronterCall;
+  const hasCloser = !!data.closerCall || !!data.saleCall;
+  const fitsCall = (f: QaForm) =>
+    !f.queue ||
+    f.queue === from ||
+    (f.queue === 'transfer' && hasFronter) ||
+    ((f.queue === 'unclosed' || f.queue === 'closed') && hasCloser && f.queue === t.queueStatus);
+  const recommended = (f: QaForm) => (from ? f.queue === from : f.queue === t.queueStatus);
+  const formChoices = (formsData?.forms ?? [])
+    .filter(fitsCall)
+    .sort((a, b) => Number(recommended(b)) - Number(recommended(a)));
+  const reviews = (f: QaForm) =>
+    f.queue === 'transfer' || f.target === 'fronter' ? 'reviews the fronter' : f.queue ? 'reviews the closer' : 'any leg';
   const noCloser = !data.closerCall && !pendingMatch && t.kind === 'transfer';
 
   return (
@@ -438,26 +471,29 @@ export function TransferDetailPage() {
       </div>
 
       <Modal title="Start evaluation" open={evalModal} onClose={() => setEvalModal(false)}>
-        <p className="mb-3 text-sm text-ink-2">Choose a published QA form for this call.</p>
+        <p className="mb-3 text-sm text-ink-2">
+          {from
+            ? `You opened this call from the ${from === 'transfer' ? 'Transfers' : from === 'unclosed' ? 'Unclosed' : 'Closed'} queue — its method is first.`
+            : 'Choose a published QA form for this call.'}
+        </p>
         <div className="space-y-2">
-          {formsData?.forms.filter((f) => !f.queue || f.queue === t.queueStatus).map((f) => (
+          {formChoices.map((f) => (
             <button
               key={f.id}
-              className="card flex w-full items-center justify-between p-3 text-left hover:bg-bg"
-              onClick={() => startEval.mutate(f.id)}
+              className={`card flex w-full items-center justify-between p-3 text-left hover:bg-bg ${recommended(f) ? 'border border-brand/40' : ''}`}
+              onClick={() => startEval.mutate(f)}
               disabled={startEval.isPending}
             >
               <span>
                 <span className="font-medium">{f.name}</span>
-                <span className="ml-2 text-2xs text-ink-3">v{f.currentVersion} · {f.target}</span>
+                <span className="ml-2 text-2xs text-ink-3">v{f.currentVersion} · {reviews(f)}</span>
+                {recommended(f) && <span className="chip ml-2 bg-brand-soft text-brand">recommended</span>}
               </span>
               <span className="text-brand">Use →</span>
             </button>
           ))}
-          {formsData && formsData.forms.filter((f) => !f.queue || f.queue === t.queueStatus).length === 0 && (
-            <p className="text-sm text-ink-2">
-              No evaluation method for this queue is available to you.
-            </p>
+          {formsData && formChoices.length === 0 && (
+            <p className="text-sm text-ink-2">No evaluation method for this call is available to you.</p>
           )}
         </div>
       </Modal>
