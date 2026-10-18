@@ -1,4 +1,5 @@
 import { useState, type FormEvent } from 'react';
+import { DevCredit } from '../components/DevCredit';
 import { Navigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 import { ApiError } from '../api/client';
@@ -71,6 +72,7 @@ export function LoginPage() {
             {busy ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
+        <DevCredit className="mt-4 justify-center" />
       </div>
     </div>
   );

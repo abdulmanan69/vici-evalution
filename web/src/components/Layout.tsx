@@ -26,6 +26,7 @@ import {
 import { useAuth } from '../auth/AuthContext';
 import { api } from '../api/client';
 import { configureTimeZones } from './ui';
+import { DevCredit } from './DevCredit';
 import type { Company } from '../api/types';
 
 /** Super admins can pin the whole console to one company; everyone else is already scoped. */
@@ -231,6 +232,10 @@ export function Layout({ children }: { children: ReactNode }) {
           <main key={timeMode} className="mx-auto max-w-[1400px] px-6 py-6">
             {children}
           </main>
+          <footer className="mx-auto flex max-w-[1400px] items-center justify-between px-6 pb-6 pt-2">
+            <span className="text-2xs text-ink-3">VICIdial QA Platform</span>
+            <DevCredit />
+          </footer>
         </div>
       </div>
     </CompanyScopeContext.Provider>
