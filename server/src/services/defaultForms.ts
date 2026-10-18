@@ -661,7 +661,7 @@ export const DEFAULT_FORMS: DefaultForm[] = [
             {
               "id": "callback_date_field",
               "text": "Callback Date",
-              "type": "text",
+              "type": "date",
               "weight": 0,
               "critical": false,
               "helpText": "Optional - YYYY-MM-DD",
@@ -1047,7 +1047,7 @@ export const DEFAULT_FORMS: DefaultForm[] = [
             {
               "id": "callback_date_field",
               "text": "Callback Date",
-              "type": "text",
+              "type": "date",
               "weight": 0,
               "critical": false,
               "helpText": "Optional - YYYY-MM-DD",

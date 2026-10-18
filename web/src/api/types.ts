@@ -150,7 +150,7 @@ export interface QaForm {
 export interface FormQuestion {
   id: string;
   text: string;
-  type: 'yes_no' | 'pass_fail' | 'rating' | 'dropdown' | 'text' | 'number';
+  type: 'yes_no' | 'pass_fail' | 'rating' | 'dropdown' | 'text' | 'number' | 'date';
   weight: number;
   required: boolean;
   critical: boolean;

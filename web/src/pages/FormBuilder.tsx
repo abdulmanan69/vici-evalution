@@ -16,6 +16,7 @@ const QUESTION_TYPES: { value: FormQuestion['type']; label: string }[] = [
   { value: 'rating', label: 'Rating scale' },
   { value: 'dropdown', label: 'Dropdown' },
   { value: 'text', label: 'Text (unscored)' },
+  { value: 'date', label: 'Date (calendar picker, unscored)' },
   { value: 'number', label: 'Number (unscored)' },
 ];
 
@@ -42,7 +43,7 @@ function QuestionEditor({
   onMove: (dir: -1 | 1) => void;
   readOnly: boolean;
 }) {
-  const scorable = q.type !== 'text' && q.type !== 'number';
+  const scorable = q.type !== 'text' && q.type !== 'number' && q.type !== 'date';
   return (
     <div className="rounded-md border border-ink/10 bg-bg/50 p-3">
       <div className="flex items-start gap-2">
@@ -308,7 +309,7 @@ export function FormBuilderPage() {
 
   const totalWeight = def.sections
     .flatMap((s) => s.questions)
-    .filter((q) => q.type !== 'text' && q.type !== 'number')
+    .filter((q) => q.type !== 'text' && q.type !== 'number' && q.type !== 'date')
     .reduce((sum, q) => sum + q.weight, 0);
   const allQuestions = def.sections.flatMap((s) => s.questions);
 

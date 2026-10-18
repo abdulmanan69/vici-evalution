@@ -86,6 +86,7 @@ export function scoreEvaluation(
         }
         break;
       }
+      case 'date':
       case 'text':
       case 'number':
         // informational — never scored

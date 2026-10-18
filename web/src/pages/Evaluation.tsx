@@ -214,6 +214,16 @@ function AnswerControl({
           disabled={disabled}
         />
       );
+    case 'date':
+      return (
+        <input
+          type="date"
+          className="input max-w-[12rem]"
+          value={value == null ? '' : String(value)}
+          onChange={(e) => onChange(e.target.value || null)}
+          disabled={disabled}
+        />
+      );
     case 'text':
     default:
       return (

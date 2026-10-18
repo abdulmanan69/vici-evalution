@@ -6,7 +6,7 @@ import { z } from 'zod';
  * keep the exact rules they were scored with.
  */
 
-export const questionTypeEnum = z.enum(['yes_no', 'pass_fail', 'rating', 'dropdown', 'text', 'number']);
+export const questionTypeEnum = z.enum(['yes_no', 'pass_fail', 'rating', 'dropdown', 'text', 'number', 'date']);
 
 export const dropdownOptionSchema = z.object({
   value: z.string().min(1).max(100),
@@ -98,6 +98,6 @@ export function allQuestions(form: FormDefinition): Question[] {
 /** Maximum achievable points of a form (all scorable questions visible). */
 export function formMaxScore(form: FormDefinition): number {
   return allQuestions(form)
-    .filter((q) => q.type !== 'text' && q.type !== 'number')
+    .filter((q) => q.type !== 'text' && q.type !== 'number' && q.type !== 'date')
     .reduce((sum, q) => sum + q.weight, 0);
 }
