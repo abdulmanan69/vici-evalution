@@ -110,7 +110,12 @@ function AssignPanel({ onAssigned }: { onAssigned: () => void }) {
 
   const preview = useQuery({
     queryKey: ['task-preview', body],
-    queryFn: () => api<{ available: number; willAssign: number }>('/qa/tasks/preview', { method: 'POST', body }),
+    queryFn: () =>
+      api<{
+        available: number;
+        willAssign: number;
+        breakdown?: { inMethod: number; inTask: number; outsideAgents: number; evaluated: number; agentScoped: boolean };
+      }>('/qa/tasks/preview', { method: 'POST', body }),
     enabled: !!reviewerId && !!date && (mode === 'all' || limit > 0),
     retry: false,
   });
@@ -204,6 +209,15 @@ function AssignPanel({ onAssigned }: { onAssigned: () => void }) {
               <strong className="tabular-nums">{preview.data.available}</strong> unassigned call
               {preview.data.available === 1 ? '' : 's'} match ·{' '}
               <strong className="tabular-nums">{preview.data.willAssign}</strong> will be assigned
+              {preview.data.breakdown && preview.data.breakdown.inMethod > preview.data.available && (
+                <span className="ml-2 text-2xs text-ink-3">
+                  {preview.data.breakdown.inMethod} {METHOD_LABEL[queue]} calls that day
+                  {preview.data.breakdown.inTask > 0 && ` · ${preview.data.breakdown.inTask} already in a ${METHOD_LABEL[queue]} task`}
+                  {preview.data.breakdown.outsideAgents > 0 &&
+                    ` · ${preview.data.breakdown.outsideAgents} outside this reviewer's agents (QA team)`}
+                  {preview.data.breakdown.evaluated > 0 && ` · ${preview.data.breakdown.evaluated} already evaluated`}
+                </span>
+              )}
             </>
           ) : null}
         </span>

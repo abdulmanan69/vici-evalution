@@ -37,40 +37,60 @@ async function companyTimezone(companyId: string): Promise<string> {
   return d?.timezone ?? 'UTC';
 }
 
-/**
- * Calls a reviewer could be given for one dialer day and method: that day's
- * transfers in the queue (every transfer for 'transfer'), inside the
- * reviewer's agent coverage, not already someone's active task, and — by
- * default — not already evaluated with this method.
- */
-function candidateWhere(opts: {
+interface CandidateOpts {
   companyId: string;
   reviewer: AuthContext;
   queue: QueueName;
   start: Date;
   end: Date;
   skipEvaluated: boolean;
-}): SQL {
+}
+
+/**
+ * The method's calls for one dialer day:
+ *  - Transfer: every fronter XFER (sale-only entries have no fronter);
+ *  - Unclosed: every XFER that is not a sale — reached a closer without a
+ *    sale, or no closer leg was found. Only calls whose closer may still be
+ *    on the line right now are left out;
+ *  - Closed: every sale (transfer, callback and inbound).
+ */
+function methodPool(opts: CandidateOpts): SQL {
   const parts: SQL[] = [
     sql`transfers.company_id = ${opts.companyId}`,
     sql`transfers.is_mock = false`,
     sql`coalesce(transfers.counted_at, transfers.xfer_time) >= ${opts.start}`,
     sql`coalesce(transfers.counted_at, transfers.xfer_time) <= ${opts.end}`,
-    sql`not exists (select 1 from qa_assignments x
-                     where x.transfer_id = transfers.id and x.status in ('open', 'in_progress'))`,
   ];
-  if (opts.queue !== 'transfer') parts.push(sql`transfers.queue_status = ${opts.queue}`);
-  // the Transfer method reviews fronter calls; sale-only entries have none
-  else parts.push(sql`transfers.kind = 'transfer'`);
+  if (opts.queue === 'transfer') parts.push(sql`transfers.kind = 'transfer'`);
+  else if (opts.queue === 'unclosed') {
+    parts.push(sql`transfers.kind = 'transfer'`);
+    parts.push(sql`transfers.queue_status <> 'closed'`);
+    parts.push(sql`not (transfers.queue_status = 'transfer' and transfers.match_status = 'pending_match')`);
+  } else parts.push(sql`transfers.queue_status = 'closed'`);
+  return sql.join(parts, sql` and `);
+}
+
+/** already in an unfinished task of the same method (another method's task does not count) */
+const inActiveTask = (queue: QueueName) => sql`exists (select 1 from qa_assignments x
+   where x.transfer_id = transfers.id and x.status in ('open', 'in_progress')
+     and (x.queue = ${queue} or x.queue is null))`;
+
+const evaluatedWith = (queue: QueueName) => sql`exists (
+  select 1 from evaluations e
+    join qa_form_versions v on v.id = e.form_version_id
+    join qa_forms f on f.id = v.form_id
+   where e.transfer_id = transfers.id and e.status = 'completed'
+     and (f.queue = ${queue} or f.queue is null))`;
+
+/**
+ * Calls a reviewer could be given for one dialer day and method: the
+ * method's pool, inside the reviewer's agent coverage, not already in a task
+ * of this method, and — by default — not already evaluated with it.
+ */
+function candidateWhere(opts: CandidateOpts): SQL {
+  const parts: SQL[] = [methodPool(opts), sql`not ${inActiveTask(opts.queue)}`];
   if (isAgentScoped(opts.reviewer)) parts.push(agentScopeCondition(opts.reviewer, opts.queue));
-  if (opts.skipEvaluated) {
-    parts.push(sql`not exists (
-      select 1 from evaluations e
-        join qa_form_versions v on v.id = e.form_version_id
-        join qa_forms f on f.id = v.form_id
-       where e.transfer_id = transfers.id and e.status = 'completed'
-         and (f.queue = ${opts.queue} or f.queue is null))`);
-  }
+  if (opts.skipEvaluated) parts.push(sql`not ${evaluatedWith(opts.queue)}`);
   return sql.join(parts, sql` and `);
 }
 
@@ -93,14 +113,30 @@ async function resolveAssignContext(req: FastifyRequest, body: z.infer<typeof as
 }
 
 export async function taskRoutes(app: FastifyInstance): Promise<void> {
-  /** How many calls an assignment would pick up, before committing it. */
+  /**
+   * How many calls an assignment would pick up, before committing it — and
+   * why the rest of the day's calls in this method are not available.
+   */
   app.post('/preview', { preHandler: [requirePermission('qa.assign')] }, async (req) => {
     const body = assignBody.parse(req.body);
     const ctx = await resolveAssignContext(req, body);
-    const where = candidateWhere({ ...ctx, queue: body.queue, skipEvaluated: body.skipEvaluated, companyId: ctx.companyId });
-    const result = await db.execute(sql`select count(*)::int as n from transfers where ${where}`);
-    const available = (result.rows[0] as { n: number }).n;
-    return { available, willAssign: body.limit ? Math.min(body.limit, available) : available };
+    const opts: CandidateOpts = { ...ctx, queue: body.queue, skipEvaluated: body.skipEvaluated, companyId: ctx.companyId };
+    const scoped = isAgentScoped(ctx.reviewer);
+    const inScope = scoped ? agentScopeCondition(ctx.reviewer, body.queue) : sql`true`;
+    const result = await db.execute(sql`
+      select count(*)::int as "inMethod",
+             count(*) filter (where ${inActiveTask(body.queue)})::int as "inTask",
+             count(*) filter (where not ${inActiveTask(body.queue)} and not (${inScope}))::int as "outsideAgents",
+             count(*) filter (where not ${inActiveTask(body.queue)} and (${inScope})
+                               and ${body.skipEvaluated ? evaluatedWith(body.queue) : sql`false`})::int as "evaluated"
+        from transfers where ${methodPool(opts)}`);
+    const counts = result.rows[0] as { inMethod: number; inTask: number; outsideAgents: number; evaluated: number };
+    const available = Math.max(0, counts.inMethod - counts.inTask - counts.outsideAgents - counts.evaluated);
+    return {
+      available,
+      willAssign: body.limit ? Math.min(body.limit, available) : available,
+      breakdown: { ...counts, agentScoped: scoped },
+    };
   });
 
   app.post('/assign', { preHandler: [requirePermission('qa.assign')] }, async (req, reply) => {
@@ -119,8 +155,8 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
        where ${where}
        order by ${orderBy}
        ${limit}
-      on conflict (transfer_id, assigned_to) do update
-        set status = 'open', task_date = excluded.task_date, queue = excluded.queue,
+      on conflict (transfer_id, assigned_to, queue) do update
+        set status = 'open', task_date = excluded.task_date,
             due_at = excluded.due_at, assigned_by = excluded.assigned_by,
             completed_at = null, updated_at = now()
       returning id`);

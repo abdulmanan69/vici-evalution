@@ -5,6 +5,9 @@ x-logging: &logging
   options: { max-size: "20m", max-file: "5" }
 
 x-app-env: &app-env
+  # the API always listens on 8080 inside its container; API_PORT in .env
+  # only picks the host port it is published on
+  API_PORT: "8080"
   DATABASE_URL: postgres://${POSTGRES_USER:-vici_qa}:${POSTGRES_PASSWORD:-change-me-strong-password}@postgres:5432/${POSTGRES_DB:-vici_qa}
   REDIS_URL: redis://redis:6379
 

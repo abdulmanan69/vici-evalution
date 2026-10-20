@@ -5,6 +5,14 @@ import { and, count, desc, eq, gte, inArray, lte, or, sql, type SQL } from 'driz
 import { db } from '../db/client.js';
 import { calls, dialerServers, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
 import { isFinalMp3 } from '../vicidial/recordingUrl.js';
+
+type Method = 'transfer' | 'unclosed' | 'closed';
+
+/** The task method a form evaluates: its queue, else fronter forms → Transfer, others → the call's status. */
+function formMethod(form: { queue: Method | null; target: string }, callStatus: Method): Method {
+  if (form.queue) return form.queue;
+  return form.target === 'fronter' ? 'transfer' : callStatus;
+}
 import { localToUtc } from '../vicidial/timezone.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
@@ -317,10 +325,13 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
         answers: {},
       })
       .returning();
-    // starting the evaluation starts the reviewer's task for this call
+    // starting the evaluation starts the reviewer's task for this call and
+    // method — a TRA evaluation does not touch the call's Unclosed task
+    const method = formMethod(form, transfer.queueStatus);
     await db.execute(sql`
       update qa_assignments set status = 'in_progress', updated_at = now()
-       where transfer_id = ${transfer.id} and assigned_to = ${req.auth.userId} and status = 'open'`);
+       where transfer_id = ${transfer.id} and assigned_to = ${req.auth.userId} and status = 'open'
+         and (queue = ${method} or queue is null)`);
     await audit(req, { action: 'evaluation.create', entityType: 'evaluation', entityId: row.id, companyId: transfer.companyId });
     return reply.status(201).send({ evaluation: row });
   });
@@ -388,12 +399,19 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       })
       .where(eq(evaluations.id, id))
       .returning();
-    // the reviewer's task for this call is done
+    // the reviewer's task for this call and method is done
     if (evalRow.transferId) {
+      const [meta] = await db
+        .select({ queue: qaForms.queue, target: qaForms.target, queueStatus: transfers.queueStatus })
+        .from(qaForms)
+        .innerJoin(transfers, eq(transfers.id, evalRow.transferId))
+        .where(eq(qaForms.id, version.formId));
+      const method = meta ? formMethod(meta, meta.queueStatus) : null;
       await db.execute(sql`
         update qa_assignments set status = 'done', completed_at = now(), updated_at = now()
          where transfer_id = ${evalRow.transferId} and assigned_to = ${evalRow.reviewerId}
-           and status in ('open', 'in_progress')`);
+           and status in ('open', 'in_progress')
+           and (${method}::queue_status is null or queue = ${method} or queue is null)`);
     }
     await audit(req, {
       action: 'evaluation.complete',

@@ -561,7 +561,9 @@ export const qaAssignments = pgTable(
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    uniqueIndex('qa_assignments_transfer_user_uq').on(t.transferId, t.assignedTo),
+    // one task per call, reviewer and method: the same XFER can be a Transfer
+    // task (fronter review) and an Unclosed/Closed task (closer review)
+    uniqueIndex('qa_assignments_transfer_user_queue_uq').on(t.transferId, t.assignedTo, t.queue),
     index('qa_assignments_assignee_idx').on(t.assignedTo, t.status),
     index('qa_assignments_company_date_idx').on(t.companyId, t.taskDate),
   ],

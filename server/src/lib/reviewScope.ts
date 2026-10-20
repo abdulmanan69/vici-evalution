@@ -12,18 +12,24 @@ export function isAgentScoped(auth: AuthContext): boolean {
 }
 
 /**
- * SQL condition: the transfer's evaluated leg belongs to one of the
- * reviewer's agents with this method — fronter leg for 'transfer', closer
- * leg for 'unclosed' and 'closed'.
+ * SQL condition: one of the reviewer's agents with this method is on the
+ * call. Transfer reviews the fronter, so it is the fronter leg; Unclosed and
+ * Closed review the outcome, so any leg counts — a reviewer given fronters
+ * with the Unclosed method gets those fronters' unclosed calls, one given
+ * closers gets the closers' (before, only the closer leg was checked, so the
+ * first case came up nearly empty).
  */
 export function agentScopeCondition(auth: AuthContext, queue: QueueName): SQL {
-  const leg = queue === 'transfer' ? transfers.fronterCallId : transfers.closerCallId;
+  const legs =
+    queue === 'transfer'
+      ? sql`c.id = ${transfers.fronterCallId}`
+      : sql`c.id in (${transfers.fronterCallId}, ${transfers.closerCallId}, ${transfers.saleCallId})`;
   return sql`exists (
     select 1
       from reviewer_agent_assignments a
       join calls c on c.vici_agent_id = a.vici_agent_id
      where a.reviewer_user_id = ${auth.userId}
-       and c.id = ${leg}
+       and ${legs}
        and a.methods @> ${JSON.stringify([queue])}::jsonb
   )`;
 }
