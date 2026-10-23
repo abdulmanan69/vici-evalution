@@ -1,14 +1,15 @@
 import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { CheckCircle2, RefreshCw, Save } from 'lucide-react';
+import { CheckCircle2, Clock, Lock, RefreshCw, Save } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
 import { fetchNote, useFetchRecordings, useLiveRecordings, type Leg, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
 import { LeadCard, type LeadInfo } from '../components/LeadCard';
-import { Chip, ErrorState, Loading, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
+import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
+import { scoreEvaluation, type LiveScore } from '../lib/scoring';
 
 const LEG_STYLE: Record<RecordingItem['leg'], { label: string; cls: string }> = {
   fronter: { label: 'Fronter', cls: 'bg-info-soft text-info' },
@@ -120,6 +121,12 @@ interface Detail {
   } | null;
   /** snapshot for the first paint; the live query takes over from there */
   recordings: RecordingItem[];
+  /** manager setting: how long a completed evaluation stays editable */
+  editWindowMinutes: number;
+  /** when a completed evaluation locks; null for drafts */
+  editableUntil: string | null;
+  /** this user may change it right now (draft, or completed and inside the window) */
+  canEdit: boolean;
 }
 
 type Answers = Record<string, string | number | boolean | null>;
@@ -127,6 +134,89 @@ type Answers = Record<string, string | number | boolean | null>;
 function isVisible(q: FormQuestion, answers: Answers): boolean {
   if (!q.visibleIf) return true;
   return String(answers[q.visibleIf.questionId]) === String(q.visibleIf.equals);
+}
+
+function fmtRemaining(ms: number): string {
+  if (ms <= 0) return 'now';
+  const m = Math.ceil(ms / 60_000);
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  if (h < 48) return rest ? `${h} h ${rest} min` : `${h} h`;
+  return `${Math.round(h / 24)} days`;
+}
+
+function fmtWindow(minutes: number): string {
+  if (minutes < 60) return `${minutes} minutes`;
+  const h = minutes / 60;
+  return Number.isInteger(h) ? `${h} hour${h === 1 ? '' : 's'}` : `${h.toFixed(1)} hours`;
+}
+
+/**
+ * The score as it stands, recomputed on every answer with the same engine the
+ * server uses on completion. Pinned so it stays in view while scrolling the
+ * form; 0 % until the first scored question is answered.
+ */
+function LiveScoreBar({ live, passThreshold, final }: { live: LiveScore; passThreshold: number; final: boolean }) {
+  const nothing = live.answered === 0 && !live.autoFailed;
+  const allAnswered = live.scorable > 0 && live.answered >= live.scorable && live.missingRequired.length === 0;
+  const passing = !live.autoFailed && live.rawPercent >= passThreshold;
+  const tone = nothing ? 'neutral' : passing ? 'good' : 'bad';
+  const label = live.autoFailed
+    ? 'Automatic failure — a critical question failed'
+    : nothing
+      ? 'Not scored yet — the score builds up as you answer'
+      : allAnswered || final
+        ? passing
+          ? 'Passing'
+          : 'Below the pass mark'
+        : passing
+          ? 'On track to pass'
+          : 'Below the pass mark so far';
+  const cls = {
+    neutral: { text: 'text-ink-2', bar: 'bg-ink/30' },
+    good: { text: 'text-good', bar: 'bg-good' },
+    bad: { text: 'text-bad', bar: 'bg-bad' },
+  }[tone];
+  const width = Math.min(100, live.percent);
+  return (
+    <div className="card sticky top-2 z-10 border border-ink/10 p-3 shadow-card">
+      <div className="flex items-center gap-4">
+        <div className={`font-display text-4xl font-bold leading-none tabular-nums ${cls.text}`}>{Math.round(live.percent)}%</div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+            <span className={`font-semibold ${cls.text}`}>
+              {final ? 'Final score' : 'Live score'} · {label}
+            </span>
+            <span className="font-mono text-ink-2">
+              {live.score} / {live.maxScore} pts
+            </span>
+            <span className="text-2xs text-ink-3">
+              {live.answered} of {live.scorable} scored questions answered
+            </span>
+            {live.missingRequired.length > 0 && (
+              <span className="chip bg-amber-soft text-amber-line">
+                {live.missingRequired.length} required left
+              </span>
+            )}
+          </div>
+          <div className="relative mt-2 h-2.5 w-full rounded-full bg-ink/10">
+            <div className={`h-full rounded-full transition-all duration-500 ${cls.bar}`} style={{ width: `${width}%` }} />
+            <div
+              className="absolute -top-1 h-[18px] w-0.5 bg-ink/60"
+              style={{ left: `calc(${Math.min(100, passThreshold)}% - 1px)` }}
+              title={`Pass mark ${passThreshold}%`}
+            />
+          </div>
+          <div className="mt-1 flex justify-between font-mono text-2xs text-ink-3">
+            <span>0%</span>
+            <span>pass mark {passThreshold}%</span>
+            <span>100%</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function AnswerControl({
@@ -245,6 +335,13 @@ export function EvaluationPage() {
   const [comments, setComments] = useState('');
   const [coaching, setCoaching] = useState('');
   const [message, setMessage] = useState<string | null>(null);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  // a clock for the edit-window countdown
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(t);
+  }, []);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['evaluation', id],
@@ -269,22 +366,27 @@ export function EvaluationPage() {
     }
   }, [data?.evaluation.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const body = () => ({ answers, comments: comments || undefined, coachingNotes: coaching || undefined });
+
   const save = useMutation({
-    mutationFn: () =>
-      api(`/evaluations/${id}`, {
-        method: 'PATCH',
-        body: { answers, comments: comments || undefined, coachingNotes: coaching || undefined },
-      }),
+    mutationFn: () => api(`/evaluations/${id}`, { method: 'PATCH', body: body() }),
     onSuccess: () => setMessage('Draft saved.'),
+    onError: (err) => setMessage(err instanceof ApiError ? err.message : 'Save failed.'),
+  });
+
+  // changes to a completed evaluation inside the edit window — re-scored by the server
+  const saveEdits = useMutation({
+    mutationFn: () => api(`/evaluations/${id}`, { method: 'PATCH', body: body() }),
+    onSuccess: () => {
+      setMessage('Changes saved and re-scored.');
+      void queryClient.invalidateQueries({ queryKey: ['evaluation', id] });
+    },
     onError: (err) => setMessage(err instanceof ApiError ? err.message : 'Save failed.'),
   });
 
   const complete = useMutation({
     mutationFn: async () => {
-      await api(`/evaluations/${id}`, {
-        method: 'PATCH',
-        body: { answers, comments: comments || undefined, coachingNotes: coaching || undefined },
-      });
+      await api(`/evaluations/${id}`, { method: 'PATCH', body: body() });
       return api(`/evaluations/${id}/complete`, { method: 'POST' });
     },
     onSuccess: () => {
@@ -297,8 +399,15 @@ export function EvaluationPage() {
   if (isLoading) return <Loading />;
   if (isError || !data) return <ErrorState message="Evaluation could not load." onRetry={() => void refetch()} />;
 
-  const done = data.evaluation.status === 'completed';
   const ev = data.evaluation;
+  const done = ev.status === 'completed';
+  const passThreshold = Number(data.passThreshold);
+  const live = scoreEvaluation(data.formSchema, answers, passThreshold);
+  const editableUntil = data.editableUntil ? new Date(data.editableUntil) : null;
+  const remainingMs = editableUntil ? editableUntil.getTime() - now : 0;
+  const canEdit = !done || (data.canEdit && remainingMs > 0);
+  const locked = done && !canEdit;
+  const windowMin = data.editWindowMinutes;
 
   return (
     <div className="mx-auto max-w-[1700px]">
@@ -306,15 +415,23 @@ export function EvaluationPage() {
         title={data.formName}
         subtitle={`Version ${data.formVersion} · reviewer ${data.reviewerName} · pass at ${data.passThreshold}%`}
         actions={
-          !done && (
+          !done ? (
             <>
               <button className="btn-secondary" onClick={() => save.mutate()} disabled={save.isPending}>
                 <Save size={14} /> Save draft
               </button>
-              <button className="btn-primary" onClick={() => complete.mutate()} disabled={complete.isPending}>
+              <button className="btn-primary" onClick={() => setConfirmOpen(true)} disabled={complete.isPending}>
                 <CheckCircle2 size={14} /> Complete & score
               </button>
             </>
+          ) : canEdit ? (
+            <button className="btn-primary" onClick={() => saveEdits.mutate()} disabled={saveEdits.isPending}>
+              <Save size={14} /> {saveEdits.isPending ? 'Saving…' : 'Save changes'}
+            </button>
+          ) : (
+            <span className="chip flex items-center gap-1 bg-bg text-ink-2">
+              <Lock size={12} /> Locked
+            </span>
           )
         }
       />
@@ -376,19 +493,28 @@ export function EvaluationPage() {
           )}
         </aside>
 
-        {/* right: score and form */}
+        {/* right: live score, status and form */}
         <div className="min-w-0 space-y-4">
+          <LiveScoreBar live={live} passThreshold={passThreshold} final={done} />
+
           {done && (
-            <div className={`card flex items-center gap-4 p-4 ${ev.autoFailed || !ev.passed ? 'bg-bad-soft' : 'bg-good-soft'}`}>
-              <div className="font-display text-3xl font-bold tabular-nums">{ev.percent}%</div>
-              <div className="text-sm">
-                <div className="font-semibold">
-                  {ev.autoFailed ? 'Automatic failure (critical question)' : ev.passed ? 'Passed' : 'Failed'}
-                </div>
-                <div className="text-ink-2">
-                  {ev.score} / {ev.maxScore} points · completed {fmtDateTime(ev.completedAt)}
-                </div>
-              </div>
+            <div className={`card flex flex-wrap items-center gap-3 p-3 text-sm ${locked ? 'bg-bg' : 'bg-brand-soft/40'}`}>
+              {locked ? <Lock size={16} className="shrink-0 text-ink-2" /> : <Clock size={16} className="shrink-0 text-brand" />}
+              <span className="font-semibold">Completed {fmtDateTime(ev.completedAt)}</span>
+              {locked ? (
+                <span className="text-ink-2">
+                  Locked —{' '}
+                  {windowMin > 0 && editableUntil
+                    ? `the edit window closed ${fmtDateTime(editableUntil.toISOString())}`
+                    : 'evaluations lock the moment they are completed'}
+                  . The score above is final.
+                </span>
+              ) : (
+                <span className="text-ink-2">
+                  You can still change answers for <strong>{fmtRemaining(remainingMs)}</strong> (until{' '}
+                  {fmtDateTime(editableUntil!.toISOString())}); after that it locks. Press <strong>Save changes</strong> to re-score.
+                </span>
+              )}
               <Chip value={ev.status} />
             </div>
           )}
@@ -409,7 +535,7 @@ export function EvaluationPage() {
                     <AnswerControl
                       q={q}
                       value={answers[q.id]}
-                      disabled={done}
+                      disabled={!canEdit}
                       onChange={(v) => setAnswers((a) => ({ ...a, [q.id]: v }))}
                     />
                   </div>
@@ -421,15 +547,60 @@ export function EvaluationPage() {
           <div className="card grid gap-3 p-4 xl:grid-cols-2">
             <div>
               <label className="label">Reviewer comments</label>
-              <textarea className="input" rows={3} value={comments} onChange={(e) => setComments(e.target.value)} disabled={done} />
+              <textarea className="input" rows={3} value={comments} onChange={(e) => setComments(e.target.value)} disabled={!canEdit} />
             </div>
             <div>
               <label className="label">Coaching notes (shared with the agent's manager)</label>
-              <textarea className="input" rows={3} value={coaching} onChange={(e) => setCoaching(e.target.value)} disabled={done} />
+              <textarea className="input" rows={3} value={coaching} onChange={(e) => setCoaching(e.target.value)} disabled={!canEdit} />
             </div>
           </div>
         </div>
       </div>
+
+      <Modal title="Complete this evaluation?" open={confirmOpen} onClose={() => setConfirmOpen(false)}>
+        <div className="space-y-3 text-sm">
+          <div className={`rounded-md p-3 ${live.autoFailed || !live.passed ? 'bg-bad-soft' : 'bg-good-soft'}`}>
+            <div className="font-display text-2xl font-bold tabular-nums">{Math.round(live.percent)}%</div>
+            <div>
+              {live.score} / {live.maxScore} points ·{' '}
+              {live.autoFailed ? 'automatic failure (critical question)' : live.passed ? 'passes' : 'fails'} the {passThreshold}% pass mark
+            </div>
+          </div>
+          {live.missingRequired.length > 0 && (
+            <div className="rounded-md bg-bad-soft px-3 py-2 text-bad">
+              {live.missingRequired.length} required question{live.missingRequired.length === 1 ? ' is' : 's are'} still unanswered — answer them before completing.
+            </div>
+          )}
+          <p className="text-ink-2">
+            {windowMin > 0 ? (
+              <>
+                After completing you can still correct this evaluation for <strong>{fmtWindow(windowMin)}</strong> (until about{' '}
+                {fmtDateTime(new Date(Date.now() + windowMin * 60_000).toISOString())}). <strong>After that it is locked</strong> and
+                cannot be changed.
+              </>
+            ) : (
+              <>
+                <strong>Once completed, this evaluation is locked immediately</strong> and cannot be changed.
+              </>
+            )}
+          </p>
+          <div className="flex justify-end gap-2">
+            <button className="btn-secondary" onClick={() => setConfirmOpen(false)}>
+              Keep editing
+            </button>
+            <button
+              className="btn-primary"
+              disabled={live.missingRequired.length > 0 || complete.isPending}
+              onClick={() => {
+                setConfirmOpen(false);
+                complete.mutate();
+              }}
+            >
+              <CheckCircle2 size={14} /> Yes, complete & score
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

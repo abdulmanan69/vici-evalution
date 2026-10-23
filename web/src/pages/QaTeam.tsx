@@ -5,6 +5,7 @@ import { api, ApiError } from '../api/client';
 import type { Agent, PageMeta } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
 import { EmptyState, ErrorState, Loading, PageHeader } from '../components/ui';
+import { QaSettingsCard } from '../components/QaSettingsCard';
 
 type Method = 'transfer' | 'unclosed' | 'closed';
 const METHODS: Array<{ key: Method; label: string; short: string }> = [
@@ -304,6 +305,7 @@ export function QaTeamPage() {
         title="QA team"
         subtitle="Choose which agents each reviewer evaluates, and with which methods"
       />
+      <QaSettingsCard />
       {isLoading ? (
         <Loading />
       ) : isError ? (

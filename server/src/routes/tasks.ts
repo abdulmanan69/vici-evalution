@@ -189,6 +189,29 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
       .parse(req.query);
     const scope = companyScope(req, q.companyId);
     const isManager = hasPermission(req.auth.permissions, 'qa.assign');
+
+    // A task whose call the reviewer already evaluated with this method is
+    // done, however the evaluation came about (before the task existed, or
+    // started from the call page) — close it so it never reads "Continue".
+    await db.execute(sql`
+      update qa_assignments a
+         set status = 'done', completed_at = coalesce(a.completed_at, e.completed_at), updated_at = now()
+        from evaluations e
+        join qa_form_versions v on v.id = e.form_version_id
+        join qa_forms f on f.id = v.form_id
+       where e.transfer_id = a.transfer_id and e.reviewer_id = a.assigned_to and e.status = 'completed'
+         and a.status in ('open', 'in_progress')
+         and (a.queue is null or f.queue = a.queue
+              or (f.queue is null and ((f.target = 'fronter') = (a.queue = 'transfer'))))
+         ${scope ? sql`and a.company_id = ${scope}` : sql``}`);
+
+    // the evaluation that belongs to this task's method (a TRA evaluation is
+    // not the Unclosed task's evaluation)
+    const methodEval = sql`e.transfer_id = ${qaAssignments.transferId} and e.reviewer_id = ${qaAssignments.assignedTo}
+      and exists (select 1 from qa_form_versions v join qa_forms f on f.id = v.form_id
+                   where v.id = e.form_version_id
+                     and (${qaAssignments.queue} is null or f.queue = ${qaAssignments.queue}
+                          or (f.queue is null and ((f.target = 'fronter') = (${qaAssignments.queue} = 'transfer')))))`;
     const fc = alias(calls, 'tfc');
     const cc = alias(calls, 'tcc');
     const fa = alias(viciAgents, 'tfa');
@@ -219,14 +242,11 @@ export async function taskRoutes(app: FastifyInstance): Promise<void> {
         closerAgent: ca.fullName,
         closerUser: ca.viciUser,
         closerStatus: cc.status,
-        evaluationId: sql<string | null>`(select e.id from evaluations e
-            where e.transfer_id = ${qaAssignments.transferId} and e.reviewer_id = ${qaAssignments.assignedTo}
-            order by e.created_at desc limit 1)`,
-        evaluationPercent: sql<string | null>`(select e.percent from evaluations e
-            where e.transfer_id = ${qaAssignments.transferId} and e.reviewer_id = ${qaAssignments.assignedTo}
+        evaluationId: sql<string | null>`(select e.id from evaluations e where ${methodEval}
+            order by (e.status = 'completed') desc, e.created_at desc limit 1)`,
+        evaluationPercent: sql<string | null>`(select e.percent from evaluations e where ${methodEval}
               and e.status = 'completed' order by e.completed_at desc limit 1)`,
-        evaluationPassed: sql<boolean | null>`(select e.passed from evaluations e
-            where e.transfer_id = ${qaAssignments.transferId} and e.reviewer_id = ${qaAssignments.assignedTo}
+        evaluationPassed: sql<boolean | null>`(select e.passed from evaluations e where ${methodEval}
               and e.status = 'completed' order by e.completed_at desc limit 1)`,
       })
       .from(qaAssignments)

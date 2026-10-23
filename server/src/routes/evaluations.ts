@@ -22,6 +22,7 @@ import { canReviewTransfer } from '../lib/reviewScope.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { answersSchema, formDefinitionSchema } from '../services/formSchema.js';
 import { scoreEvaluation } from '../services/scoring.js';
+import { editableUntil, getQaSettings } from '../services/qaSettings.js';
 
 const createSchema = z.object({
   transferId: z.string().uuid(),
@@ -281,7 +282,20 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
         }
       }
     }
-    return { ...row, call: callContext, recordings: callRecordings };
+    // the manager-set window in which a completed evaluation may still be
+    // corrected by its reviewer (or a manager); drafts are always editable
+    const qa = await getQaSettings(row.evaluation.companyId);
+    const until = editableUntil(row.evaluation.completedAt, qa);
+    const mayTouch = row.evaluation.reviewerId === req.auth.userId || hasPermission(req.auth.permissions, 'qa.forms.manage');
+    const canEdit = row.evaluation.status !== 'completed' ? true : mayTouch && !!until && until.getTime() > Date.now();
+    return {
+      ...row,
+      call: callContext,
+      recordings: callRecordings,
+      editWindowMinutes: qa.evaluationEditWindowMinutes,
+      editableUntil: until,
+      canEdit,
+    };
   });
 
   app.post('/', { preHandler: [requirePermission('qa.evaluate')] }, async (req, reply) => {
@@ -348,8 +362,40 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
     const [before] = await db.select().from(evaluations).where(eq(evaluations.id, id));
     if (!before) throw new NotFoundError('Evaluation not found');
     companyScope(req, before.companyId);
+    // A completed evaluation stays editable for the company's edit window
+    // (set by a manager), by its reviewer or a manager, and is re-scored on
+    // every change against the same frozen form version. After the window it
+    // is locked for good.
+    let rescore: Partial<typeof before> = {};
     if (before.status === 'completed') {
-      throw new ConflictError('Completed evaluations are immutable');
+      const qa = await getQaSettings(before.companyId);
+      const until = editableUntil(before.completedAt, qa);
+      if (before.reviewerId !== req.auth.userId && !hasPermission(req.auth.permissions, 'qa.forms.manage')) {
+        throw new ForbiddenError('Only the reviewer who completed this evaluation, or a manager, can change it');
+      }
+      if (!until || until.getTime() <= Date.now()) {
+        throw new ConflictError(
+          qa.evaluationEditWindowMinutes > 0
+            ? 'The edit window for this evaluation has closed — it is locked'
+            : 'Completed evaluations are locked the moment they are completed',
+        );
+      }
+      if (body.answers) {
+        const [version] = await db.select().from(qaFormVersions).where(eq(qaFormVersions.id, before.formVersionId));
+        if (!version) throw new NotFoundError('Form version missing');
+        const form = formDefinitionSchema.parse(version.schema);
+        const result = scoreEvaluation(form, body.answers, Number(version.passThreshold));
+        if (result.missingRequired.length > 0) {
+          throw new ValidationError(`Required questions unanswered: ${result.missingRequired.join(', ')}`);
+        }
+        rescore = {
+          score: String(result.score),
+          maxScore: String(result.maxScore),
+          percent: String(result.percent),
+          passed: result.passed,
+          autoFailed: result.autoFailed,
+        };
+      }
     }
     const [row] = await db
       .update(evaluations)
@@ -357,10 +403,20 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
         answers: body.answers ?? before.answers,
         comments: body.comments ?? before.comments,
         coachingNotes: body.coachingNotes ?? before.coachingNotes,
+        ...rescore,
         updatedAt: new Date(),
       })
       .where(eq(evaluations.id, id))
       .returning();
+    if (before.status === 'completed') {
+      await audit(req, {
+        action: 'evaluation.edit_after_complete',
+        entityType: 'evaluation',
+        entityId: id,
+        after: { percent: row.percent, passed: row.passed, autoFailed: row.autoFailed },
+        companyId: before.companyId,
+      });
+    }
     return { evaluation: row };
   });
 

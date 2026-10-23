@@ -447,7 +447,7 @@ function TaskTable({ isManager, refreshKey }: { isManager: boolean; refreshKey: 
                       <span className="flex items-center gap-1.5">
                         <Chip
                           value={r.task.status === 'in_progress' ? 'running' : r.task.status === 'done' ? 'completed' : r.task.status === 'cancelled' ? 'disabled' : 'pending'}
-                          label={r.task.status === 'in_progress' ? 'in progress' : r.task.status === 'cancelled' ? 'withdrawn' : r.task.status === 'open' ? 'not started' : 'done'}
+                          label={r.task.status === 'in_progress' ? 'in progress' : r.task.status === 'cancelled' ? 'withdrawn' : r.task.status === 'open' ? 'not started' : 'evaluated'}
                         />
                         {overdue && <span className="chip bg-bad-soft text-bad">overdue</span>}
                       </span>
@@ -464,7 +464,7 @@ function TaskTable({ isManager, refreshKey }: { isManager: boolean; refreshKey: 
                     <td className="td text-right">
                       {r.evaluationId ? (
                         <Link to={`/qa/evaluations/${r.evaluationId}`} className="font-medium text-brand hover:underline">
-                          {r.task.status === 'done' ? 'View' : 'Continue'}
+                          {r.task.status === 'done' ? 'View score' : 'Continue'}
                         </Link>
                       ) : r.task.status === 'open' && !isManager ? (
                         <button className="btn-primary px-2 py-1 text-2xs" onClick={() => start.mutate(r)} disabled={start.isPending}>

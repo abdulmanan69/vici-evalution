@@ -184,6 +184,7 @@ export interface Evaluation {
   comments: string | null;
   coachingNotes: string | null;
   completedAt: string | null;
+  updatedAt?: string;
   createdAt: string;
 }
 
