@@ -29,6 +29,12 @@ const envSchema = z.object({
   RECORDING_RETRY_MINUTES: z.coerce.number().default(10),
   /** how often the recording repair job runs */
   RECORDING_CHECK_SECONDS: z.coerce.number().min(30).default(60),
+  /**
+   * Dialers synced at the same time. A sync mostly waits on the dialer, so
+   * with several dialers a higher number keeps each one fresh (one dialer
+   * never runs two syncs at once either way).
+   */
+  SYNC_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
   MATCH_AUTO_THRESHOLD: z.coerce.number().default(70),
   MATCH_FLAG_THRESHOLD: z.coerce.number().default(40),
 });

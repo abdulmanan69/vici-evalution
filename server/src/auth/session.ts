@@ -90,8 +90,27 @@ export async function login(
   };
 }
 
+/**
+ * Every API request resolves its session (three queries). A page load fires
+ * several requests at once and open call pages poll, so the result is kept
+ * for a few seconds. Any successful write through the API clears the whole
+ * cache (see app.ts), as do logout and session revocation, so role, access
+ * and status changes still apply on the next request.
+ */
+const SESSION_CACHE_MS = 10_000;
+const SESSION_CACHE_MAX = 5_000;
+const sessionCache = new Map<string, { at: number; expiresAt: number; auth: AuthContext }>();
+
+export function invalidateAuthCache(): void {
+  sessionCache.clear();
+}
+
 export async function resolveSession(token: string): Promise<AuthContext | null> {
   const tokenHash = sha256(token);
+  const now = Date.now();
+  const hit = sessionCache.get(tokenHash);
+  if (hit && now - hit.at < SESSION_CACHE_MS && hit.expiresAt > now) return { ...hit.auth };
+
   const rows = await db
     .select({ user: users, role: roles, session: sessions })
     .from(sessions)
@@ -99,8 +118,14 @@ export async function resolveSession(token: string): Promise<AuthContext | null>
     .innerJoin(roles, eq(users.roleId, roles.id))
     .where(and(eq(sessions.tokenHash, tokenHash), gt(sessions.expiresAt, new Date())));
   const row = rows[0];
-  if (!row || row.user.status !== 'active') return null;
-  return withAllowedQueues(toAuthContext(row.user, row.role));
+  if (!row || row.user.status !== 'active') {
+    sessionCache.delete(tokenHash);
+    return null;
+  }
+  const auth = await withAllowedQueues(toAuthContext(row.user, row.role));
+  if (sessionCache.size >= SESSION_CACHE_MAX) sessionCache.clear();
+  sessionCache.set(tokenHash, { at: now, expiresAt: row.session.expiresAt.getTime(), auth });
+  return { ...auth };
 }
 
 /** A user's effective access (form, queue and agent limits) without a session. */
@@ -116,10 +141,13 @@ export async function authContextForUser(userId: string): Promise<AuthContext | 
 }
 
 export async function logout(token: string): Promise<void> {
-  await db.delete(sessions).where(eq(sessions.tokenHash, sha256(token)));
+  const tokenHash = sha256(token);
+  sessionCache.delete(tokenHash);
+  await db.delete(sessions).where(eq(sessions.tokenHash, tokenHash));
 }
 
 export async function revokeUserSessions(userId: string): Promise<void> {
+  invalidateAuthCache();
   await db.delete(sessions).where(eq(sessions.userId, userId));
 }
 

@@ -115,12 +115,17 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
-    await audit(req, {
-      action: 'recording.play',
-      entityType: 'recording',
-      entityId: id,
-      companyId: rec.companyId,
-    });
+    // One audit row per play, not per byte range: the player asks for many
+    // ranges while it seeks, and none of them should wait on the insert.
+    const range = req.headers.range;
+    if (!range || /^bytes=0-/.test(range)) {
+      void audit(req, {
+        action: 'recording.play',
+        entityType: 'recording',
+        entityId: id,
+        companyId: rec.companyId,
+      }).catch((err: unknown) => req.log.warn({ err }, 'recording.play audit failed'));
+    }
 
     reply.status(upstream.statusCode);
     const h = upstream.headers;

@@ -36,8 +36,10 @@ import { fetchUserStatsCalls, type UserStatsCall } from './webReport.js';
 import { sha256 } from '../lib/crypto.js';
 
 export interface SyncStats {
-  [key: string]: number | string[] | undefined;
+  [key: string]: number | string[] | Record<string, number> | undefined;
   notes?: string[];
+  /** seconds per stage of this sync */
+  stageSeconds?: Record<string, number>;
 }
 
 const BATCH_LIMIT = 5000;
@@ -91,6 +93,9 @@ class ProgressReporter {
   private lastWrite = 0;
   private readonly total: number;
   private readonly startedAt = Date.now();
+  private stageStartedAt = Date.now();
+  /** seconds spent per stage — saved with the job so a slow stage shows up */
+  private readonly seconds: Record<string, number> = {};
 
   constructor(
     private readonly jobId: string,
@@ -99,9 +104,23 @@ class ProgressReporter {
     this.total = stageKeys.reduce((s, k) => s + (STAGES[k]?.weight ?? 0), 0) || 1;
   }
 
+  private closeStage(): void {
+    if (!this.current) return;
+    const s = (Date.now() - this.stageStartedAt) / 1000;
+    this.seconds[this.current.key] = Math.round(((this.seconds[this.current.key] ?? 0) + s) * 10) / 10;
+  }
+
+  stageSeconds(): Record<string, number> {
+    this.closeStage();
+    this.stageStartedAt = Date.now();
+    return { ...this.seconds };
+  }
+
   async stage(key: string): Promise<void> {
+    this.closeStage();
     if (this.current) this.doneWeight += this.current.weight;
     this.current = { key, label: STAGES[key]?.label ?? key, weight: STAGES[key]?.weight ?? 0 };
+    this.stageStartedAt = Date.now();
     this.fraction = 0;
     this.detail = null;
     await this.flush(true);
@@ -260,6 +279,7 @@ export async function runDialerSync(
       await attributeSales(conn.companyId, stats);
       await reporter.stage('queues');
       await updateQueueStatuses(conn.companyId, stats);
+      stats.stageSeconds = reporter.stageSeconds();
       await reporter.finish();
 
       await db
@@ -272,6 +292,7 @@ export async function runDialerSync(
         .where(eq(syncJobs.id, job.id));
       return stats;
     } catch (err) {
+      stats.stageSeconds = reporter.stageSeconds();
       await db
         .update(syncJobs)
         .set({

@@ -136,10 +136,14 @@ export const dialerServers = pgTable(
     timeCheckedAt: timestamp('time_checked_at', { withTimezone: true }),
     active: boolean('active').notNull().default(true),
     lastSeenAt: timestamp('last_seen_at', { withTimezone: true }),
+    // set when an admin deletes the dialer: it stops syncing at once and the
+    // worker removes its data in batches, then the row itself
+    deletingAt: timestamp('deleting_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [uniqueIndex('dialers_company_name_uq').on(t.companyId, t.name)],
+  // a dialer being deleted frees its name so it can be added again right away
+  (t) => [uniqueIndex('dialers_company_name_uq').on(t.companyId, t.name).where(sql`${t.deletingAt} is null`)],
 );
 
 export const viciAgents = pgTable(
@@ -275,6 +279,9 @@ export const calls = pgTable(
     index('calls_phone_idx').on(t.phoneNumber),
     index('calls_lead_idx').on(t.dialerServerId, t.viciLeadId),
     index('calls_status_idx').on(t.status),
+    // reviewer agent scopes, agent reports, and deleting an agent/dialer
+    // (without it every removed agent scanned the whole calls table)
+    index('calls_agent_idx').on(t.viciAgentId),
   ],
 );
 
@@ -335,6 +342,8 @@ export const transfers = pgTable(
       .on(t.dialerServerId, t.agentLogId)
       .where(sql`${t.agentLogId} is not null`),
     index('transfers_company_queue_idx').on(t.companyId, t.queueStatus, t.xferTime),
+    // the Transfers queue lists by kind, newest first
+    index('transfers_company_kind_idx').on(t.companyId, t.kind, t.xferTime),
     index('transfers_match_idx').on(t.matchStatus),
     index('transfers_closer_call_idx').on(t.closerCallId),
     index('transfers_lead_idx').on(t.dialerServerId, t.viciLeadId),
@@ -504,6 +513,7 @@ export const evaluations = pgTable(
     index('evaluations_company_idx').on(t.companyId, t.status),
     index('evaluations_transfer_idx').on(t.transferId),
     index('evaluations_agent_idx').on(t.targetAgentId),
+    index('evaluations_call_idx').on(t.callId),
   ],
 );
 

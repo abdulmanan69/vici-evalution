@@ -15,5 +15,17 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     sourcemap: false,
+    rollupOptions: {
+      output: {
+        // Libraries change far less often than the app: in their own files
+        // they stay in the browser cache across deploys.
+        manualChunks(id) {
+          if (!id.includes('node_modules')) return undefined;
+          if (/[\\/]node_modules[\\/](recharts|d3-[^\\/]+|victory-vendor)[\\/]/.test(id)) return 'charts';
+          if (/[\\/]node_modules[\\/]lucide-react[\\/]/.test(id)) return 'icons';
+          return 'vendor';
+        },
+      },
+    },
   },
 });

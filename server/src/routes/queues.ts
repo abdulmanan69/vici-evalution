@@ -22,7 +22,7 @@ import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { scoreCandidate, DEFAULT_MATCH_OPTIONS } from '../vicidial/matcher.js';
 import { localToUtc } from '../vicidial/timezone.js';
 import { toConnection } from '../vicidial/credentials.js';
-import { getPooledDbClient } from '../vicidial/dbPool.js';
+import { loadLeadInfo } from '../services/leadInfo.js';
 import { findFronterOnLead, recordingBundle, toRecordingRows } from '../services/callRecordings.js';
 
 /** A reviewer limited to certain forms only reaches the matching queues. */
@@ -43,53 +43,6 @@ async function assertTransferAccess(req: FastifyRequest, transfer: typeof transf
   if (!req.auth.allowedQueues?.includes('transfer')) assertQueueAllowed(req.auth, transfer.queueStatus);
   if (!(await canReviewTransfer(req.auth, transfer))) {
     throw new ForbiddenError("This call's agent is not assigned to you");
-  }
-}
-
-type LeadFields = Record<string, unknown> | null;
-
-/**
- * Lead details, fetched live from the dialer by primary key through a cached
- * pool. Capped at 2.5 s and always optional — a page never waits on or fails
- * because of lead info. Dialer-local timestamps become ISO (UTC) so the UI
- * shows them in the viewer's chosen zone; the list's name and campaign ride
- * along as list_name / list_campaign.
- */
-async function loadLeadInfo(dialerServerId: string, leadId: number | null): Promise<{ lead: LeadFields; leadCustom: LeadFields }> {
-  const empty = { lead: null, leadCustom: null };
-  if (leadId == null) return empty;
-  try {
-    const [dialerRow] = await db.select().from(dialerServers).where(eq(dialerServers.id, dialerServerId));
-    if (!dialerRow) return empty;
-    const conn = toConnection(dialerRow);
-    const client = getPooledDbClient(conn);
-    if (!client) return empty;
-    const info = await Promise.race([
-      client.fetchLead(leadId),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
-    ]);
-    if (!info) return empty;
-    const toIso = (rec: Record<string, unknown>) => {
-      const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(rec)) {
-        out[k] =
-          typeof v === 'string' && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(v) && !v.startsWith('0000')
-            ? localToUtc(v, conn.timezone).toISOString()
-            : v;
-      }
-      return out;
-    };
-    return {
-      lead: {
-        ...toIso(info.lead),
-        list_name: info.list?.list_name ?? null,
-        list_campaign: info.list?.campaign_id ?? null,
-        list_active: info.list?.active ?? null,
-      },
-      leadCustom: info.custom ? toIso(info.custom) : null,
-    };
-  } catch {
-    return empty;
   }
 }
 
@@ -169,13 +122,12 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     }
     const whereAll = and(...where);
 
-    const [total] = await db
-      .select({ n: count() })
-      .from(transfers)
-      .leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id))
-      .where(whereAll);
+    // the count only needs the fronter leg when filtering by its campaign
+    const countQuery = q.campaignId
+      ? db.select({ n: count() }).from(transfers).leftJoin(fronterCall, eq(transfers.fronterCallId, fronterCall.id)).where(whereAll)
+      : db.select({ n: count() }).from(transfers).where(whereAll);
 
-    const rows = await db
+    const [[total], rows] = await Promise.all([countQuery, db
       .select({
         transfer: transfers,
         fronterCall: fronterCall,
@@ -200,7 +152,8 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       .where(whereAll)
       .orderBy(desc(transfers.xferTime))
       .limit(q.pageSize)
-      .offset(offsetOf(q));
+      .offset(offsetOf(q)),
+    ]);
 
     return { items: rows, meta: pageMeta(q, total.n) };
   });
@@ -229,27 +182,31 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     if (!row) throw new NotFoundError('Transfer not found');
     await assertTransferAccess(req, row.transfer);
 
-    // a sale made on a later call of the lead is shown as its own leg
-    let saleCall: (typeof calls.$inferSelect & { agentName: string | null }) | null = null;
-    if (row.transfer.saleCallId) {
-      const [s] = await db
-        .select({ call: calls, agentName: viciAgents.fullName })
-        .from(calls)
-        .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
-        .where(eq(calls.id, row.transfer.saleCallId));
-      if (s) saleCall = { ...s.call, agentName: s.agentName };
-    }
-
     const leadId = row.transfer.viciLeadId ?? row.fronterCall?.viciLeadId ?? row.closerCall?.viciLeadId ?? null;
+    // Everything below is local and independent, so it runs in parallel. Lead
+    // details live on the dialer and come from /detail/:id/lead — the page
+    // never waits on the dialer to show the call.
+    const [saleRow, fronterOnLead, events, evals] = await Promise.all([
+      // a sale made on a later call of the lead is shown as its own leg
+      row.transfer.saleCallId
+        ? db
+            .select({ call: calls, agentName: viciAgents.fullName })
+            .from(calls)
+            .leftJoin(viciAgents, eq(calls.viciAgentId, viciAgents.id))
+            .where(eq(calls.id, row.transfer.saleCallId))
+            .then((r) => r[0] ?? null)
+        : Promise.resolve(null),
+      !row.fronterCall && leadId != null ? findFronterOnLead(row.transfer, leadId) : Promise.resolve(null),
+      db.select().from(transferEvents).where(eq(transferEvents.transferId, transferId)).orderBy(transferEvents.createdAt),
+      db.select().from(evaluations).where(eq(evaluations.transferId, transferId)).orderBy(desc(evaluations.createdAt)),
+    ]);
+    const saleCall = saleRow ? { ...saleRow.call, agentName: saleRow.agentName } : null;
     let fronterFromLead = false;
-    if (!row.fronterCall && leadId != null) {
-      const f = await findFronterOnLead(row.transfer, leadId);
-      if (f) {
-        row.fronterCall = f.call;
-        row.fronterAgentUser = f.agentUser;
-        row.fronterAgentName = f.agentName;
-        fronterFromLead = true;
-      }
+    if (fronterOnLead) {
+      row.fronterCall = fronterOnLead.call;
+      row.fronterAgentUser = fronterOnLead.agentUser;
+      row.fronterAgentName = fronterOnLead.agentName;
+      fronterFromLead = true;
     }
     // the snapshot for the first paint — the page then follows the live
     // endpoint below, which re-checks the dialer
@@ -258,25 +215,11 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       closer: row.closerCall,
       sale: saleCall,
     });
-    const events = await db
-      .select()
-      .from(transferEvents)
-      .where(eq(transferEvents.transferId, transferId))
-      .orderBy(transferEvents.createdAt);
-    const evals = await db
-      .select()
-      .from(evaluations)
-      .where(eq(evaluations.transferId, transferId))
-      .orderBy(desc(evaluations.createdAt));
-
-    const { lead, leadCustom } = await loadLeadInfo(row.transfer.dialerServerId, leadId);
 
     return {
       ...row,
       fronterFromLead,
       saleCall,
-      lead,
-      leadCustom,
       ...toRecordingRows(bundle),
       legs: bundle.legs,
       live: bundle.live,
@@ -322,19 +265,20 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
     const { transferId } = req.params as { transferId: string };
     return liveRecordings(req, transferId, false);
   });
-  // Lead details for the evaluation page — same access rules as the call
+  // Lead details for the call and evaluation pages — same access rules as the
+  // call. Cached for a minute; the call's list id lets the dialer lookup read
+  // the custom fields in parallel (one round trip instead of four).
   app.get('/detail/:transferId/lead', { preHandler: [requirePermission('calls.view')] }, async (req) => {
     const { transferId } = req.params as { transferId: string };
     const [t] = await db.select().from(transfers).where(eq(transfers.id, transferId));
     if (!t) throw new NotFoundError('Transfer not found');
     await assertTransferAccess(req, t);
-    let leadId = t.viciLeadId;
     const legId = t.fronterCallId ?? t.closerCallId ?? t.saleCallId;
-    if (leadId == null && legId) {
-      const [c] = await db.select({ leadId: calls.viciLeadId }).from(calls).where(eq(calls.id, legId));
-      leadId = c?.leadId ?? null;
-    }
-    return loadLeadInfo(t.dialerServerId, leadId);
+    const [leg] = legId
+      ? await db.select({ leadId: calls.viciLeadId, listId: calls.listId }).from(calls).where(eq(calls.id, legId))
+      : [];
+    const leadId = t.viciLeadId ?? leg?.leadId ?? null;
+    return loadLeadInfo(t.dialerServerId, leadId, leg?.listId ?? null);
   });
 
   // "Fetch from dialer": a reviewer's explicit retry — ignores the throttles,

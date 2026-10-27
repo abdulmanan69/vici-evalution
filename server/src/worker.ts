@@ -1,30 +1,35 @@
 import { Queue, Worker } from 'bullmq';
 import { Redis } from 'ioredis';
-import { and, eq, sql } from 'drizzle-orm';
+import { and, eq, isNull, sql } from 'drizzle-orm';
 import { config } from './config.js';
 import { runMigrations } from './db/migrate.js';
-import { db } from './db/client.js';
+import { db, relaxCommitDurabilityForSync } from './db/client.js';
 import { calls, dialerServers, recordings } from './db/schema.js';
 import { runDialerSync } from './vicidial/sync.js';
 import { toConnection } from './vicidial/credentials.js';
 import { refreshRecording } from './vicidial/recordingUrl.js';
 import { isCallInProgress } from './services/callRecordings.js';
+import { pendingPurges, purgeCompany, purgeDialer } from './services/purge.js';
+import { enqueueCompanyPurge, enqueueDialerPurge, MAINTENANCE_QUEUE, SYNC_QUEUE } from './lib/queue.js';
 
 /**
  * Background worker: schedules and runs per-dialer synchronization and
  * recording availability checks. BullMQ job ids are derived from the dialer id
  * so a dialer can never be synced by two jobs at once (idempotent + deduped).
+ * Housekeeping that can run for minutes (deleting a dialer or company, the
+ * daily retention) has its own queue, so it never holds up a sync.
  */
 
 const connection = new Redis(config.REDIS_URL, { maxRetriesPerRequest: null });
 
-export const syncQueue = new Queue('vici-sync', { connection });
+export const syncQueue = new Queue(SYNC_QUEUE, { connection });
+const maintenanceQueue = new Queue(MAINTENANCE_QUEUE, { connection });
 
 async function enqueueActiveDialers(): Promise<void> {
   const rows = await db
     .select({ id: dialerServers.id, name: dialerServers.name })
     .from(dialerServers)
-    .where(eq(dialerServers.active, true));
+    .where(and(eq(dialerServers.active, true), isNull(dialerServers.deletingAt)));
   for (const d of rows) {
     await syncQueue.add(
       'sync-dialer',
@@ -40,6 +45,16 @@ async function enqueueActiveDialers(): Promise<void> {
       },
     );
   }
+}
+
+/**
+ * A delete whose job was lost (worker restart, Redis flush) is picked up
+ * again: the database marks are the source of truth, the jobs only carry it.
+ */
+async function resumePendingPurges(): Promise<void> {
+  const pending = await pendingPurges();
+  for (const id of pending.companies) await enqueueCompanyPurge(id, maintenanceQueue);
+  for (const id of pending.dialers) await enqueueDialerPurge(id, maintenanceQueue);
 }
 
 let recordingCheckRunning = false;
@@ -93,7 +108,8 @@ async function checkPendingRecordings(): Promise<void> {
     const connFor = async (dialerServerId: string) => {
       if (!conns.has(dialerServerId)) {
         const [dialer] = await db.select().from(dialerServers).where(eq(dialerServers.id, dialerServerId));
-        conns.set(dialerServerId, dialer ? toConnection(dialer) : null);
+        // a dialer being deleted is not probed any more
+        conns.set(dialerServerId, dialer && !dialer.deletingAt ? toConnection(dialer) : null);
       }
       return conns.get(dialerServerId) ?? null;
     };
@@ -180,7 +196,10 @@ async function applyRetention(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  relaxCommitDurabilityForSync();
   await runMigrations();
+  const commit = await db.execute(sql`select current_setting('synchronous_commit') as v`);
+  console.log(`[worker] synchronous_commit for sync writes: ${(commit.rows[0] as { v?: string } | undefined)?.v ?? '?'}`);
 
   // a restart mid-sync leaves job rows stuck at 'running'; this worker is the
   // only thing that runs syncs, so every such row is stale — close them out
@@ -189,7 +208,7 @@ async function main(): Promise<void> {
      where status = 'running'`);
 
   const worker = new Worker(
-    'vici-sync',
+    SYNC_QUEUE,
     async (job) => {
       if (job.name === 'sync-dialer') {
         return runDialerSync(job.data.dialerServerId as string, { full: !!job.data.full });
@@ -198,25 +217,45 @@ async function main(): Promise<void> {
         await checkPendingRecordings();
         return { ok: true };
       }
-      if (job.name === 'retention') {
-        await applyRetention();
-        return { ok: true };
-      }
       if (job.name === 'tick') {
         await enqueueActiveDialers();
+        await resumePendingPurges();
         return { ok: true };
       }
+      if (job.name === 'retention') return { ok: true, movedTo: MAINTENANCE_QUEUE }; // pre-upgrade schedule
       throw new Error(`Unknown job: ${job.name}`);
     },
     {
       connection: new Redis(config.REDIS_URL, { maxRetriesPerRequest: null }),
-      concurrency: 2, // modest parallelism — keeps CPU/RAM low and dialers safe
+      // a sync mostly waits on its dialer; several dialers sync side by side
+      concurrency: config.SYNC_CONCURRENCY,
     },
   );
 
-  worker.on('failed', (job, err) => {
-    console.error(`[worker] job ${job?.name}:${job?.id} failed:`, err.message);
-  });
+  const maintenance = new Worker(
+    MAINTENANCE_QUEUE,
+    async (job) => {
+      const log = (m: string) => console.log(`[worker] ${m}`);
+      if (job.name === 'purge-dialer') return { deleted: await purgeDialer(job.data.dialerServerId as string, log) };
+      if (job.name === 'purge-company') return { deleted: await purgeCompany(job.data.companyId as string, log) };
+      if (job.name === 'retention') {
+        await applyRetention();
+        return { ok: true };
+      }
+      throw new Error(`Unknown maintenance job: ${job.name}`);
+    },
+    {
+      connection: new Redis(config.REDIS_URL, { maxRetriesPerRequest: null }),
+      concurrency: 1, // one heavy delete at a time
+      lockDuration: 5 * 60_000, // batches keep it busy; never hand it to a second run
+    },
+  );
+
+  for (const w of [worker, maintenance]) {
+    w.on('failed', (job, err) => {
+      console.error(`[worker] job ${job?.name}:${job?.id} failed:`, err.message);
+    });
+  }
   worker.on('completed', (job) => {
     if (job.name === 'sync-dialer') {
       console.log(`[worker] sync completed for dialer ${job.data.dialerServerId}`);
@@ -230,15 +269,19 @@ async function main(): Promise<void> {
     { every: config.RECORDING_CHECK_SECONDS * 1000 },
     { name: 'check-recordings' },
   );
-  await syncQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention' });
+  // retention moved to the maintenance queue — drop the old schedule
+  await syncQueue.removeJobScheduler('retention').catch(() => false);
+  await maintenanceQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention' });
+  await resumePendingPurges();
 
   console.log(
-    `[worker] started — polling every ${config.SYNC_POLL_SECONDS}s, recording checks every ${config.RECORDING_CHECK_SECONDS}s`,
+    `[worker] started — polling every ${config.SYNC_POLL_SECONDS}s, recording checks every ${config.RECORDING_CHECK_SECONDS}s, ` +
+      `${config.SYNC_CONCURRENCY} dialers at a time`,
   );
 
   const shutdown = async () => {
-    await worker.close();
-    await syncQueue.close();
+    await Promise.all([worker.close(), maintenance.close()]);
+    await Promise.all([syncQueue.close(), maintenanceQueue.close()]);
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());

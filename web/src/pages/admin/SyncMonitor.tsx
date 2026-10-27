@@ -23,6 +23,38 @@ interface DialerStatus {
   cursors: { stream: string; lastTimestamp: string | null }[];
 }
 
+const STAGE_LABELS: Record<string, string> = {
+  roster: 'agents & campaigns',
+  calls: 'outbound calls',
+  closer_calls: 'closer calls',
+  recordings: 'recording log',
+  dispositions: 'dispositions',
+  api_calls: 'API calls',
+  api_recordings: 'recording lookups',
+  transfers: 'transfers',
+  matching: 'matching',
+  sales: 'sales',
+  queues: 'queues',
+};
+
+/** How long a finished sync took, in seconds. */
+function tookSeconds(job: SyncJob): number | null {
+  if (!job.startedAt || !job.finishedAt) return null;
+  return Math.max(0, Math.round((Date.parse(job.finishedAt) - Date.parse(job.startedAt)) / 1000));
+}
+
+/** Where a finished sync spent its time — the three slowest stages. */
+function slowestStages(job: SyncJob): string | null {
+  const stages = job.stats?.stageSeconds as Record<string, number> | undefined;
+  if (!stages) return null;
+  const top = Object.entries(stages)
+    .filter(([, s]) => s >= 0.5)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([k, s]) => `${STAGE_LABELS[k] ?? k} ${s.toFixed(1)}s`);
+  return top.length ? `slowest: ${top.join(' · ')}` : null;
+}
+
 function fmtOffset(min: number): string {
   const sign = min < 0 ? '-' : '+';
   const abs = Math.abs(min);
@@ -146,6 +178,7 @@ export function SyncMonitorPage() {
                 <th className="th">Dialer</th>
                 <th className="th">Type</th>
                 <th className="th">Status</th>
+                <th className="th">Took</th>
                 <th className="th">Result</th>
               </tr>
             </thead>
@@ -158,10 +191,16 @@ export function SyncMonitorPage() {
                   <td className="td">
                     <Chip value={job.status} />
                   </td>
-                  <td className="td max-w-md truncate font-mono text-2xs text-ink-2">
+                  <td className="td font-mono text-2xs text-ink-2">
+                    {tookSeconds(job) != null ? `${tookSeconds(job)}s` : '—'}
+                  </td>
+                  <td
+                    className="td max-w-md truncate font-mono text-2xs text-ink-2"
+                    title={job.stats ? JSON.stringify(job.stats, null, 1) : undefined}
+                  >
                     {job.status === 'running' && job.progress
                       ? `${job.progress.percent.toFixed(0)}% · ${job.progress.label}${job.progress.detail ? ` · ${job.progress.detail}` : ''}`
-                      : (job.error ?? (job.stats ? JSON.stringify(job.stats) : '—'))}
+                      : (job.error ?? slowestStages(job) ?? (job.stats ? JSON.stringify(job.stats) : '—'))}
                   </td>
                 </tr>
               ))}

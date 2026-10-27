@@ -12,6 +12,10 @@ export async function runMigrations(): Promise<void> {
   await db.execute(sql`select pg_advisory_lock(${MIGRATION_LOCK})`);
   try {
     await migrate(db, { migrationsFolder: 'drizzle' });
+    // Slow-query statistics for diagnosis (the compose files preload the
+    // module). Best effort: a database user without the right to create
+    // extensions simply goes without.
+    await db.execute(sql`create extension if not exists pg_stat_statements`).catch(() => undefined);
   } finally {
     await db.execute(sql`select pg_advisory_unlock(${MIGRATION_LOCK})`);
   }

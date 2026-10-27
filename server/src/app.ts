@@ -5,7 +5,9 @@ import rateLimit from '@fastify/rate-limit';
 import { ZodError } from 'zod';
 import { config } from './config.js';
 import { AppError } from './lib/errors.js';
-import { authenticate } from './auth/plugin.js';
+import { authenticate, SESSION_COOKIE } from './auth/plugin.js';
+import { invalidateAuthCache } from './auth/session.js';
+import { sha256 } from './lib/crypto.js';
 import { authRoutes } from './routes/auth.js';
 import { companyRoutes } from './routes/companies.js';
 import { dialerRoutes } from './routes/dialers.js';
@@ -40,9 +42,25 @@ export async function buildApp(): Promise<FastifyInstance> {
     origin: config.NODE_ENV === 'production' ? false : true,
     credentials: true,
   });
+  // A call centre's reviewers usually share one office IP, so limits are per
+  // signed-in session — one IP-wide budget throttled the whole team at busy
+  // times (live recording polls, audio seeks and page loads add up). Requests
+  // without a session stay limited per IP.
   await app.register(rateLimit, {
-    max: 600,
     timeWindow: '1 minute',
+    keyGenerator: (req) => {
+      const token = req.cookies?.[SESSION_COOKIE];
+      return token ? `s:${sha256(token).slice(0, 32)}` : `ip:${req.ip}`;
+    },
+    max: (_req, key) => (key.startsWith('s:') ? 1200 : 600),
+  });
+  // Session lookups are cached for a few seconds; any change made through
+  // the API (users, roles, assignments, forms …) drops the cache so access
+  // changes apply on the very next request.
+  app.addHook('onResponse', async (req, reply) => {
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS' && reply.statusCode < 400) {
+      invalidateAuthCache();
+    }
   });
 
   app.setErrorHandler((err, req, reply) => {
@@ -84,7 +102,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       await api.register(recordingRoutes, { prefix: '/recordings' });
       await api.register(qaFormRoutes, { prefix: '/qa/forms' });
       await api.register(qaTeamRoutes, { prefix: '/qa/team' });
-  await api.register(qaSettingsRoutes, { prefix: '/qa/settings' });
+      await api.register(qaSettingsRoutes, { prefix: '/qa/settings' });
       await api.register(taskRoutes, { prefix: '/qa/tasks' });
       await api.register(evaluationRoutes, { prefix: '/evaluations' });
       await api.register(userRoutes, { prefix: '/users' });

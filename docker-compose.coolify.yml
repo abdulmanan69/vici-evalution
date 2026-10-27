@@ -25,6 +25,8 @@ x-app-env: &app-env
   SYNC_HISTORICAL_DAYS: ${SYNC_HISTORICAL_DAYS:-30}
   RECORDING_CHECK_SECONDS: ${RECORDING_CHECK_SECONDS:-60}
   RECORDING_RETRY_MINUTES: ${RECORDING_RETRY_MINUTES:-10}
+  # dialers synced side by side (each dialer still runs one sync at a time)
+  SYNC_CONCURRENCY: ${SYNC_CONCURRENCY:-4}
   MATCH_AUTO_THRESHOLD: ${MATCH_AUTO_THRESHOLD:-70}
   MATCH_FLAG_THRESHOLD: ${MATCH_FLAG_THRESHOLD:-40}
 
@@ -36,6 +38,32 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-vici_qa}
       POSTGRES_USER: ${POSTGRES_USER:-vici_qa}
       POSTGRES_PASSWORD: ${SERVICE_PASSWORD_POSTGRES}
+    # Tuned for an SSD server shared with the app (defaults are sized for a
+    # tiny machine). Raise PG_SHARED_BUFFERS to ~25% of RAM on bigger boxes.
+    # pg_stat_statements records the slowest queries for diagnosis.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-1GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-16MB}
+      - -c
+      - maintenance_work_mem=128MB
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - log_min_duration_statement=${PG_LOG_SLOW_MS:-2000}
+    shm_size: 256mb
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

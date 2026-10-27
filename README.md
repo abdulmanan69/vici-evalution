@@ -182,6 +182,10 @@ They are ordinary forms: edit them, add questions, re-publish (each publish is a
 | Logs (API / worker) | `docker compose logs -f api` · `docker compose logs -f worker` |
 | Restart everything | `docker compose restart` |
 | Full re-sync of a dialer | **Dialer servers → Sync (full)** |
+| Delete a dialer | **Dialer servers → Delete** (company admins and super admins) |
+| Delete a company | **Companies → Delete** (super admins only) |
+
+**Deleting.** The dialog first counts what goes with the item (calls, recordings, transfers, evaluations, users …) and asks for its exact name. A deleted dialer stops syncing at once and leaves every list and filter; a deleted company's users are signed out and disabled at once. The data is then removed by the worker in small batches, so a big dialer never locks the database, and the row disappears from the admin page when it is done. Names and slugs are free for re-use straight away. QA forms stay when only a dialer is deleted. Every delete is in the audit log.
 
 **Retention.** Un-reviewed calls, transfers and recordings older than `RETENTION_DAYS` (default 7) are deleted nightly. Anything with an evaluation, or flagged, is kept forever — nothing a reviewer touched is ever lost. Recordings are never copied; they stay on the dialer and stream through the API on demand.
 
@@ -209,6 +213,9 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). The inst
 | `SYNC_LOOKBACK_MINUTES` | `15` | overlap re-read on every incremental sync |
 | `SYNC_HISTORICAL_DAYS` | `30` | history imported on a full sync (capped by retention) |
 | `RECORDING_CHECK_SECONDS` | `60` | recording repair job cadence |
+| `SYNC_CONCURRENCY` | `4` | dialers synced side by side (each dialer still runs one sync at a time) |
+| `PG_SHARED_BUFFERS` / `PG_EFFECTIVE_CACHE_SIZE` / `PG_WORK_MEM` | `256MB` / `1GB` / `16MB` | Postgres memory; on a bigger server set shared buffers to about a quarter of RAM |
+| `PG_LOG_SLOW_MS` | `2000` | Postgres logs statements slower than this |
 | `MATCH_AUTO_THRESHOLD` / `MATCH_FLAG_THRESHOLD` | `70` / `40` | fronter→closer match scores for auto-link and manual review |
 | `SEED_DEMO` | `false` | creates a clearly flagged demo company with synthetic data |
 
@@ -234,6 +241,7 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). The inst
 | A recording says *Being prepared on the dialer* for long | the dialer converts files 1–3 min after hangup; press **Fetch from dialer**; if it stays, the dialer never produced the file (the dialer's own lead page will show the same) |
 | Counts differ from the dialer by a few | check the dialer **time zone** on the dialer server page and the **Dispositions** mapping — every XFER code must map to *Transfer*, every sale code to *Sale* |
 | `502` right after a restart | nginx is waiting for the API; it re-resolves within 10 s |
+| The site feels slow | **Sync monitor** shows each sync's seconds per stage — a slow stage is usually the dialer answering slowly. For the database, `docker compose exec postgres psql -U vici_qa -d vici_qa -c "select calls, round(mean_exec_time) ms, left(query, 120) from pg_stat_statements order by total_exec_time desc limit 10"` lists the heaviest queries |
 | Lost the super-admin password | it is in `.env` as `SUPERADMIN_PASSWORD` at install time; otherwise reset it from **Users** with another admin |
 
 ---

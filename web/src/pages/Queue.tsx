@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { keepPreviousData, useQuery } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Download, Search } from 'lucide-react';
 import { api } from '../api/client';
+import { leadQueryOptions } from '../api/lead';
 import { DispoChip } from '../components/DispoChip';
 import type { Dialer, PageMeta, QueueItem, Transfer } from '../api/types';
 import { useCompanyScope } from '../components/Layout';
@@ -32,8 +33,36 @@ export function SaleTypeChip({ transfer }: { transfer: Transfer }) {
   return <span className="chip bg-good-soft text-good" title="Sold on the transfer's closer call">Transfer sale</span>;
 }
 
+/**
+ * Resting the pointer on a row starts loading that call (and its lead from
+ * the dialer), so by the time the reviewer clicks Open the page is ready.
+ * A short delay keeps a mouse sweeping over the table from loading every row.
+ */
+function useCallPrefetch() {
+  const queryClient = useQueryClient();
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  return {
+    start(transferId: string) {
+      window.clearTimeout(timer.current);
+      timer.current = window.setTimeout(() => {
+        void queryClient.prefetchQuery({
+          queryKey: ['transfer', transferId],
+          queryFn: () => api(`/queues/detail/${transferId}`),
+          staleTime: 15_000,
+        });
+        void queryClient.prefetchQuery(leadQueryOptions(transferId));
+      }, 150);
+    },
+    stop() {
+      window.clearTimeout(timer.current);
+    },
+  };
+}
+
 export function QueuePage() {
   const { status = 'transfer' } = useParams();
+  const prefetch = useCallPrefetch();
   const { companyId } = useCompanyScope();
   const { hasPerm } = useAuth();
   // the dialer list is an admin endpoint — reviewers just see all dialers
@@ -157,7 +186,13 @@ export function QueuePage() {
             </thead>
             <tbody className="divide-y divide-ink/5">
               {data.items.map((row) => (
-                <tr key={row.transfer.id} className="hover:bg-bg/60">
+                <tr
+                  key={row.transfer.id}
+                  className="hover:bg-bg/60"
+                  onMouseEnter={() => prefetch.start(row.transfer.id)}
+                  onMouseLeave={prefetch.stop}
+                  onFocus={() => prefetch.start(row.transfer.id)}
+                >
                   <td className="td font-mono text-2xs">{fmtDateTime(row.transfer.xferTime)}</td>
                   {status === 'transfer' && (
                     <td className="td">

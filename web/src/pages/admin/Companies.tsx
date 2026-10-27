@@ -1,9 +1,10 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 import { api, ApiError } from '../../api/client';
 import type { Company } from '../../api/types';
 import { Chip, EmptyState, ErrorState, Field, Loading, Modal, PageHeader, fmtDateTime } from '../../components/ui';
+import { DeleteConfirmModal, DeletingChip } from '../../components/DeleteConfirm';
 
 export function CompaniesPage() {
   const queryClient = useQueryClient();
@@ -11,10 +12,13 @@ export function CompaniesPage() {
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<Company | null>(null);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['companies'],
     queryFn: () => api<{ companies: Company[] }>('/companies'),
+    // while a company is being removed, follow it until it is gone
+    refetchInterval: (q) => (q.state.data?.companies.some((c) => c.status === 'deleting') ? 5_000 : false),
   });
 
   const create = useMutation({
@@ -55,19 +59,32 @@ export function CompaniesPage() {
                 <th className="th">Slug</th>
                 <th className="th">Status</th>
                 <th className="th">Created</th>
+                <th className="th text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-ink/5">
-              {data.companies.map((c) => (
-                <tr key={c.id} className="hover:bg-bg/60">
-                  <td className="td font-medium">{c.name}</td>
-                  <td className="td font-mono text-2xs">{c.slug}</td>
-                  <td className="td">
-                    <Chip value={c.status} />
-                  </td>
-                  <td className="td font-mono text-2xs">{fmtDateTime(c.createdAt)}</td>
-                </tr>
-              ))}
+              {data.companies.map((c) => {
+                const isDeleting = c.status === 'deleting';
+                return (
+                  <tr key={c.id} className={isDeleting ? 'opacity-70' : 'hover:bg-bg/60'}>
+                    <td className="td font-medium">{c.name}</td>
+                    <td className="td font-mono text-2xs">{isDeleting ? '—' : c.slug}</td>
+                    <td className="td">{isDeleting ? <DeletingChip /> : <Chip value={c.status} />}</td>
+                    <td className="td font-mono text-2xs">{fmtDateTime(c.createdAt)}</td>
+                    <td className="td text-right">
+                      {!isDeleting && (
+                        <button
+                          className="btn-secondary px-2 py-1 text-2xs text-bad hover:bg-bad-soft"
+                          onClick={() => setDeleting(c)}
+                          aria-label={`Delete ${c.name}`}
+                        >
+                          <Trash2 size={13} /> Delete
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -95,6 +112,22 @@ export function CompaniesPage() {
           </button>
         </div>
       </Modal>
+
+      {deleting && (
+        <DeleteConfirmModal
+          open={!!deleting}
+          onClose={() => setDeleting(null)}
+          kind="company"
+          name={deleting.name}
+          usagePath={`/companies/${deleting.id}/usage`}
+          deletePath={`/companies/${deleting.id}`}
+          consequences="Its users are signed out and disabled right away and its dialers stop syncing. The data is then removed in the background — the company disappears from this list when that is done."
+          onDeleted={() => {
+            void queryClient.invalidateQueries({ queryKey: ['companies'] });
+            void queryClient.invalidateQueries({ queryKey: ['dialers'] });
+          }}
+        />
+      )}
     </div>
   );
 }

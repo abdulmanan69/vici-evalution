@@ -8,7 +8,8 @@ import { fetchNote, useFetchRecordings, useLiveRecordings, type LegState, type R
 import { useAuth } from '../auth/AuthContext';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
-import { LeadCard, type LeadInfo } from '../components/LeadCard';
+import { LeadCard } from '../components/LeadCard';
+import { useLeadInfo } from '../api/lead';
 import { SaleTypeChip } from './Queue';
 import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 
@@ -19,9 +20,6 @@ interface Detail {
   closerCall: Call | null;
   /** a later call of the lead that carried the sale */
   saleCall: (Call & { agentName: string | null }) | null;
-  lead: LeadInfo | null;
-  /** the list's custom_<id> fields, when the dialer has them */
-  leadCustom: LeadInfo | null;
   fronterAgentUser: string | null;
   fronterAgentName: string | null;
   closerAgentUser: string | null;
@@ -240,6 +238,8 @@ export function TransferDetailPage() {
   // recordings follow the dialer live; everything else is the snapshot above
   const liveQ = useLiveRecordings(id);
   const fetchRecs = useFetchRecordings(id);
+  // lead details come from the dialer in parallel — the page never waits on them
+  const leadQ = useLeadInfo(id);
 
   const { data: formsData } = useQuery({
     queryKey: ['forms', data?.transfer.companyId],
@@ -374,9 +374,12 @@ export function TransferDetailPage() {
         </span>
       </div>
 
-      <div className="mb-3">
-        <SaleTypeChip transfer={t} />
-      </div>
+      {/* how the sale came about — only a closed call is a sale */}
+      {t.queueStatus === 'closed' && (
+        <div className="mb-3">
+          <SaleTypeChip transfer={t} />
+        </div>
+      )}
       <div className={`grid gap-4 ${legCount === 3 ? 'lg:grid-cols-3' : legCount === 2 ? 'lg:grid-cols-2' : ''}`}>
         {showFronter && (
           <CallLeg
@@ -425,7 +428,14 @@ export function TransferDetailPage() {
 
       {byLeg('other').length > 0 && <LeadRecordings items={byLeg('other')} />}
 
-      {data.lead && <LeadCard lead={data.lead} custom={data.leadCustom} />}
+      {leadQ.data?.lead ? (
+        <LeadCard lead={leadQ.data.lead} custom={leadQ.data.leadCustom} />
+      ) : leadQ.isLoading ? (
+        <div className="card mb-4 flex items-center gap-2 p-4 text-sm text-ink-3" role="status">
+          <span className="h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" aria-hidden />
+          Loading lead details from the dialer…
+        </div>
+      ) : null}
 
       <div className="mt-4 grid gap-4 lg:grid-cols-2">
         <div className="card p-4">

@@ -1,11 +1,12 @@
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, RefreshCw, Satellite } from 'lucide-react';
+import { Plus, RefreshCw, Satellite, Trash2 } from 'lucide-react';
 import { api, ApiError } from '../../api/client';
 import type { Dialer } from '../../api/types';
 import { useAuth } from '../../auth/AuthContext';
 import { useCompanyScope } from '../../components/Layout';
 import { Chip, EmptyState, ErrorState, Field, Loading, Modal, PageHeader, fmtDateTime } from '../../components/ui';
+import { DeleteConfirmModal, DeletingChip } from '../../components/DeleteConfirm';
 
 interface DialerForm {
   name: string;
@@ -101,10 +102,14 @@ export function DialersPage() {
   }, []);
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>({});
+  const [deleting, setDeleting] = useState<Dialer | null>(null);
 
   const { data, isLoading, isError, refetch } = useQuery({
-    queryKey: ['dialers', companyId],
-    queryFn: () => api<{ dialers: Dialer[] }>('/dialers', { query: { companyId: companyId || undefined } }),
+    queryKey: ['dialers', companyId, 'admin'],
+    queryFn: () =>
+      api<{ dialers: Dialer[] }>('/dialers', { query: { companyId: companyId || undefined, includeDeleting: true } }),
+    // while a dialer is being removed, follow it until it is gone
+    refetchInterval: (q) => (q.state.data?.dialers.some((d) => d.deletingAt) ? 5_000 : false),
   });
 
   const openEditor = (d: Dialer | 'new') => {
@@ -195,6 +200,20 @@ export function DialersPage() {
         <div className="space-y-3">
           {data.dialers.map((d) => {
             const t = testResult[d.id];
+            if (d.deletingAt) {
+              return (
+                <div key={d.id} className="card p-4 opacity-70">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-display font-bold">{d.name}</span>
+                    <DeletingChip />
+                  </div>
+                  <p className="mt-1 text-2xs text-ink-3">
+                    Sync stopped. Its calls, recordings and evaluations are being removed in the background — it
+                    disappears from this list when that is done.
+                  </p>
+                </div>
+              );
+            }
             return (
               <div key={d.id} className="card p-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -221,6 +240,14 @@ export function DialersPage() {
                     </button>
                     <button className="btn-primary" onClick={() => openEditor(d)}>
                       Edit
+                    </button>
+                    <button
+                      className="btn-secondary text-bad hover:bg-bad-soft"
+                      onClick={() => setDeleting(d)}
+                      aria-label={`Delete ${d.name}`}
+                      title="Delete this dialer and its data"
+                    >
+                      <Trash2 size={14} /> Delete
                     </button>
                   </div>
                 </div>
@@ -342,6 +369,21 @@ export function DialersPage() {
           {editing === 'new' ? 'Add dialer' : 'Save changes'}
         </button>
       </Modal>
+
+      {deleting && (
+        <DeleteConfirmModal
+          open={!!deleting}
+          onClose={() => setDeleting(null)}
+          kind="dialer"
+          name={deleting.name}
+          usagePath={`/dialers/${deleting.id}/usage`}
+          deletePath={`/dialers/${deleting.id}`}
+          consequences="It stops syncing right away and leaves every list and filter. Its calls, recordings, transfers and their evaluations are then removed in the background. QA forms stay."
+          onDeleted={() => {
+            void queryClient.invalidateQueries({ queryKey: ['dialers'] });
+          }}
+        />
+      )}
     </div>
   );
 }

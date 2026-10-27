@@ -199,7 +199,7 @@ export function Layout({ children }: { children: ReactNode }) {
                   aria-label="Company scope"
                 >
                   <option value="">All companies</option>
-                  {companiesData?.companies.map((c) => (
+                  {companiesData?.companies.filter((c) => c.status !== 'deleting').map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
                     </option>

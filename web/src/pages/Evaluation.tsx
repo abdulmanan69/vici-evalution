@@ -7,7 +7,8 @@ import type { Evaluation, FormDefinition, FormQuestion } from '../api/types';
 import { fetchNote, useFetchRecordings, useLiveRecordings, type Leg, type LegState, type RecordingItem } from '../api/liveRecordings';
 import { AudioPlayer } from '../components/AudioPlayer';
 import { DispoChip, HangupChip } from '../components/DispoChip';
-import { LeadCard, type LeadInfo } from '../components/LeadCard';
+import { LeadCard } from '../components/LeadCard';
+import { useLeadInfo } from '../api/lead';
 import { Chip, ErrorState, Loading, Modal, PageHeader, fmtDateTime, fmtDuration } from '../components/ui';
 import { scoreEvaluation, type LiveScore } from '../lib/scoring';
 
@@ -351,12 +352,7 @@ export function EvaluationPage() {
   const liveQ = useLiveRecordings(data?.call?.transferId);
   const fetchRecs = useFetchRecordings(data?.call?.transferId);
   // the lead's full record from the dialer, beside the recordings
-  const leadQ = useQuery({
-    queryKey: ['transfer-lead', data?.call?.transferId],
-    queryFn: () => api<{ lead: LeadInfo | null; leadCustom: LeadInfo | null }>(`/queues/detail/${data?.call?.transferId}/lead`),
-    enabled: !!data?.call?.transferId,
-    staleTime: 60_000,
-  });
+  const leadQ = useLeadInfo(data?.call?.transferId);
 
   useEffect(() => {
     if (data) {

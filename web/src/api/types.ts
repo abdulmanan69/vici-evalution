@@ -29,6 +29,8 @@ export interface Dialer {
   timezone: string;
   active: boolean;
   lastSeenAt: string | null;
+  /** set while the dialer and its data are being deleted */
+  deletingAt?: string | null;
   hasApiCredentials: boolean;
   hasDbCredentials: boolean;
   hasRecordingAuth: boolean;

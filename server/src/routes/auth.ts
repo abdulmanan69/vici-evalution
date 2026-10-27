@@ -21,11 +21,47 @@ const changePasswordSchema = z.object({
   newPassword: z.string().min(10).max(200),
 });
 
+/**
+ * IP-wide ceiling on login attempts. The per-account limit (10 a minute) is
+ * what stops password guessing; this stops one address from spraying many
+ * accounts, yet leaves room for a whole shift logging in from one office IP.
+ */
+const LOGIN_IP_MAX_PER_MIN = 120;
+const loginAttemptsByIp = new Map<string, { windowStart: number; n: number }>();
+function tooManyLoginsFromIp(ip: string): boolean {
+  const now = Date.now();
+  if (loginAttemptsByIp.size > 10_000) loginAttemptsByIp.clear();
+  const entry = loginAttemptsByIp.get(ip);
+  if (!entry || now - entry.windowStart >= 60_000) {
+    loginAttemptsByIp.set(ip, { windowStart: now, n: 1 });
+    return false;
+  }
+  entry.n += 1;
+  return entry.n > LOGIN_IP_MAX_PER_MIN;
+}
+
 export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     '/login',
-    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    {
+      config: {
+        rateLimit: {
+          max: 10,
+          timeWindow: '1 minute',
+          // per account and address — a call centre logs in from one office
+          // IP, so an IP-only limit locked most of a shift out at once
+          hook: 'preHandler',
+          keyGenerator: (req) => {
+            const email = (req.body as { email?: unknown } | undefined)?.email;
+            return `login:${req.ip}:${typeof email === 'string' ? email.toLowerCase().trim().slice(0, 200) : ''}`;
+          },
+        },
+      },
+    },
     async (req, reply) => {
+      if (tooManyLoginsFromIp(req.ip)) {
+        return reply.status(429).send({ error: 'rate_limited', message: 'Too many sign-in attempts — wait a minute and try again' });
+      }
       const body = loginSchema.safeParse(req.body);
       if (!body.success) throw new ValidationError('Email and password are required');
       const result = await login(

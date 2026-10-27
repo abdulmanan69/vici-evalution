@@ -71,6 +71,13 @@
       "when": 1792533708112,
       "tag": "0009_task-per-method",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1793127564263,
+      "tag": "0010_perf-and-delete",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,4 @@
-import { and, eq, sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { request } from 'undici';
 import { db } from '../db/client.js';
 import { recordings } from '../db/schema.js';
@@ -57,26 +57,47 @@ export function candidateUrls(
 }
 
 const hostCache = new Map<string, { at: number; hosts: string[] }>();
+const hostRefresh = new Map<string, Promise<string[]>>();
+const HOST_TTL_MS = 10 * 60_000;
 
-/** Recording webservers this dialer uses, learned from working URLs. */
+/**
+ * Recording webservers this dialer uses, learned from working URLs. Once
+ * known, an expired entry is still answered at once while a fresh one is
+ * read in the background — no request ever waits on this lookup again.
+ */
 export async function knownRecordingHosts(dialerServerId: string, baseUrl?: string): Promise<string[]> {
   const hit = hostCache.get(dialerServerId);
-  if (hit && Date.now() - hit.at < 10 * 60_000) return hit.hosts;
-  const rows = await db
-    .select({ origin: sql<string>`substring(${recordings.locationUrl} from '^(https?://[^/]+)')` })
-    .from(recordings)
-    .where(
-      and(
-        eq(recordings.dialerServerId, dialerServerId),
-        eq(recordings.status, 'available'),
-        sql`${recordings.locationUrl} like '%/RECORDINGS/MP3/%'`,
-        sql`${recordings.updatedAt} > now() - interval '14 days'`,
-      ),
-    )
-    .groupBy(sql`1`)
-    .orderBy(sql`count(*) desc`)
-    .limit(6);
-  const hosts = rows.map((r) => r.origin).filter(Boolean);
+  if (hit && Date.now() - hit.at < HOST_TTL_MS) return hit.hosts;
+  let pending = hostRefresh.get(dialerServerId);
+  if (!pending) {
+    pending = loadRecordingHosts(dialerServerId, baseUrl).finally(() => hostRefresh.delete(dialerServerId));
+    hostRefresh.set(dialerServerId, pending);
+  }
+  if (hit) {
+    pending.catch(() => {});
+    return hit.hosts;
+  }
+  return pending;
+}
+
+async function loadRecordingHosts(dialerServerId: string, baseUrl?: string): Promise<string[]> {
+  // The latest working URLs are representative, and plain string functions
+  // replace a regular expression: over every recording that took seconds of
+  // database time each time the cache expired.
+  const result = await db.execute(sql`
+    select split_part(u, '/', 1) || '//' || split_part(u, '/', 3) as origin, count(*) as n
+      from (select ${recordings.locationUrl} as u
+              from ${recordings}
+             where ${recordings.dialerServerId} = ${dialerServerId}
+               and ${recordings.status} = 'available'
+               and ${recordings.locationUrl} like 'http%/RECORDINGS/MP3/%'
+               and ${recordings.updatedAt} > now() - interval '14 days'
+             order by ${recordings.startTime} desc nulls last
+             limit 2000) s
+     group by 1
+     order by n desc
+     limit 6`);
+  const hosts = (result.rows as { origin: string | null }[]).map((r) => r.origin ?? '').filter((o) => /^https?:\/\/[^/]+$/.test(o));
   if (baseUrl) {
     try {
       const o = new URL(baseUrl).origin;

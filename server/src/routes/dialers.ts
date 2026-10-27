@@ -1,14 +1,30 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { and, desc, eq, type SQL } from 'drizzle-orm';
+import { and, desc, eq, isNull, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { dialerServers, syncJobs } from '../db/schema.js';
 import { companyScope, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
-import { NotFoundError } from '../lib/errors.js';
+import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
 import { encryptSecret } from '../lib/crypto.js';
 import { testDialerConnection } from '../vicidial/sync.js';
-import { enqueueDialerSync } from '../lib/queue.js';
+import { dropQueuedSyncs, enqueueDialerPurge, enqueueDialerSync } from '../lib/queue.js';
+import { closePooledDbClient } from '../vicidial/dbPool.js';
+import { dialerUsage } from '../services/purge.js';
+
+/** A dialer the caller may manage, or a 404 / 403. */
+async function loadDialer(req: FastifyRequest, id: string) {
+  const parsed = z.string().uuid().safeParse(id);
+  if (!parsed.success) throw new NotFoundError('Dialer not found');
+  const [row] = await db.select().from(dialerServers).where(eq(dialerServers.id, id));
+  if (!row) throw new NotFoundError('Dialer not found');
+  companyScope(req, row.companyId); // throws on cross-company access
+  return row;
+}
+
+function assertNotDeleting(row: typeof dialerServers.$inferSelect): void {
+  if (row.deletingAt) throw new ConflictError('This dialer is being deleted');
+}
 
 const dialerSchema = z.object({
   companyId: z.string().uuid().optional(),
@@ -50,10 +66,13 @@ function publicDialer(row: typeof dialerServers.$inferSelect) {
 
 export async function dialerRoutes(app: FastifyInstance): Promise<void> {
   app.get('/', { preHandler: [requirePermission('admin.dialers')] }, async (req) => {
-    const q = req.query as { companyId?: string };
+    const q = req.query as { companyId?: string; includeDeleting?: string };
     const scope = companyScope(req, q.companyId);
     const where: SQL[] = [];
     if (scope) where.push(eq(dialerServers.companyId, scope));
+    // pickers never offer a dialer that is being deleted; the admin page
+    // shows it with its progress
+    if (q.includeDeleting !== 'true') where.push(isNull(dialerServers.deletingAt));
     const rows = await db
       .select()
       .from(dialerServers)
@@ -99,9 +118,8 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
   app.patch('/:id', { preHandler: [requirePermission('admin.dialers')] }, async (req) => {
     const { id } = req.params as { id: string };
     const body = dialerSchema.partial().parse(req.body);
-    const [before] = await db.select().from(dialerServers).where(eq(dialerServers.id, id));
-    if (!before) throw new NotFoundError('Dialer not found');
-    companyScope(req, before.companyId); // throws on cross-company access
+    const before = await loadDialer(req, id);
+    assertNotDeleting(before);
 
     const set: Partial<typeof dialerServers.$inferInsert> = { updatedAt: new Date() };
     if (body.name !== undefined) set.name = body.name;
@@ -136,9 +154,8 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/:id/test', { preHandler: [requirePermission('admin.dialers')] }, async (req) => {
     const { id } = req.params as { id: string };
-    const [row] = await db.select().from(dialerServers).where(eq(dialerServers.id, id));
-    if (!row) throw new NotFoundError('Dialer not found');
-    companyScope(req, row.companyId);
+    const row = await loadDialer(req, id);
+    assertNotDeleting(row);
     const result = await testDialerConnection(id);
     await audit(req, { action: 'dialer.test', entityType: 'dialer', entityId: id, after: result, companyId: row.companyId });
     return result;
@@ -147,9 +164,8 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
   app.post('/:id/sync', { preHandler: [requirePermission('admin.sync')] }, async (req) => {
     const { id } = req.params as { id: string };
     const q = req.query as { full?: string };
-    const [row] = await db.select().from(dialerServers).where(eq(dialerServers.id, id));
-    if (!row) throw new NotFoundError('Dialer not found');
-    companyScope(req, row.companyId);
+    const row = await loadDialer(req, id);
+    assertNotDeleting(row);
     await enqueueDialerSync(id, q.full === 'true');
     await audit(req, { action: 'dialer.sync_trigger', entityType: 'dialer', entityId: id, companyId: row.companyId });
     return { queued: true };
@@ -157,9 +173,7 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/:id/jobs', { preHandler: [requirePermission('admin.sync')] }, async (req) => {
     const { id } = req.params as { id: string };
-    const [row] = await db.select().from(dialerServers).where(eq(dialerServers.id, id));
-    if (!row) throw new NotFoundError('Dialer not found');
-    companyScope(req, row.companyId);
+    await loadDialer(req, id);
     const jobs = await db
       .select()
       .from(syncJobs)
@@ -167,5 +181,47 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
       .orderBy(desc(syncJobs.createdAt))
       .limit(50);
     return { jobs };
+  });
+
+  // What a delete would remove — the confirmation dialog shows it first.
+  app.get('/:id/usage', { preHandler: [requirePermission('admin.dialers')] }, async (req) => {
+    const { id } = req.params as { id: string };
+    await loadDialer(req, id);
+    return { usage: await dialerUsage(id) };
+  });
+
+  // Delete a dialer with all its calls, recordings, transfers and their
+  // evaluations. The admin types the dialer's name to confirm. The dialer
+  // stops syncing and leaves every picker at once; the worker removes the
+  // data in the background (services/purge.ts) and finally the dialer row.
+  app.delete('/:id', { preHandler: [requirePermission('admin.dialers')] }, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = z.object({ confirmName: z.string().max(200) }).parse(req.body ?? {});
+    const row = await loadDialer(req, id);
+    if (row.deletingAt) {
+      // already on its way out — make sure the background job exists
+      await enqueueDialerPurge(id);
+      return reply.status(202).send({ deleting: true });
+    }
+    if (body.confirmName.trim() !== row.name.trim()) {
+      throw new ValidationError('Type the dialer name exactly as shown to confirm');
+    }
+    const usage = await dialerUsage(id);
+    await db
+      .update(dialerServers)
+      .set({ active: false, deletingAt: new Date(), updatedAt: new Date() })
+      .where(eq(dialerServers.id, id));
+    await dropQueuedSyncs(id);
+    closePooledDbClient(id);
+    await enqueueDialerPurge(id);
+    await audit(req, {
+      action: 'dialer.delete',
+      entityType: 'dialer',
+      entityId: id,
+      before: publicDialer(row),
+      after: { usage },
+      companyId: row.companyId,
+    });
+    return reply.status(202).send({ deleting: true, usage });
   });
 }

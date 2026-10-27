@@ -30,10 +30,21 @@ export function decodeViciText<T extends Record<string, unknown>>(row: T): T {
   return out as T;
 }
 
+export interface ViciDbPoolOptions {
+  /** parallel connections to the dialer (default 3 — syncs are sequential) */
+  connectionLimit?: number;
+  /** keep idle connections this long, so the next lookup skips the handshake */
+  idleTimeoutMs?: number;
+}
+
+const NO_SUCH_TABLE = 1146;
+
 export class ViciDbClient {
   private pool: mysql.Pool;
+  /** whether custom_<list_id> exists — fields rarely change, so remembered */
+  private customTables = new Map<number, { exists: boolean; at: number }>();
 
-  constructor(conn: DialerConnection) {
+  constructor(conn: DialerConnection, opts: ViciDbPoolOptions = {}) {
     if (!conn.db) throw new Error(`Dialer ${conn.name} has no database credentials`);
     this.pool = mysql.createPool({
       host: conn.db.host,
@@ -41,7 +52,10 @@ export class ViciDbClient {
       database: conn.db.database,
       user: conn.db.user,
       password: conn.db.password,
-      connectionLimit: 3,
+      connectionLimit: opts.connectionLimit ?? 3,
+      maxIdle: opts.connectionLimit ?? 3,
+      idleTimeout: opts.idleTimeoutMs ?? 60_000,
+      enableKeepAlive: true,
       connectTimeout: 10_000,
       // VICIdial stores local time; we read strings and convert explicitly.
       dateStrings: true,
@@ -185,16 +199,47 @@ export class ViciDbClient {
   /** recording_log rows; vicidial_id is the uniqueid of the recorded leg. */
   async fetchRecordings(since: string, until: string, limit = 5000, archive = false): Promise<ViciRecordingRow[]> {
     const table = archive ? 'recording_log_archive' : 'recording_log';
+    // Stock VICIdial has no index on recording_log.start_time, so a time
+    // filter alone scans the whole table — on a busy dialer hundreds of
+    // thousands of rows, seconds of load on its database every sync. The
+    // primary key grows with start_time, so the scan is bounded to the ids
+    // that reach back to `since` (found by a few primary-key lookups).
+    const fromId = archive ? null : await this.recordingIdFloor(since).catch(() => null);
     const [rows] = await this.pool.query(
       `SELECT recording_id, start_time, length_in_sec, filename, location,
               lead_id, user, vicidial_id
          FROM ${table}
-        WHERE start_time > ? AND start_time <= ?
+        WHERE ${fromId != null ? 'recording_id >= ? AND ' : ''}start_time > ? AND start_time <= ?
         ORDER BY start_time ASC
         LIMIT ?`,
-      [since, until, limit],
+      fromId != null ? [fromId, since, until, limit] : [since, until, limit],
     );
     return rows as ViciRecordingRow[];
+  }
+
+  /**
+   * The lowest recording_id that can hold a recording started after `since`
+   * (dialer-local 'YYYY-MM-DD HH:MM:SS'), or null when the bound would cover
+   * most of the table anyway. Steps back from the newest id, widening each
+   * time, until the row there started at or before `since`.
+   */
+  async recordingIdFloor(since: string): Promise<number | null> {
+    const [maxRows] = await this.pool.query('SELECT MAX(recording_id) AS mx FROM recording_log');
+    const max = Number((maxRows as { mx: unknown }[])[0]?.mx);
+    if (!Number.isFinite(max) || max <= 0) return null;
+    for (let span = 2_000; span <= 1_000_000; span *= 5) {
+      const lo = max - span;
+      if (lo <= 0) return null;
+      const [probe] = await this.pool.query(
+        'SELECT start_time FROM recording_log WHERE recording_id >= ? ORDER BY recording_id ASC LIMIT 1',
+        [lo],
+      );
+      const start = (probe as { start_time: string | null }[])[0]?.start_time;
+      // ids are handed out at call start, so everything below `lo` started
+      // earlier still; a margin covers recordings that began the same second
+      if (start && start <= since) return Math.max(0, lo - 200);
+    }
+    return null;
   }
 
   /** One lead's details for the call page — primary-key lookup, milliseconds. */
@@ -204,35 +249,79 @@ export class ViciDbClient {
    * custom_<list_id> table. Free text comes back with VICIdial's "!N" line
    * breaks decoded.
    */
-  async fetchLead(leadId: number): Promise<LeadInfo | null> {
-    const [rows] = await this.pool.query(`SELECT * FROM vicidial_list WHERE lead_id = ? LIMIT 1`, [leadId]);
-    const lead = (rows as Record<string, unknown>[])[0];
-    if (!lead) return null;
-    let list: Record<string, unknown> | null = null;
-    let custom: Record<string, unknown> | null = null;
+  /**
+   * A lead, its list and its custom fields. The dialer is often far away, so
+   * round trips are what cost time: the list rides along in the lead query,
+   * and when the caller already knows the list (from the synced call) the
+   * custom fields are read in parallel — one round trip in the usual case.
+   */
+  async fetchLead(leadId: number, listIdHint?: number | null): Promise<LeadInfo | null> {
+    const hint = listIdHint != null && Number.isFinite(Number(listIdHint)) ? Math.trunc(Number(listIdHint)) : null;
+    const [found, guessedCustom] = await Promise.all([
+      this.leadWithList(leadId),
+      hint != null ? this.customFields(hint, leadId) : Promise.resolve(undefined),
+    ]);
+    if (!found) return null;
+    const { lead, list } = found;
     const listId = Number(lead.list_id);
+    let custom: Record<string, unknown> | null = null;
     if (Number.isFinite(listId)) {
-      try {
-        const [l] = await this.pool.query(
-          `SELECT list_id, list_name, campaign_id, active, list_description FROM vicidial_lists WHERE list_id = ? LIMIT 1`,
-          [listId],
-        );
-        list = (l as Record<string, unknown>[])[0] ?? null;
-      } catch {
-        list = null;
-      }
-      try {
-        const table = `custom_${Math.trunc(listId)}`;
-        const [t] = await this.pool.query(`SHOW TABLES LIKE ?`, [table]);
-        if ((t as unknown[]).length > 0) {
-          const [c] = await this.pool.query(`SELECT * FROM \`${table}\` WHERE lead_id = ? LIMIT 1`, [leadId]);
-          custom = (c as Record<string, unknown>[])[0] ?? null;
-        }
-      } catch {
-        custom = null; // the read-only user may not see custom tables
-      }
+      // the lead may have moved lists since the call — then read the right table
+      custom = hint === Math.trunc(listId) && guessedCustom !== undefined ? guessedCustom : await this.customFields(listId, leadId);
     }
     return { lead: decodeViciText(lead), list, custom: custom ? decodeViciText(custom) : null };
+  }
+
+  private async leadWithList(
+    leadId: number,
+  ): Promise<{ lead: Record<string, unknown>; list: Record<string, unknown> | null } | null> {
+    try {
+      const [rows] = await this.pool.query(
+        `SELECT l.*, ls.list_name AS __ls_list_name, ls.campaign_id AS __ls_campaign_id,
+                ls.active AS __ls_active, ls.list_description AS __ls_list_description
+           FROM vicidial_list l
+           LEFT JOIN vicidial_lists ls ON ls.list_id = l.list_id
+          WHERE l.lead_id = ? LIMIT 1`,
+        [leadId],
+      );
+      const row = (rows as Record<string, unknown>[])[0];
+      if (!row) return null;
+      const lead: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(row)) if (!k.startsWith('__ls_')) lead[k] = v;
+      const list =
+        row.__ls_list_name != null || row.__ls_campaign_id != null
+          ? {
+              list_id: row.list_id,
+              list_name: row.__ls_list_name,
+              campaign_id: row.__ls_campaign_id,
+              active: row.__ls_active,
+              list_description: row.__ls_list_description,
+            }
+          : null;
+      return { lead, list };
+    } catch {
+      // a read-only user without access to vicidial_lists: the lead alone
+      const [rows] = await this.pool.query(`SELECT * FROM vicidial_list WHERE lead_id = ? LIMIT 1`, [leadId]);
+      const lead = (rows as Record<string, unknown>[])[0];
+      return lead ? { lead, list: null } : null;
+    }
+  }
+
+  private async customFields(listId: number, leadId: number): Promise<Record<string, unknown> | null> {
+    const id = Math.trunc(listId);
+    const known = this.customTables.get(id);
+    if (known && !known.exists && Date.now() - known.at < 10 * 60_000) return null;
+    try {
+      const [c] = await this.pool.query(`SELECT * FROM \`custom_${id}\` WHERE lead_id = ? LIMIT 1`, [leadId]);
+      this.customTables.set(id, { exists: true, at: Date.now() });
+      return (c as Record<string, unknown>[])[0] ?? null;
+    } catch (err) {
+      // no custom fields on this list, or the read-only user cannot see them
+      if ((err as { errno?: number }).errno === NO_SUCH_TABLE || (err as { code?: string }).code === 'ER_TABLEACCESS_DENIED_ERROR') {
+        this.customTables.set(id, { exists: false, at: Date.now() });
+      }
+      return null;
+    }
   }
 
   async fetchUsers(): Promise<ViciUserRow[]> {
