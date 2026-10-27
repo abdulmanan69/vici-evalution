@@ -8,7 +8,7 @@ import { audit } from '../lib/audit.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
 import { ROLE_PRESETS } from '../auth/permissions.js';
 import { ensureDefaultForms } from '../services/ensureDefaultForms.js';
-import { companyUsage } from '../services/purge.js';
+import { companyUsage, rehomeSharedPeople } from '../services/purge.js';
 import { dropQueuedSyncs, enqueueCompanyPurge } from '../lib/queue.js';
 import { closePooledDbClient } from '../vicidial/dbPool.js';
 import { invalidateAuthCache } from '../auth/session.js';
@@ -137,6 +137,9 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
         .update(companies)
         .set({ status: 'deleting', slug: `deleted-${id}`, updatedAt: new Date() })
         .where(eq(companies.id, id));
+      // people who also work in other companies keep working there: their
+      // account moves to one of those before the rest is signed out
+      await rehomeSharedPeople(id, tx);
       const companyUsers = tx.select({ id: users.id }).from(users).where(eq(users.companyId, id));
       await tx.delete(sessions).where(inArray(sessions.userId, companyUsers));
       await tx.update(users).set({ status: 'disabled', updatedAt: new Date() }).where(eq(users.companyId, id));

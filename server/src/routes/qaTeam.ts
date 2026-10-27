@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { and, eq, inArray } from 'drizzle-orm';
 import { db } from '../db/client.js';
@@ -7,6 +7,7 @@ import { companyScope, requirePermission } from '../auth/plugin.js';
 import { hasPermission } from '../auth/permissions.js';
 import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
+import { companyPeople, personInCompany, type CompanyPerson } from '../lib/people.js';
 
 const assignmentsBody = z.object({
   assignments: z
@@ -24,38 +25,71 @@ function isReviewerRole(permissions: string[]): boolean {
   return hasPermission(permissions, 'qa.evaluate') && !hasPermission(permissions, 'qa.forms.manage');
 }
 
+/**
+ * The company whose reviewer list is being managed and the person as they
+ * work there. Managers use their active company; a super admin the company
+ * in scope, else the reviewer's own company.
+ */
+async function reviewerHere(req: FastifyRequest, userId: string): Promise<{ companyId: string; person: CompanyPerson }> {
+  const q = req.query as { companyId?: string };
+  let companyId = companyScope(req, q.companyId);
+  if (!companyId) {
+    const [u] = await db.select({ companyId: users.companyId }).from(users).where(eq(users.id, userId));
+    companyId = u?.companyId ?? undefined;
+  }
+  if (!companyId) throw new NotFoundError('Reviewer not found');
+  const person = await personInCompany(userId, companyId);
+  if (!person) throw new NotFoundError('Reviewer not found');
+  return { companyId, person };
+}
+
 export async function qaTeamRoutes(app: FastifyInstance): Promise<void> {
   app.get('/', { preHandler: [requirePermission('qa.assign')] }, async (req) => {
     const q = req.query as { companyId?: string };
     const scope = companyScope(req, q.companyId);
-    const rows = await db
-      .select({
-        id: users.id,
-        name: users.name,
-        email: users.email,
-        status: users.status,
-        companyId: users.companyId,
-        allowedFormIds: users.allowedFormIds,
-        permissions: roles.permissions,
-        roleName: roles.name,
-      })
-      .from(users)
-      .innerJoin(roles, eq(users.roleId, roles.id))
-      .where(scope ? eq(users.companyId, scope) : undefined)
-      .orderBy(users.name);
+    // reviewers of this company, including people shared from other companies
+    // who review here; without a company in scope (super admin), everyone's
+    // own company
+    const rows = scope
+      ? (await companyPeople(scope)).map((p) => ({ ...p, companyId: scope }))
+      : (
+          await db
+            .select({
+              id: users.id,
+              name: users.name,
+              email: users.email,
+              status: users.status,
+              companyId: users.companyId,
+              allowedFormIds: users.allowedFormIds,
+              permissions: roles.permissions,
+              roleName: roles.name,
+            })
+            .from(users)
+            .innerJoin(roles, eq(users.roleId, roles.id))
+            .orderBy(users.name)
+        ).map((r) => ({ ...r, shared: false }));
     const reviewers = rows.filter((r) => r.companyId && isReviewerRole(r.permissions));
 
     const ids = reviewers.map((r) => r.id);
     const assignments = ids.length
       ? await db
-          .select({ reviewerUserId: reviewerAgentAssignments.reviewerUserId, methods: reviewerAgentAssignments.methods })
+          .select({
+            reviewerUserId: reviewerAgentAssignments.reviewerUserId,
+            companyId: reviewerAgentAssignments.companyId,
+            methods: reviewerAgentAssignments.methods,
+          })
           .from(reviewerAgentAssignments)
-          .where(inArray(reviewerAgentAssignments.reviewerUserId, ids))
+          .where(
+            and(
+              inArray(reviewerAgentAssignments.reviewerUserId, ids),
+              scope ? eq(reviewerAgentAssignments.companyId, scope) : undefined,
+            ),
+          )
       : [];
 
     return {
       reviewers: reviewers.map((r) => {
-        const mine = assignments.filter((a) => a.reviewerUserId === r.id);
+        const mine = assignments.filter((a) => a.reviewerUserId === r.id && a.companyId === r.companyId);
         const methodCounts = { transfer: 0, unclosed: 0, closed: 0 };
         for (const a of mine) for (const m of a.methods) methodCounts[m] += 1;
         return {
@@ -65,6 +99,7 @@ export async function qaTeamRoutes(app: FastifyInstance): Promise<void> {
           status: r.status,
           roleName: r.roleName,
           allowedFormIds: r.allowedFormIds,
+          shared: r.shared,
           agentCount: mine.length,
           methodCounts,
         };
@@ -74,9 +109,7 @@ export async function qaTeamRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/:userId/assignments', { preHandler: [requirePermission('qa.assign')] }, async (req) => {
     const { userId } = req.params as { userId: string };
-    const [reviewer] = await db.select().from(users).where(eq(users.id, userId));
-    if (!reviewer || !reviewer.companyId) throw new NotFoundError('Reviewer not found');
-    companyScope(req, reviewer.companyId);
+    const { companyId } = await reviewerHere(req, userId);
     const rows = await db
       .select({
         viciAgentId: reviewerAgentAssignments.viciAgentId,
@@ -89,7 +122,7 @@ export async function qaTeamRoutes(app: FastifyInstance): Promise<void> {
       .from(reviewerAgentAssignments)
       .innerJoin(viciAgents, eq(reviewerAgentAssignments.viciAgentId, viciAgents.id))
       .innerJoin(dialerServers, eq(viciAgents.dialerServerId, dialerServers.id))
-      .where(eq(reviewerAgentAssignments.reviewerUserId, userId))
+      .where(and(eq(reviewerAgentAssignments.reviewerUserId, userId), eq(reviewerAgentAssignments.companyId, companyId)))
       .orderBy(viciAgents.fullName);
     return { assignments: rows };
   });
@@ -98,15 +131,8 @@ export async function qaTeamRoutes(app: FastifyInstance): Promise<void> {
   app.put('/:userId/assignments', { preHandler: [requirePermission('qa.assign')] }, async (req) => {
     const { userId } = req.params as { userId: string };
     const body = assignmentsBody.parse(req.body);
-    const [reviewer] = await db
-      .select({ user: users, permissions: roles.permissions })
-      .from(users)
-      .innerJoin(roles, eq(users.roleId, roles.id))
-      .where(eq(users.id, userId));
-    if (!reviewer || !reviewer.user.companyId) throw new NotFoundError('Reviewer not found');
-    const companyId = reviewer.user.companyId;
-    companyScope(req, companyId);
-    if (!isReviewerRole(reviewer.permissions)) {
+    const { companyId, person } = await reviewerHere(req, userId);
+    if (!isReviewerRole(person.permissions)) {
       throw new ValidationError('Only QA reviewers can be assigned agents — managers already see everything');
     }
 
@@ -125,7 +151,11 @@ export async function qaTeamRoutes(app: FastifyInstance): Promise<void> {
     }
 
     await db.transaction(async (tx) => {
-      await tx.delete(reviewerAgentAssignments).where(eq(reviewerAgentAssignments.reviewerUserId, userId));
+      // only this company's list — someone reviewing for several companies
+      // keeps their agents everywhere else
+      await tx
+        .delete(reviewerAgentAssignments)
+        .where(and(eq(reviewerAgentAssignments.reviewerUserId, userId), eq(reviewerAgentAssignments.companyId, companyId)));
       if (body.assignments.length > 0) {
         await tx.insert(reviewerAgentAssignments).values(
           body.assignments.map((a) => ({

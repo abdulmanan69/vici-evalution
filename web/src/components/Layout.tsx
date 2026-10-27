@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
 import { NavLink } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import {
@@ -89,9 +89,76 @@ const NAV: { group: string; items: NavItem[] }[] = [
   },
 ];
 
+const SWITCH_KEY = 'qa-company-switch';
+
+/**
+ * For people who work in more than one company: picks the company this
+ * session works in. Every page, queue, task and report then follows it.
+ * Other open tabs reload into the chosen company too.
+ */
+function CompanySwitcher() {
+  const { user } = useAuth();
+  const [switching, setSwitching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const list = user?.companies ?? [];
+  if (!user || list.length < 2) return null;
+
+  const change = async (companyId: string) => {
+    if (companyId === user.companyId) return;
+    setSwitching(true);
+    setError(null);
+    try {
+      await api('/auth/company', { method: 'POST', body: { companyId } });
+      try {
+        localStorage.setItem(SWITCH_KEY, `${companyId}:${Date.now()}`);
+      } catch {
+        // storage unavailable — other tabs catch up on their next reload
+      }
+      // a fresh start: nothing from the previous company stays on screen
+      window.location.assign('/');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not switch company');
+      setSwitching(false);
+    }
+  };
+
+  return (
+    <>
+      <Building2 size={14} className="text-ink-3" />
+      <span className="text-2xs font-semibold uppercase tracking-wider text-ink-2">Company</span>
+      <select
+        className="input w-auto min-w-[14rem] max-w-[24rem]"
+        value={user.companyId ?? ''}
+        onChange={(e) => void change(e.target.value)}
+        disabled={switching}
+        aria-label="Company you are working in"
+        title="Switch to another company you work in"
+      >
+        {list.map((c) => (
+          <option key={c.id} value={c.id}>
+            {c.name} · {c.roleName.replace(/_/g, ' ')}
+          </option>
+        ))}
+      </select>
+      {switching && <span className="text-2xs text-ink-3">Switching…</span>}
+      {error && <span className="text-2xs text-bad">{error}</span>}
+    </>
+  );
+}
+
 export function Layout({ children }: { children: ReactNode }) {
   const { user, hasPerm, isSuperAdmin, logout } = useAuth();
   const [companyId, setCompanyId] = useState('');
+
+  // another tab switched company: follow it, so no tab shows one company's
+  // screen while its requests already answer for another
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === SWITCH_KEY && e.newValue) window.location.assign('/');
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   const { data: companiesData } = useQuery({
     queryKey: ['companies'],
@@ -175,9 +242,11 @@ export function Layout({ children }: { children: ReactNode }) {
           </nav>
           <div className="border-t border-ink/10 p-3">
             <div className="mb-2 px-1">
-              <div className="truncate text-sm font-medium">{user?.name}</div>
-              <div className="truncate text-2xs text-ink-3">
-                {user?.roleName.replace(/_/g, ' ')} · {user?.email}
+              <div className="truncate text-sm font-medium" title={user?.email}>
+                {user?.name}
+              </div>
+              <div className="truncate text-2xs text-ink-3" title={user?.email}>
+                {user?.roleName.replace(/_/g, ' ')} · {user?.companyName ?? user?.email}
               </div>
             </div>
             <button onClick={() => void logout()} className="btn-secondary w-full justify-center">
@@ -207,6 +276,7 @@ export function Layout({ children }: { children: ReactNode }) {
                 </select>
               </>
             )}
+            {!isSuperAdmin && <CompanySwitcher />}
             <div className="ml-auto flex items-center gap-2">
               <Clock size={14} className="text-ink-3" />
               <span className="text-2xs font-semibold uppercase tracking-wider text-ink-2">Times in</span>

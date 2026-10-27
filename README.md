@@ -182,8 +182,11 @@ They are ordinary forms: edit them, add questions, re-publish (each publish is a
 | Logs (API / worker) | `docker compose logs -f api` · `docker compose logs -f worker` |
 | Restart everything | `docker compose restart` |
 | Full re-sync of a dialer | **Dialer servers → Sync (full)** |
+| Let one person work in several companies | **Users & roles → Companies** on their row (super admins) |
 | Delete a dialer | **Dialer servers → Delete** (company admins and super admins) |
 | Delete a company | **Companies → Delete** (super admins only) |
+
+**People in several companies.** A manager or evaluator who works for more than one company keeps one login. A super admin opens **Users & roles → Companies** on that person's row, picks another company and their role there — they can be a QA manager in one company and a reviewer in another. After signing in, the person chooses the company from the **Company** switcher in the header; queues, tasks, forms, reports and evaluations all follow it, and the next sign-in opens in the company they used last. In each company the person appears in Users and QA team marked *shared*, with that company's role, QA-method limits and agent assignments. That company's admins can change their role and limits there or **Remove access**; their account itself stays with their own company. If their own company is deleted, the account moves to another company they work in.
 
 **Deleting.** The dialog first counts what goes with the item (calls, recordings, transfers, evaluations, users …) and asks for its exact name. A deleted dialer stops syncing at once and leaves every list and filter; a deleted company's users are signed out and disabled at once. The data is then removed by the worker in small batches, so a big dialer never locks the database, and the row disappears from the admin page when it is done. Names and slugs are free for re-use straight away. QA forms stay when only a dialer is deleted. Every delete is in the audit log.
 

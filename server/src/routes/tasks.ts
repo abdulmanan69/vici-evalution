@@ -7,6 +7,7 @@ import { calls, dialerServers, qaAssignments, transfers, users, viciAgents } fro
 import { companyScope, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
 import { hasPermission } from '../auth/permissions.js';
 import { authContextForUser, type AuthContext } from '../auth/session.js';
+import { personInCompany } from '../lib/people.js';
 import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
@@ -96,10 +97,12 @@ function candidateWhere(opts: CandidateOpts): SQL {
 
 async function resolveAssignContext(req: FastifyRequest, body: z.infer<typeof assignBody>) {
   const companyId = requiredCompanyScope(req, body.companyId);
-  const [reviewerRow] = await db.select().from(users).where(eq(users.id, body.reviewerId));
-  if (!reviewerRow || reviewerRow.companyId !== companyId) throw new NotFoundError('Reviewer not found');
+  // the reviewer works here — their own company or one they were given access to
+  const reviewerRow = await personInCompany(body.reviewerId, companyId);
+  if (!reviewerRow) throw new NotFoundError('Reviewer not found');
   if (reviewerRow.status !== 'active') throw new ValidationError('This reviewer is disabled');
-  const reviewer = await authContextForUser(body.reviewerId);
+  // their role, QA methods and agents in THIS company
+  const reviewer = await authContextForUser(body.reviewerId, companyId);
   if (!reviewer || !hasPermission(reviewer.permissions, 'qa.evaluate')) {
     throw new ValidationError('This user cannot evaluate calls');
   }

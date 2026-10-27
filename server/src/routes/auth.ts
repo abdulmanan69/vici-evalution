@@ -2,9 +2,9 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { config } from '../config.js';
 import { authenticate, SESSION_COOKIE } from '../auth/plugin.js';
-import { login, logout } from '../auth/session.js';
+import { companiesForUser, login, logout, switchSessionCompany } from '../auth/session.js';
 import { audit } from '../lib/audit.js';
-import { UnauthorizedError, ValidationError } from '../lib/errors.js';
+import { ForbiddenError, UnauthorizedError, ValidationError } from '../lib/errors.js';
 import { db } from '../db/client.js';
 import { dialerServers, users } from '../db/schema.js';
 import { desc, eq } from 'drizzle-orm';
@@ -110,7 +110,37 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       .where(req.auth.companyId ? eq(dialerServers.companyId, req.auth.companyId) : eq(dialerServers.active, true))
       .orderBy(desc(dialerServers.active))
       .limit(1);
-    return { user: { ...req.auth, dialerTimezone: dialer?.timezone ?? 'UTC' } };
+    // every company this person works in — the header offers a switch when
+    // there is more than one (super admins use the company scope instead)
+    const companies = req.auth.homeCompanyId ? await companiesForUser(req.auth.userId) : [];
+    return {
+      user: {
+        ...req.auth,
+        dialerTimezone: dialer?.timezone ?? 'UTC',
+        companies,
+        companyName: companies.find((c) => c.id === req.auth.companyId)?.name ?? null,
+      },
+    };
+  });
+
+  // Work in another company this person belongs to. Everything after this —
+  // queues, tasks, forms, reports, recordings — follows the chosen company.
+  app.post('/company', { preHandler: [authenticate] }, async (req) => {
+    const body = z.object({ companyId: z.string().uuid() }).parse(req.body);
+    const token = req.cookies?.[SESSION_COOKIE] ?? req.headers.authorization?.replace(/^Bearer /, '');
+    if (!token) throw new UnauthorizedError('Not signed in');
+    if (body.companyId === req.auth.companyId) return { ok: true, companyId: body.companyId };
+    const ok = await switchSessionCompany(token, req.auth.userId, body.companyId);
+    if (!ok) throw new ForbiddenError('You do not have access to that company');
+    await audit(req, {
+      action: 'auth.switch_company',
+      entityType: 'user',
+      entityId: req.auth.userId,
+      before: { companyId: req.auth.companyId },
+      after: { companyId: body.companyId },
+      companyId: body.companyId,
+    });
+    return { ok: true, companyId: body.companyId };
   });
 
   app.post('/change-password', { preHandler: [authenticate] }, async (req, reply) => {

@@ -2,7 +2,15 @@ export interface AuthUser {
   userId: string;
   email: string;
   name: string;
+  /** the company this session works in */
   companyId: string | null;
+  /** the person's own company */
+  homeCompanyId?: string | null;
+  /** name of the company this session works in */
+  companyName?: string | null;
+  /** every company the person works in (own first) — more than one shows the switcher */
+  companies?: UserCompany[];
+  /** role in the company this session works in */
   roleName: string;
   permissions: string[];
   allowedFormIds: string[] | null;
@@ -10,6 +18,14 @@ export interface AuthUser {
   allowedQueues: Array<'transfer' | 'unclosed' | 'closed'> | null;
   /** IANA zone of the company's dialer — every date filter is a day on this clock */
   dialerTimezone: string;
+}
+
+export interface UserCompany {
+  id: string;
+  name: string;
+  roleName: string;
+  /** the person's own company */
+  home: boolean;
 }
 
 export interface Company {

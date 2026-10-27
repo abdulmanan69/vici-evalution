@@ -79,6 +79,9 @@ export const users = pgTable(
     // reviewer can see and evaluate with (set by managers)
     allowedFormIds: jsonb('allowed_form_ids').$type<string[] | null>(),
     lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
+    // the company a person with several companies worked in last — their
+    // next sign-in opens there
+    lastCompanyId: uuid('last_company_id').references(() => companies.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -96,9 +99,40 @@ export const sessions = pgTable(
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
     ip: text('ip'),
     userAgent: text('user_agent'),
+    // the company this session works in; null = the user's own company
+    activeCompanyId: uuid('active_company_id').references(() => companies.id, { onDelete: 'set null' }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [index('sessions_user_idx').on(t.userId)],
+);
+
+/**
+ * Extra companies a person works in, besides their own (users.company_id).
+ * Each membership carries the person's role and QA-method limits in that
+ * company, so someone can be a QA manager in one company and a reviewer in
+ * another with one login. Granted by super admins.
+ */
+export const companyMemberships = pgTable(
+  'company_memberships',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    companyId: uuid('company_id')
+      .notNull()
+      .references(() => companies.id, { onDelete: 'cascade' }),
+    roleId: uuid('role_id')
+      .notNull()
+      .references(() => roles.id),
+    allowedFormIds: jsonb('allowed_form_ids').$type<string[] | null>(),
+    createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('company_memberships_user_company_uq').on(t.userId, t.companyId),
+    index('company_memberships_company_idx').on(t.companyId),
+  ],
 );
 
 // ---------------------------------------------------------------------------

@@ -170,9 +170,77 @@ export async function purgeCompany(companyId: string, log: PurgeLog = () => {}):
     () => sql`delete from evaluations where id in
                 (select id from evaluations where company_id = ${companyId} limit ${BATCH})`,
   );
+  // people who also work elsewhere, or whose work is on record elsewhere,
+  // keep their account in that other company
+  const shared = await rehomeSharedPeople(companyId);
+  const referenced = await rehomeReferencedUsers(companyId);
   await db.delete(companies).where(eq(companies.id, companyId));
-  log(`company ${c.name} deleted`);
+  log(
+    `company ${c.name} deleted` +
+      (shared + referenced > 0 ? ` (${shared + referenced} account(s) kept in other companies they work in)` : ''),
+  );
   return true;
+}
+
+/**
+ * People whose own company is being deleted but who also work in other
+ * companies keep their account: it moves to the first other company they
+ * were given access to, with the role they hold there.
+ */
+export async function rehomeSharedPeople(companyId: string, executor: Pick<typeof db, 'execute'> = db): Promise<number> {
+  const r = await executor.execute(sql`
+    with pick as (
+      select distinct on (m.user_id) m.id as mid, m.user_id, m.company_id, m.role_id, m.allowed_form_ids
+        from company_memberships m
+        join users u on u.id = m.user_id
+        join companies c on c.id = m.company_id
+       where u.company_id = ${companyId} and c.status <> 'deleting'
+       order by m.user_id, m.created_at
+    ), moved as (
+      update users u
+         set company_id = p.company_id, role_id = p.role_id, allowed_form_ids = p.allowed_form_ids,
+             last_company_id = null, updated_at = now()
+        from pick p
+       where u.id = p.user_id
+      returning p.mid
+    )
+    delete from company_memberships m using moved where m.id = moved.mid`);
+  return r.rowCount ?? 0;
+}
+
+/**
+ * A deleted company's users whose work is on record in another company
+ * (evaluations, tasks they assigned, forms they wrote …) cannot be deleted
+ * without losing that history. Their account moves to that company,
+ * disabled, with its least-privileged role — the history stays intact and
+ * that company's admins can switch them back on.
+ */
+async function rehomeReferencedUsers(companyId: string): Promise<number> {
+  const r = await db.execute(sql`
+    with refs as (
+      select u.id as user_id, coalesce(
+        (select e.company_id from evaluations e where e.reviewer_id = u.id and e.company_id <> ${companyId} limit 1),
+        (select a.company_id from qa_assignments a where a.assigned_by = u.id and a.company_id <> ${companyId} limit 1),
+        (select f.company_id from qa_forms f where f.created_by = u.id and f.company_id <> ${companyId} limit 1),
+        (select f.company_id from qa_form_versions v join qa_forms f on f.id = v.form_id
+          where v.created_by = u.id and f.company_id <> ${companyId} limit 1),
+        (select t.company_id from transfer_events te join transfers t on t.id = te.transfer_id
+          where te.actor_user_id = u.id and t.company_id <> ${companyId} limit 1),
+        (select d.company_id from disposition_mappings d where d.created_by = u.id and d.company_id <> ${companyId} limit 1),
+        (select ra.company_id from reviewer_agent_assignments ra where ra.created_by = u.id and ra.company_id <> ${companyId} limit 1)
+      ) as other
+        from users u
+       where u.company_id = ${companyId}
+    )
+    update users u
+       set company_id = refs.other,
+           role_id = (select r.id from roles r where r.company_id = refs.other
+                       order by (r.name = 'qa_reviewer') desc, r.name limit 1),
+           allowed_form_ids = null, status = 'disabled', last_company_id = null, updated_at = now()
+      from refs
+     where u.id = refs.user_id and refs.other is not null
+       and exists (select 1 from roles r where r.company_id = refs.other)`);
+  return r.rowCount ?? 0;
 }
 
 /** Dialers and companies whose deletion has not finished (a worker restart). */

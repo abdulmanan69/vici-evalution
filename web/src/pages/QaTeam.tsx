@@ -20,6 +20,8 @@ interface Reviewer {
   email: string;
   status: string;
   roleName: string;
+  /** reviews here with access from another company */
+  shared?: boolean;
   agentCount: number;
   methodCounts: Record<Method, number>;
 }
@@ -66,9 +68,14 @@ function ReviewerEditor({ reviewer, onSaved }: { reviewer: Reviewer; onSaved: ()
   const [dirty, setDirty] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
+  // assignments are per company — someone reviewing for several companies
+  // has a separate list in each
   const { data: current, isLoading } = useQuery({
-    queryKey: ['qa-team-assignments', reviewer.id],
-    queryFn: () => api<{ assignments: Assignment[] }>(`/qa/team/${reviewer.id}/assignments`),
+    queryKey: ['qa-team-assignments', reviewer.id, companyId],
+    queryFn: () =>
+      api<{ assignments: Assignment[] }>(`/qa/team/${reviewer.id}/assignments`, {
+        query: { companyId: companyId || undefined },
+      }),
   });
   useEffect(() => {
     if (current) {
@@ -128,6 +135,7 @@ function ReviewerEditor({ reviewer, onSaved }: { reviewer: Reviewer; onSaved: ()
     mutationFn: () =>
       api(`/qa/team/${reviewer.id}/assignments`, {
         method: 'PUT',
+        query: { companyId: companyId || undefined },
         body: { assignments: list.map((a) => ({ viciAgentId: a.viciAgentId, methods: a.methods })) },
       }),
     onSuccess: () => {
@@ -326,7 +334,14 @@ export function QaTeamPage() {
                   onClick={() => setSelectedId(r.id)}
                   className={`block w-full px-4 py-3 text-left transition-colors ${active ? 'bg-brand-soft' : 'hover:bg-bg/60'}`}
                 >
-                  <div className={`font-medium ${active ? 'text-brand' : ''}`}>{r.name}</div>
+                  <div className={`font-medium ${active ? 'text-brand' : ''}`}>
+                    {r.name}
+                    {r.shared && (
+                      <span className="chip ml-1.5 bg-info-soft text-info" title="Reviews here with access from another company">
+                        shared
+                      </span>
+                    )}
+                  </div>
                   <div className="mt-1 flex flex-wrap gap-1 text-2xs">
                     {r.agentCount === 0 ? (
                       <span className="chip bg-bg text-ink-2">All agents</span>
