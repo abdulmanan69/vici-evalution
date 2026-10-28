@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { friendlySyncError, summarizeFailures } from './sync.js';
+import { friendlySyncError, isNoRecordingsAnswer, summarizeFailures } from './sync.js';
+
+describe('isNoRecordingsAnswer', () => {
+  it('treats an empty recording_lookup as an answer', () => {
+    expect(isNoRecordingsAnswer('VICIdial API error: ERROR: recording_lookup NO RECORDINGS FOUND - apiuser||23693310||')).toBe(true);
+  });
+  it('keeps real refusals as failures', () => {
+    expect(isNoRecordingsAnswer('VICIdial API error: ERROR: recording_lookup USER DOES NOT HAVE PERMISSION TO GET RECORDING INFO - apiuser|1')).toBe(false);
+    expect(isNoRecordingsAnswer('VICIdial API error: ERROR: Invalid Username/Password: |apiuser|')).toBe(false);
+  });
+});
 
 describe('friendlySyncError', () => {
   it('names an unknown host', () => {

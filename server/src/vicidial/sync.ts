@@ -890,6 +890,24 @@ async function syncRecordingsFromDb(
   const cursor = await getCursor(conn.id, 'recording_log');
   let sinceUtc = cursor ? new Date(cursor.getTime() - CURSOR_OVERLAP_MS) : initialWindowStart(full);
   const untilUtc = new Date();
+  // The log is read forward from its cursor. A dialer's first sync started
+  // only a day back, so the days before it — imported by the 7-day import
+  // with their calls — were never read for recordings. A full import, and
+  // once any day in the window that has answered calls but almost no
+  // recordings, read the log again from the window start.
+  const windowStart = initialWindowStart(true);
+  const readFrom = await getCursor(conn.id, RECORDINGS_READ_FROM);
+  let catchUp = false;
+  if (!readFrom || readFrom.getTime() > windowStart.getTime() + 3600_000) {
+    const gapFrom = full ? windowStart : await firstRecordingGap(conn.id, windowStart);
+    if (gapFrom && gapFrom < sinceUtc) {
+      sinceUtc = gapFrom < windowStart ? windowStart : gapFrom;
+      catchUp = true;
+      (stats.notes as string[]).push(`recording log read again from ${sinceUtc.toISOString().slice(0, 10)} to fill days without recordings`);
+    } else if (!gapFrom) {
+      await setCursor(conn.id, RECORDINGS_READ_FROM, windowStart);
+    }
+  }
 
   let imported = 0;
   let unlinked = 0;
@@ -965,8 +983,36 @@ async function syncRecordingsFromDb(
   await runPass(false, sinceUtc);
 
   if (maxSeen) await setCursor(conn.id, 'recording_log', maxSeen);
+  // the log has now been read without a gap from here on
+  if (catchUp) await setCursor(conn.id, RECORDINGS_READ_FROM, sinceUtc);
   stats.recordings_imported = imported;
   if (unlinked > 0) stats.recordings_unlinked = unlinked;
+}
+
+/** cursor: how far back the recording log has been read without a gap */
+const RECORDINGS_READ_FROM = 'recording_log_from';
+
+/**
+ * The first day in the window whose answered calls have almost no
+ * recordings (under 5 % of 50+ calls) — a stretch the recording log was
+ * never read for. Null when every day is covered.
+ */
+async function firstRecordingGap(dialerServerId: string, windowStart: Date): Promise<Date | null> {
+  const res = await db.execute(sql`
+    with days as (
+      select date_trunc('day', c.call_date) as day, count(*) as answered
+        from calls c
+       where c.dialer_server_id = ${dialerServerId} and not c.is_mock
+         and c.call_date >= ${windowStart} and coalesce(c.length_sec, 0) > 0
+       group by 1)
+    select min(d.day) as gap
+      from days d
+     where d.answered >= 50
+       and (select count(*) from recordings r
+             where r.dialer_server_id = ${dialerServerId}
+               and r.start_time >= d.day and r.start_time < d.day + interval '1 day') < d.answered * 0.05`);
+  const gap = (res.rows[0] as { gap?: string | Date | null } | undefined)?.gap;
+  return gap ? new Date(gap) : null;
 }
 
 const leadLookupBackoff = new Map<string, { tries: number; next: number }>();
@@ -992,7 +1038,7 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
   // rows were re-queried every cycle and ate the whole time budget.
   const isQaLeg = sql<number>`max((exists(select 1 from transfers t where t.fronter_call_id = ${calls.id} or t.closer_call_id = ${calls.id} or t.sale_call_id = ${calls.id}))::int)`;
   const rawCandidates = await db
-    .select({ leadId: calls.viciLeadId, isQaLeg })
+    .select({ leadId: calls.viciLeadId, isQaLeg, lastCall: sql<string>`max(${calls.callDate})` })
     .from(calls)
     .where(
       and(
@@ -1013,12 +1059,18 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
   // per-lead backoff (2, 4, 8 … 60 min) so a lead whose file is not out
   // yet does not block the rest of the backlog
   const now = Date.now();
-  // calls QA reviews (transfer legs) are never held back by the backoff
+  // a transfer leg from the last two hours is asked about every cycle (its
+  // file lands minutes after hangup); older ones back off like the rest, or
+  // legs the dialer has no file for would take every cycle's time budget
   const candidates = rawCandidates.filter(
-    (c) => Number(c.isQaLeg) > 0 || (leadLookupBackoff.get(`${conn.id}:${c.leadId}`)?.next ?? 0) <= now,
+    (c) =>
+      (Number(c.isQaLeg) > 0 && new Date(c.lastCall).getTime() > now - 2 * 3600_000) ||
+      (leadLookupBackoff.get(`${conn.id}:${c.leadId}`)?.next ?? 0) <= now,
   );
 
   let found = 0;
+  let refused = 0;
+  let firstRefusal: string | null = null;
   // a time budget keeps each sync cycle short so new calls and dispositions
   // land within a minute; the backlog drains over the following cycles
   const deadline = Date.now() + RECORDING_LOOKUP_BUDGET_MS;
@@ -1029,9 +1081,12 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
       break;
     }
     if (c.leadId == null) continue;
-    const n = await lookupLeadRecordings(conn, c.leadId, lookback, api);
-    if (n == null) continue; // transient API failure — retried next cycle
-    found += n;
+    const n = await lookupLeadRecordings(conn, c.leadId, lookback, api, (message) => {
+      refused += 1;
+      firstRefusal ??= message;
+    });
+    // a refused lookup backs off too — retrying it every cycle cannot help
+    if (n != null) found += n;
     const key = `${conn.id}:${c.leadId}`;
     const tries = (leadLookupBackoff.get(key)?.tries ?? 0) + 1;
     leadLookupBackoff.set(key, { tries, next: Date.now() + Math.min(2 ** tries, 60) * 60_000 });
@@ -1040,6 +1095,15 @@ async function syncRecordingsFromApi(conn: DialerConnection, stats: SyncStats): 
     }
   }
   stats.recordings_api_found = found;
+  if (refused > 0) {
+    stats.recordings_api_refused = refused;
+    (stats.notes as string[]).push(`recording lookup refused by the dialer ${refused}×: ${firstRefusal}`);
+  }
+}
+
+/** recording_lookup reports an empty result as an ERROR line — it is an answer, not a failure */
+export function isNoRecordingsAnswer(message: string): boolean {
+  return /NO RECORDINGS FOUND/i.test(message);
 }
 
 /**
@@ -1053,11 +1117,15 @@ export async function lookupLeadRecordings(
   leadId: number,
   lookback: Date,
   api: ViciApiClient = new ViciApiClient(conn),
+  onRefused?: (message: string) => void,
 ): Promise<number | null> {
   let rows: Array<Record<string, string>>;
   try {
     rows = await api.recordingLookup({ leadId });
-  } catch {
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (isNoRecordingsAnswer(message)) return 0;
+    onRefused?.(message);
     return null;
   }
   // the lead's call legs, so each recording links to the right one
