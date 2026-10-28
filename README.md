@@ -16,10 +16,11 @@ Built for fronter → closer operations: every XFER a fronter makes is tracked t
 4. [Connect your VICIdial](#connect-your-vicidial)
 5. [Built-in QA forms](#built-in-qa-forms)
 6. [Day-to-day operations](#day-to-day-operations)
-7. [Configuration](#configuration)
-8. [Security](#security)
-9. [Troubleshooting](#troubleshooting)
-10. [Project layout & development](#project-layout--development)
+7. [Remote diagnostics](#remote-diagnostics)
+8. [Configuration](#configuration)
+9. [Security](#security)
+10. [Troubleshooting](#troubleshooting)
+11. [Project layout & development](#project-layout--development)
 
 ---
 
@@ -198,6 +199,31 @@ They are ordinary forms: edit them, add questions, re-publish (each publish is a
 
 ---
 
+## Remote diagnostics
+
+Look inside a running instance from any computer, without SSH and without a login: what is broken, how each dialer is syncing, recent errors, slow pages, the database. It is off until you set a token.
+
+1. On your computer, in this repository: `node scripts/ops.mjs init --url https://your-domain`. This writes `.ops.local` (git ignores it) with a new random token.
+2. Copy the `OPS_TOKEN` value from `.ops.local` to the server — Coolify: the application → **Environment Variables** → `OPS_TOKEN`; plain Docker: `.env` — and redeploy.
+3. Run `node scripts/ops.mjs status`.
+
+| Command | Shows |
+|---|---|
+| `status` | API, worker, database, Redis, queues and traffic at a glance; a list of **problems** found (worker down, a dialer not syncing or failing, the 7-day import unfinished, errors, slow or failed requests, restarts); every dialer's last sync and 24-hour counts |
+| `errors [--since 24h]` | warnings and errors from the API and the worker, grouped by message, with stack traces (`--list` for one line each) |
+| `logs [--since 1h] [--grep text]` | everything the worker reported (each sync, recording check, delete), plus API warnings |
+| `dialers` · `sync [--dialer name]` | per dialer: last runs, errors, slowest stages, cursors, calls/transfers/recordings in 24 h |
+| `requests` | API timing per minute and per route, and the latest requests slower than 1 s |
+| `companies` · `queues` · `db` | per-company counts; background jobs and schedules; database connections, heaviest queries, table sizes |
+| `sql "select …"` | a read-only query |
+| `probe <dialer>` | connects to that dialer's API and database now and reports what answered |
+
+Add `--json` to any command for the raw answer. Every API and worker warning, error and crash is kept in Redis — the last 2,000 warnings and errors and the last 5,000 lines — with passwords and tokens masked, so restarts do not wipe the trail.
+
+**Safety.** Nothing here changes data. Every request needs the token (`Authorization: Bearer …`); a missing or wrong one is refused and noted in the error log. Without `OPS_TOKEN` the endpoints do not exist. SQL runs as a separate read-only database login that cannot see sessions, password hashes, tokens or the encrypted dialer credentials, one statement at a time, for at most 20 s and a capped number of rows — on `users` and `dialer_servers`, name the columns (`select *` there is refused). `OPS_ALLOWED_IPS` can limit which addresses may connect. To change the token run `init --force` and update the server; to switch everything off, empty `OPS_TOKEN` and redeploy (the read-only login is disabled at the next start).
+
+---
+
 ## Configuration
 
 All settings live in `.env` (template: [`.env.example`](.env.example)). The installer fills the secrets.
@@ -223,6 +249,8 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). The inst
 | `PG_LOG_SLOW_MS` | `2000` | Postgres logs statements slower than this |
 | `MATCH_AUTO_THRESHOLD` / `MATCH_FLAG_THRESHOLD` | `70` / `40` | fronter→closer match scores for auto-link and manual review |
 | `SEED_DEMO` | `false` | creates a clearly flagged demo company with synthetic data |
+| `OPS_TOKEN` | *(empty)* | a random secret of 32+ characters turns on [remote diagnostics](#remote-diagnostics); empty = off |
+| `OPS_ALLOWED_IPS` | *(empty)* | optional comma-separated IPs / CIDR ranges allowed to use remote diagnostics |
 
 ---
 
@@ -233,6 +261,7 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). The inst
 - Postgres and the API are bound to `127.0.0.1`; only the web port (or Caddy's 80/443) faces the network.
 - Every change — users, roles, forms, dispositions, dialer settings, evaluations, playback — is written to the audit log.
 - Sessions are HTTP-only cookies, marked Secure automatically whenever the site is served over HTTPS (`COOKIE_SECURE=true` forces it).
+- Remote diagnostics are off unless `OPS_TOKEN` is set, read-only, and their SQL login has no access to sessions, password hashes or dialer credentials.
 
 ---
 
@@ -268,6 +297,7 @@ server/
   src/worker.ts          BullMQ schedulers (sync, recording repair, retention)
 web/src/                 React app (queues, call pages, evaluation, forms, reports, admin)
 docs/                    architecture and VICIdial integration notes
+scripts/ops.mjs          remote diagnostics client (no dependencies; see Remote diagnostics)
 ```
 
 Local development:

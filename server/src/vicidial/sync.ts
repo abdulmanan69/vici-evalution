@@ -344,6 +344,7 @@ export async function runDialerSync(
           finishedAt: new Date(),
         })
         .where(eq(syncJobs.id, job.id));
+      if (!ok) console.warn(`[worker] ${opts.full ? 'full' : 'incremental'} sync of ${dialer.name} finished with problems: ${summary}`);
       return stats;
     } catch (err) {
       stats.stageSeconds = reporter.stageSeconds();

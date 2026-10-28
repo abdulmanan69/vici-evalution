@@ -37,6 +37,14 @@ const envSchema = z.object({
   SYNC_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
   MATCH_AUTO_THRESHOLD: z.coerce.number().default(70),
   MATCH_FLAG_THRESHOLD: z.coerce.number().default(40),
+  /**
+   * Remote diagnostics (routes/ops.ts): a long random secret (32+ chars)
+   * turns on the read-only /api/v1/ops endpoints for whoever holds it.
+   * Empty = off.
+   */
+  OPS_TOKEN: z.string().default(''),
+  /** optional: only these IPs / CIDR ranges may use the diagnostics endpoints */
+  OPS_ALLOWED_IPS: z.string().default(''),
 });
 
 const parsed = envSchema.safeParse(process.env);

@@ -12,6 +12,8 @@ import { isCallInProgress } from './services/callRecordings.js';
 import { pendingPurges, purgeCompany, purgeDialer } from './services/purge.js';
 import { ensureDefaultMappingsEverywhere } from './services/defaultMappings.js';
 import { enqueueCompanyPurge, enqueueDialerPurge, MAINTENANCE_QUEUE, SYNC_QUEUE } from './lib/queue.js';
+import { captureConsole, captureCrashes, flushOpsLog, recordBoot, setOpsSource, startHeartbeat } from './lib/opsLog.js';
+import { buildInfo, processStats } from './lib/runtime.js';
 
 /**
  * Background worker: schedules and runs per-dialer synchronization and
@@ -244,6 +246,10 @@ async function applyRetention(): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  // every line the worker prints, and every crash, reaches the diagnostics log
+  setOpsSource('worker');
+  captureConsole({ info: true });
+  captureCrashes();
   relaxCommitDurabilityForSync();
   await runMigrations();
   const commit = await db.execute(sql`select current_setting('synchronous_commit') as v`);
@@ -313,33 +319,46 @@ async function main(): Promise<void> {
     }
   });
 
-  // repeatable schedulers
-  await syncQueue.upsertJobScheduler('tick', { every: config.SYNC_POLL_SECONDS * 1000 }, { name: 'tick' });
+  // repeatable schedulers; only the latest finished runs are kept — every
+  // run used to stay in Redis (about 2,900 a day)
+  const keep = { removeOnComplete: 50, removeOnFail: 50 };
+  await syncQueue.upsertJobScheduler('tick', { every: config.SYNC_POLL_SECONDS * 1000 }, { name: 'tick', opts: keep });
   await syncQueue.upsertJobScheduler(
     'check-recordings',
     { every: config.RECORDING_CHECK_SECONDS * 1000 },
-    { name: 'check-recordings' },
+    { name: 'check-recordings', opts: keep },
   );
   // retention moved to the maintenance queue — drop the old schedule
   await syncQueue.removeJobScheduler('retention').catch(() => false);
-  await maintenanceQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention' });
+  await maintenanceQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention', opts: keep });
   await resumePendingPurges();
 
   console.log(
     `[worker] started — polling every ${config.SYNC_POLL_SECONDS}s, recording checks every ${config.RECORDING_CHECK_SECONDS}s, ` +
       `${config.SYNC_CONCURRENCY} dialers at a time`,
   );
+  recordBoot('worker', { ...buildInfo(), concurrency: config.SYNC_CONCURRENCY });
+  // what the worker is doing right now, for remote diagnostics
+  startHeartbeat('worker', () => ({
+    ...processStats(),
+    ...buildInfo(),
+    concurrency: config.SYNC_CONCURRENCY,
+    busy: Object.fromEntries(busy),
+    recordingCheckRunning,
+  }));
 
   const shutdown = async () => {
     await Promise.all([worker.close(), maintenance.close()]);
     await Promise.all([syncQueue.close(), maintenanceQueue.close()]);
+    await flushOpsLog(1000);
     process.exit(0);
   };
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('Worker fatal error:', err);
+  await flushOpsLog(2000);
   process.exit(1);
 });

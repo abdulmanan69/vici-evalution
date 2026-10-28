@@ -70,7 +70,10 @@ services:
     logging: *logging
 
   api:
-    build: ./server
+    build:
+      context: ./server
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-}
     restart: unless-stopped
     command: ["node", "dist/index.js"]
     env_file: .env
@@ -93,7 +96,10 @@ services:
     logging: *logging
 
   worker:
-    build: ./server
+    build:
+      context: ./server
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-}
     restart: unless-stopped
     command: ["node", "dist/worker.js"]
     env_file: .env

@@ -29,6 +29,11 @@ x-app-env: &app-env
   SYNC_CONCURRENCY: ${SYNC_CONCURRENCY:-4}
   MATCH_AUTO_THRESHOLD: ${MATCH_AUTO_THRESHOLD:-70}
   MATCH_FLAG_THRESHOLD: ${MATCH_FLAG_THRESHOLD:-40}
+  # remote diagnostics (README → Remote diagnostics): a 32+ character secret
+  # turns on the read-only /api/v1/ops endpoints; empty = off
+  OPS_TOKEN: ${OPS_TOKEN:-}
+  # optional: only these IPs / CIDR ranges may use them (comma-separated)
+  OPS_ALLOWED_IPS: ${OPS_ALLOWED_IPS:-}
 
 services:
   postgres:
@@ -87,6 +92,9 @@ services:
   api:
     build:
       context: ./server
+      args:
+        # filled by Coolify when "Include Source Commit in Build" is on
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-}
     restart: unless-stopped
     command: ["node", "dist/index.js"]
     environment: *app-env
@@ -105,6 +113,8 @@ services:
   worker:
     build:
       context: ./server
+      args:
+        SOURCE_COMMIT: ${SOURCE_COMMIT:-}
     restart: unless-stopped
     command: ["node", "dist/worker.js"]
     environment: *app-env

@@ -26,12 +26,17 @@ import { auditRoutes } from './routes/audit.js';
 import { syncRoutes } from './routes/sync.js';
 import { dashboardRoutes } from './routes/dashboard.js';
 import { reportRoutes } from './routes/reports.js';
+import { opsRoutes } from './routes/ops.js';
+import { opsLogStream } from './lib/opsLog.js';
+import { recordRequest } from './lib/requestStats.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
     logger: {
       level: config.NODE_ENV === 'production' ? 'info' : 'debug',
       redact: ['req.headers.authorization', 'req.headers.cookie'],
+      // stdout as before; warnings and errors also go to the diagnostics log
+      stream: opsLogStream(),
     },
     trustProxy: true,
     bodyLimit: 1024 * 1024,
@@ -62,6 +67,17 @@ export async function buildApp(): Promise<FastifyInstance> {
       invalidateAuthCache();
     }
   });
+  // request timing for remote diagnostics (lib/requestStats.ts)
+  app.addHook('onResponse', async (req, reply) => {
+    if (req.url === '/healthz') return;
+    recordRequest({
+      method: req.method,
+      route: req.routeOptions?.url ?? '(no route)',
+      path: req.url.split('?')[0],
+      status: reply.statusCode,
+      ms: reply.elapsedTime,
+    });
+  });
 
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof AppError) {
@@ -81,7 +97,7 @@ export async function buildApp(): Promise<FastifyInstance> {
         message: typeof fe.message === 'string' ? fe.message : 'Request error',
       });
     }
-    req.log.error({ err }, 'unhandled error');
+    req.log.error({ err, method: req.method, url: req.url }, 'unhandled error');
     // Never leak internals to the client.
     return reply.status(500).send({ error: 'internal_error', message: 'Internal server error' });
   });
@@ -89,6 +105,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.get('/healthz', async () => ({ ok: true, ts: new Date().toISOString() }));
 
   await app.register(authRoutes, { prefix: '/api/v1/auth' });
+  // remote diagnostics: its own token instead of a session; absent unless OPS_TOKEN is set
+  await app.register(opsRoutes, { prefix: '/api/v1/ops' });
 
   await app.register(
     async (api) => {

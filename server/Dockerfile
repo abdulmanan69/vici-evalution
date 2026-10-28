@@ -5,6 +5,9 @@ RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY tsconfig.json drizzle.config.ts ./
 COPY src ./src
 RUN npm run build
+# which build is running, shown by the diagnostics overview (lib/runtime.ts)
+ARG SOURCE_COMMIT=""
+RUN node -e "require('fs').writeFileSync('dist/build-info.json', JSON.stringify({commit: process.env.SOURCE_COMMIT || null, builtAt: new Date().toISOString()}))"
 
 FROM node:22-alpine
 WORKDIR /app
