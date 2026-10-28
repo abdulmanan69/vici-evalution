@@ -11,6 +11,7 @@ import { testDialerConnection } from '../vicidial/sync.js';
 import { dropQueuedSyncs, enqueueDialerPurge, enqueueDialerSync } from '../lib/queue.js';
 import { closePooledDbClient } from '../vicidial/dbPool.js';
 import { dialerUsage } from '../services/purge.js';
+import { ensureDefaultMappings } from '../services/defaultMappings.js';
 
 /** A dialer the caller may manage, or a 404 / 403. */
 async function loadDialer(req: FastifyRequest, id: string) {
@@ -112,6 +113,10 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
       after: publicDialer(row), // never audit-log secrets
       companyId,
     });
+    // a new company can recognise transfers and sales straight away, and the
+    // dialer starts importing its last 7 days now rather than on the next tick
+    await ensureDefaultMappings(companyId, req.auth.userId);
+    if (row.active) await enqueueDialerSync(row.id, true);
     return reply.status(201).send({ dialer: publicDialer(row) });
   });
 
@@ -140,7 +145,14 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
     if (body.recordingAuthPass !== undefined)
       set.recordingAuthPassEnc = body.recordingAuthPass ? encryptSecret(body.recordingAuthPass) : null;
 
+    // new connection details or a corrected time zone: re-import the window
+    // so nothing missed (or mis-timed) under the old settings stays wrong
+    const reconnect = ['baseUrl', 'sourceMode', 'timezone', 'apiUser', 'apiPass', 'dbHost', 'dbPort', 'dbName', 'dbUser', 'dbPass'].some(
+      (k) => body[k as keyof typeof body] !== undefined && (k.endsWith('User') || k.endsWith('Pass') || body[k as keyof typeof body] !== before[k as keyof typeof before]),
+    );
+    if (reconnect) set.backfilledAt = null;
     const [row] = await db.update(dialerServers).set(set).where(eq(dialerServers.id, id)).returning();
+    if (reconnect && row.active) await enqueueDialerSync(id, true);
     await audit(req, {
       action: 'dialer.update',
       entityType: 'dialer',

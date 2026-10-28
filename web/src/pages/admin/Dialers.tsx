@@ -226,9 +226,19 @@ export function DialersPage() {
                     <div className="mt-0.5 font-mono text-2xs text-ink-3">
                       {d.baseUrl} · {d.timezone} · last seen {fmtDateTime(d.lastSeenAt)}
                     </div>
-                    <div className="mt-1 flex gap-2 text-2xs">
+                    <div className="mt-1 flex flex-wrap gap-2 text-2xs">
                       <Chip value={d.hasApiCredentials ? 'available' : 'missing'} label={d.hasApiCredentials ? 'API creds' : 'no API creds'} />
                       <Chip value={d.hasDbCredentials ? 'available' : 'missing'} label={d.hasDbCredentials ? 'DB creds' : 'no DB creds'} />
+                      {d.active &&
+                        (d.backfilledAt ? (
+                          <span className="chip bg-good-soft text-good" title={`Completed ${fmtDateTime(d.backfilledAt)}`}>
+                            last 7 days imported
+                          </span>
+                        ) : (
+                          <a href="/admin/sync" className="chip bg-amber-soft text-amber-line hover:underline" title="Follow it in Sync monitor">
+                            importing last 7 days…
+                          </a>
+                        ))}
                     </div>
                   </div>
                   <div className="flex items-center gap-2">

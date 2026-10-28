@@ -154,6 +154,8 @@ In **Dialer servers → Add dialer** enter the web root (`https://your-dialer`),
 
 Press **Test connection**: both the API and the MySQL checks must pass.
 
+**First import.** Saving a dialer starts importing its last 7 days (the retention window) straight away — nothing to click. **Sync monitor** shows it day by day with time left; queues fill in as it goes. If it is interrupted (a deploy, a restart, the dialer dropping the connection) it continues where it stopped; if the dialer cannot be reached it says why in plain words and retries every few minutes. After that the dialer syncs every minute. A new company starts with the stock VICIdial meanings (XFER = transfer, SALE = sale, CALLBK = callback, NI = no sale) — adjust them under **Dispositions**; changing what counts as a transfer or sale re-reads the last 7 days automatically.
+
 ---
 
 ## Built-in QA forms

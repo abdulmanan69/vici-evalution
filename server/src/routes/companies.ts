@@ -8,6 +8,7 @@ import { audit } from '../lib/audit.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
 import { ROLE_PRESETS } from '../auth/permissions.js';
 import { ensureDefaultForms } from '../services/ensureDefaultForms.js';
+import { ensureDefaultMappings } from '../services/defaultMappings.js';
 import { companyUsage, rehomeSharedPeople } from '../services/purge.js';
 import { dropQueuedSyncs, enqueueCompanyPurge } from '../lib/queue.js';
 import { closePooledDbClient } from '../vicidial/dbPool.js';
@@ -79,6 +80,8 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
     }
     // every company starts with the built-in TRA / Unclosed / Closed scorecards
     await ensureDefaultForms(row.id, req.auth.userId);
+    // ...and with the stock VICIdial meanings (XFER = transfer, SALE = sale …)
+    await ensureDefaultMappings(row.id, req.auth.userId);
     await audit(req, { action: 'company.create', entityType: 'company', entityId: row.id, after: row, companyId: row.id });
     return reply.status(201).send({ company: row });
   });

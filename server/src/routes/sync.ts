@@ -41,8 +41,10 @@ export async function syncRoutes(app: FastifyInstance): Promise<void> {
           and(
             eq(syncJobs.dialerServerId, d.id),
             eq(syncJobs.status, 'running'),
-            // still reporting — a worker restart can leave a row at 'running'
-            sql`coalesce((${syncJobs.progress}->>'updatedAt')::timestamptz, ${syncJobs.startedAt}) > now() - interval '5 minutes'`,
+            // alive — the sync writes a heartbeat every 15 s even while a
+            // dialer query or a big step takes minutes; a row left at
+            // 'running' by a dead worker drops out within two minutes
+            sql`coalesce((${syncJobs.progress}->>'heartbeatAt')::timestamptz, (${syncJobs.progress}->>'updatedAt')::timestamptz, ${syncJobs.startedAt}) > now() - interval '2 minutes'`,
           ),
         )
         .orderBy(sql`(${syncJobs.jobType} = 'full') desc`, desc(syncJobs.createdAt))
@@ -57,6 +59,9 @@ export async function syncRoutes(app: FastifyInstance): Promise<void> {
         tzOffsetMin: d.tzOffsetMin,
         clockDriftSec: d.clockDriftSec,
         timeCheckedAt: d.timeCheckedAt,
+        /** when the last 7 days were last fully imported; null = still importing */
+        backfilledAt: d.backfilledAt,
+        deleting: !!d.deletingAt,
         lastJob: lastJob ?? null,
         runningJob: runningJob ?? null,
         cursors: cursors.filter((c) => c.dialerServerId === d.id),

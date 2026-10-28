@@ -64,7 +64,10 @@ export interface SyncProgress {
   /** from elapsed time and percent; null until there is enough to go on */
   etaSeconds: number | null;
   startedAt: string;
+  /** when the numbers last moved */
   updatedAt: string;
+  /** the sync is alive — written every 15 s even while it waits on the dialer */
+  heartbeatAt?: string;
 }
 
 const STAGES: Record<string, { label: string; weight: number }> = {
@@ -94,6 +97,8 @@ class ProgressReporter {
   private readonly total: number;
   private readonly startedAt = Date.now();
   private stageStartedAt = Date.now();
+  private lastChangeAt = Date.now();
+  private heartbeat: NodeJS.Timeout | null = null;
   /** seconds spent per stage — saved with the job so a slow stage shows up */
   private readonly seconds: Record<string, number> = {};
 
@@ -102,6 +107,17 @@ class ProgressReporter {
     private readonly stageKeys: string[],
   ) {
     this.total = stageKeys.reduce((s, k) => s + (STAGES[k]?.weight ?? 0), 0) || 1;
+    // A single dialer query or a big local step can take minutes without a
+    // progress tick; the heartbeat keeps the job visibly alive meanwhile (the
+    // monitor used to drop a job that went quiet, so it looked like it died).
+    this.heartbeat = setInterval(() => void this.flush(true), 15_000);
+    this.heartbeat.unref();
+  }
+
+  /** Ends the heartbeat — always called when the sync finishes or fails. */
+  stop(): void {
+    if (this.heartbeat) clearInterval(this.heartbeat);
+    this.heartbeat = null;
   }
 
   private closeStage(): void {
@@ -121,13 +137,16 @@ class ProgressReporter {
     if (this.current) this.doneWeight += this.current.weight;
     this.current = { key, label: STAGES[key]?.label ?? key, weight: STAGES[key]?.weight ?? 0 };
     this.stageStartedAt = Date.now();
+    this.lastChangeAt = Date.now();
     this.fraction = 0;
     this.detail = null;
     await this.flush(true);
   }
 
   async tick(fraction: number, detail?: string | null): Promise<void> {
-    this.fraction = Math.max(0, Math.min(1, fraction));
+    const f = Math.max(0, Math.min(1, fraction));
+    if (f !== this.fraction || (detail !== undefined && detail !== this.detail)) this.lastChangeAt = Date.now();
+    this.fraction = f;
     if (detail !== undefined) this.detail = detail;
     await this.flush(false);
   }
@@ -154,7 +173,8 @@ class ProgressReporter {
       detail: this.detail,
       etaSeconds,
       startedAt: new Date(this.startedAt).toISOString(),
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(this.lastChangeAt).toISOString(),
+      heartbeatAt: new Date().toISOString(),
     };
   }
 
@@ -243,52 +263,86 @@ export async function runDialerSync(
   const reporter = new ProgressReporter(job.id, stageKeys);
 
   let viciDb: ViciDbClient | null = null;
+  /** stages that failed this run, in the admin's words */
+  const failures: string[] = [];
+  /** stages without which the import is not complete (recordings repair themselves) */
+  const coreFailed: string[] = [];
+  const RECOVERABLE = new Set(['roster', 'recordings', 'api_recordings']);
+  // Each stage runs on its own: one failing (a dialer timeout, a table the
+  // read-only user cannot see) is recorded and the rest still run, so calls
+  // already imported still become transfers and sales on screen. The next
+  // run picks the failed part up again.
+  const step = async (key: string, fn: () => Promise<void>) => {
+    await reporter.stage(key);
+    try {
+      await fn();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      failures.push(`${STAGES[key]?.label ?? key}: ${msg}`);
+      notes.push(`${key} failed: ${msg}`);
+      if (!RECOVERABLE.has(key)) coreFailed.push(key);
+    }
+  };
+
   return progressStore.run(reporter, async () => {
     try {
       if (usesDb) {
         viciDb = new ViciDbClient(conn);
-        await reporter.stage('roster');
-        await syncRoster(conn, viciDb, stats);
-        await reporter.stage('calls');
-        await syncCallStream(conn, viciDb, 'vicidial_log', stats, opts.full);
-        await reporter.stage('closer_calls');
-        await syncCallStream(conn, viciDb, 'vicidial_closer_log', stats, opts.full);
-        await reporter.stage('recordings');
-        await syncRecordingsFromDb(conn, viciDb, stats, opts.full);
-        await reporter.stage('dispositions');
-        await syncAgentDispositions(conn, viciDb, stats, opts.full);
+        const vdb = viciDb;
+        await step('roster', () => syncRoster(conn, vdb, stats));
+        await step('calls', () => syncCallStream(conn, vdb, 'vicidial_log', stats, opts.full));
+        await step('closer_calls', () => syncCallStream(conn, vdb, 'vicidial_closer_log', stats, opts.full));
+        await step('recordings', () => syncRecordingsFromDb(conn, vdb, stats, opts.full));
+        await step('dispositions', () => syncAgentDispositions(conn, vdb, stats, opts.full));
       } else if (conn.sourceMode === 'api') {
         // No DB access: synthesize call records from recording_lookup +
         // lead_all_info (verified shapes on this build — see docs).
-        await reporter.stage('api_calls');
-        await syncApiOnly(conn, stats, opts.full);
+        await step('api_calls', () => syncApiOnly(conn, stats, opts.full));
       } else {
         notes.push('No usable data source configured (db credentials missing).');
+        failures.push('No usable data source configured — add the dialer’s database or API credentials');
+        coreFailed.push('source');
       }
 
       if (conn.sourceMode === 'hybrid') {
-        await reporter.stage('api_recordings');
-        await syncRecordingsFromApi(conn, stats);
+        await step('api_recordings', () => syncRecordingsFromApi(conn, stats));
       }
 
-      await reporter.stage('transfers');
-      await buildTransfers(conn, stats, opts.full);
-      await reporter.stage('matching');
-      await matchPendingTransfers(conn.companyId, stats);
-      await reporter.stage('sales');
-      await attributeSales(conn.companyId, stats);
-      await reporter.stage('queues');
-      await updateQueueStatuses(conn.companyId, stats);
+      await step('transfers', () => buildTransfers(conn, stats, opts.full));
+      await step('matching', () => matchPendingTransfers(conn.companyId, stats));
+      await step('sales', () => attributeSales(conn.companyId, stats));
+      await step('queues', () => updateQueueStatuses(conn.companyId, stats));
       stats.stageSeconds = reporter.stageSeconds();
       await reporter.finish();
 
-      await db
-        .update(dialerServers)
-        .set({ lastSeenAt: new Date(), updatedAt: new Date() })
-        .where(eq(dialerServers.id, dialerServerId));
+      const ok = failures.length === 0;
+      const summary = summarizeFailures(failures);
+      if (coreFailed.length === 0) {
+        await db
+          .update(dialerServers)
+          .set({ lastSeenAt: new Date(), updatedAt: new Date() })
+          .where(eq(dialerServers.id, dialerServerId));
+      }
+      if (opts.full && coreFailed.length === 0) {
+        // the whole retention window is in: the dialer moves on to
+        // minute-by-minute syncs, and the resume points are no longer needed
+        await db
+          .update(dialerServers)
+          .set({ backfilledAt: new Date() })
+          .where(eq(dialerServers.id, dialerServerId));
+        await db
+          .delete(syncCursors)
+          .where(and(eq(syncCursors.dialerServerId, dialerServerId), sql`${syncCursors.stream} like 'backfill:%'`));
+      }
       await db
         .update(syncJobs)
-        .set({ status: 'success', stats, progress: reporter.snapshot(), finishedAt: new Date() })
+        .set({
+          status: ok ? 'success' : 'failed',
+          stats,
+          error: ok ? null : summary.slice(0, 2000),
+          progress: reporter.snapshot(),
+          finishedAt: new Date(),
+        })
         .where(eq(syncJobs.id, job.id));
       return stats;
     } catch (err) {
@@ -304,9 +358,44 @@ export async function runDialerSync(
         .where(eq(syncJobs.id, job.id));
       throw err;
     } finally {
+      reporter.stop();
       await viciDb?.close();
     }
   });
+}
+
+/** A connection error in words an admin can act on; other errors unchanged. */
+export function friendlySyncError(message: string): string {
+  const host = message.match(/(?:ENOTFOUND|EAI_AGAIN)\s+(\S+)/)?.[1];
+  if (host) return `The dialer address ${host} could not be found — check the host name`;
+  if (/ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|connect timed out|Connection lost|PROTOCOL_CONNECTION_LOST/i.test(message)) {
+    return "The dialer did not answer — check it is up and that it allows this server's IP (MySQL port 3306 / web port)";
+  }
+  if (/ER_ACCESS_DENIED_ERROR|Access denied for user/i.test(message)) {
+    return "The dialer refused the database login — check the MySQL user and password, and that the user may connect from this server's IP";
+  }
+  if (/ER_DBACCESS_DENIED_ERROR|ER_TABLEACCESS_DENIED_ERROR|command denied/i.test(message)) {
+    return `The read-only database user is missing a permission: ${message}`;
+  }
+  return message;
+}
+
+/**
+ * One line per distinct problem. "Dialer unreachable" used to repeat once per
+ * stage; now it reads once, with the steps it hit when only some failed.
+ */
+export function summarizeFailures(failures: string[]): string {
+  const byMessage = new Map<string, string[]>();
+  for (const f of failures) {
+    const i = f.indexOf(': ');
+    const label = i > 0 ? f.slice(0, i) : '';
+    const msg = friendlySyncError(i > 0 ? f.slice(i + 2) : f);
+    byMessage.set(msg, [...(byMessage.get(msg) ?? []), label].filter(Boolean));
+  }
+  const parts = [...byMessage.entries()].map(([msg, labels]) =>
+    byMessage.size === 1 || labels.length === 0 ? msg : `${labels.join(', ')}: ${msg}`,
+  );
+  return parts.join(' · ');
 }
 
 function fmtOffset(min: number): string {
@@ -518,11 +607,19 @@ async function syncCallStream(
   // progress: how far through the time window each pass is, in dialer days
   const windowStart = full ? initialWindowStart(full) : sinceUtc;
   const totalDays = Math.max(1, Math.ceil((untilUtc.getTime() - windowStart.getTime()) / 86_400_000));
-  const runPass = async (archive: boolean, passSinceUtc: Date, share: [number, number]): Promise<void> => {
+  const runPass = async (
+    archive: boolean,
+    passSinceUtc: Date,
+    share: [number, number],
+    checkpoint?: string,
+  ): Promise<void> => {
     let cursorUtc = passSinceUtc;
-    const span = Math.max(1, untilUtc.getTime() - passSinceUtc.getTime());
+    // a full import measures against the whole window, so a resumed import
+    // shows how far it really is instead of starting again at 0 %
+    const base = full ? windowStart : passSinceUtc;
+    const span = Math.max(1, untilUtc.getTime() - base.getTime());
     const report = async (at: Date) => {
-      const frac = Math.min(1, Math.max(0, (at.getTime() - passSinceUtc.getTime()) / span));
+      const frac = Math.min(1, Math.max(0, (at.getTime() - base.getTime()) / span));
       const day = Math.min(totalDays, Math.max(1, Math.floor((at.getTime() - windowStart.getTime()) / 86_400_000) + 1));
       await progress()?.tick(
         share[0] + (share[1] - share[0]) * frac,
@@ -538,40 +635,59 @@ async function syncCallStream(
           : await viciDb.fetchCloserCalls(sinceLocal, untilLocal, BATCH_LIMIT, archive);
       if (rows.length === 0) break;
 
-      let n = 0;
+      const batch: Array<{ row: ViciCallRow; callDateUtc: Date }> = [];
       for (const row of rows) {
         const callDateUtc = localToUtc(row.call_date, conn.timezone);
         if (!maxSeen || callDateUtc > maxSeen) maxSeen = callDateUtc;
-        n += 1;
-        if (n % 500 === 0) await report(callDateUtc);
         if (!row.uniqueid) {
           skippedNoUid += 1;
           continue;
         }
-        await upsertCall(conn, source, row, callDateUtc, agentMap, campMap, groupMap);
-        imported += 1;
+        batch.push({ row, callDateUtc });
+      }
+      // many rows per statement — a 7-day import is hundreds of thousands
+      for (let i = 0; i < batch.length; i += UPSERT_CHUNK) {
+        const chunk = batch.slice(i, i + UPSERT_CHUNK);
+        await upsertCalls(conn, source, chunk, agentMap, campMap, groupMap);
+        imported += chunk.length;
+        await report(chunk[chunk.length - 1].callDateUtc);
       }
 
+      const lastUtc = localToUtc(rows[rows.length - 1].call_date, conn.timezone);
+      // a resume point: an interrupted import continues here next time
+      if (checkpoint) await setCursor(conn.id, checkpoint, lastUtc);
       if (rows.length < BATCH_LIMIT) break;
-      // advance window past the last processed row (equal timestamps re-read via overlap)
-      const last = rows[rows.length - 1];
-      cursorUtc = localToUtc(last.call_date, conn.timezone);
+      // Next page starts one second before the last row: the dialer's times
+      // have whole seconds, and calls sharing the last row's second beyond
+      // the page limit were skipped before. Re-read rows are simply updated.
+      const next = new Date(lastUtc.getTime() - 1000);
+      cursorUtc = next.getTime() > cursorUtc.getTime() ? next : lastUtc;
       await report(cursorUtc);
     }
   };
 
-  // Full syncs read the *_archive table first: dialers with a nightly archive
-  // job keep little or nothing in the live tables beyond the current day.
   if (full) {
+    // Full imports read the *_archive table first (dialers with a nightly
+    // archive keep only today in the live tables), then the live table over
+    // the whole window — dialers without an archive keep everything there.
+    // Both passes resume from where an interrupted import stopped.
+    const resumeFrom = async (key: string): Promise<Date> => {
+      const at = await getCursor(conn.id, key);
+      return at && at.getTime() > windowStart.getTime() ? new Date(at.getTime() - CURSOR_OVERLAP_MS) : windowStart;
+    };
+    const archiveKey = `backfill:${source}:archive`;
+    const liveKey = `backfill:${source}:live`;
     try {
-      await runPass(true, initialWindowStart(full), [0, 0.85]);
+      await runPass(true, await resumeFrom(archiveKey), [0, 0.85], archiveKey);
     } catch (err) {
       (stats.notes as string[]).push(
         `${source}_archive not readable: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    await runPass(false, await resumeFrom(liveKey), [0.85, 1], liveKey);
+  } else {
+    await runPass(false, sinceUtc, [0, 1]);
   }
-  await runPass(false, sinceUtc, full ? [0.85, 1] : [0, 1]);
   const cursorAfter = maxSeen;
 
   // Realtime refresh. A call is written when it starts (status INCALL) and
@@ -637,6 +753,69 @@ async function syncCallStream(
   if (cursorAfter) await setCursor(conn.id, source, cursorAfter);
   stats[`${source}_imported`] = imported;
   if (skippedNoUid > 0) stats[`${source}_skipped_no_uniqueid`] = skippedNoUid;
+}
+
+/** rows per insert statement (17 columns each — far below the parameter limit) */
+const UPSERT_CHUNK = 500;
+
+/**
+ * The same upsert as upsertCall for many rows in one statement. A uniqueid
+ * appearing twice in one chunk (closer logs can repeat it) keeps the last
+ * row, as row-by-row processing did.
+ */
+async function upsertCalls(
+  conn: DialerConnection,
+  source: 'vicidial_log' | 'vicidial_closer_log',
+  items: Array<{ row: ViciCallRow; callDateUtc: Date }>,
+  agentMap: Map<string, string>,
+  campMap: Map<string, string>,
+  groupMap: Map<string, string>,
+): Promise<void> {
+  const byUid = new Map<string, { row: ViciCallRow; callDateUtc: Date }>();
+  for (const it of items) if (it.row.uniqueid) byUid.set(it.row.uniqueid, it);
+  if (byUid.size === 0) return;
+  const now = new Date();
+  const values = [...byUid.values()].map(({ row, callDateUtc }) => ({
+    companyId: conn.companyId,
+    dialerServerId: conn.id,
+    source,
+    viciLeadId: row.lead_id,
+    viciUniqueId: row.uniqueid,
+    // vicidial_closer_log reuses campaign_id for the in-group id
+    campaignId: source === 'vicidial_log' ? (campMap.get(row.campaign_id ?? '') ?? null) : null,
+    ingroupId: source === 'vicidial_closer_log' ? (groupMap.get(row.campaign_id ?? '') ?? null) : null,
+    viciAgentId: row.user ? (agentMap.get(row.user) ?? null) : null,
+    viciUserRaw: row.user,
+    phoneNumber: row.phone_number,
+    callDate: callDateUtc,
+    lengthSec: row.length_in_sec,
+    status: row.status,
+    termReason: row.term_reason,
+    listId: row.list_id,
+    raw: row,
+    firstSyncedAt: now,
+    lastSyncedAt: now,
+  }));
+  await db
+    .insert(calls)
+    .values(values)
+    .onConflictDoUpdate({
+      target: [calls.dialerServerId, calls.source, calls.viciUniqueId],
+      targetWhere: sql`vici_uniqueid is not null`,
+      set: {
+        status: sql`excluded.status`,
+        lengthSec: sql`excluded.length_sec`,
+        termReason: sql`excluded.term_reason`,
+        phoneNumber: sql`excluded.phone_number`,
+        viciUserRaw: sql`excluded.vici_user_raw`,
+        viciAgentId: sql`excluded.vici_agent_id`,
+        campaignId: sql`excluded.campaign_id`,
+        ingroupId: sql`excluded.ingroup_id`,
+        listId: sql`excluded.list_id`,
+        raw: sql`excluded.raw`,
+        lastSyncedAt: sql`excluded.last_synced_at`,
+      },
+    });
 }
 
 async function upsertCall(
@@ -1095,8 +1274,16 @@ async function syncApiOnly(conn: DialerConnection, stats: SyncStats, full?: bool
   let recsLinked = 0;
   let exportErrors = 0;
 
-  for (const chunk of chunks) {
+  // progress: one step per agent per day-pair (these exports are the slow part)
+  const totalSteps = Math.max(1, chunks.length * scanUsers.length);
+  let stepNo = 0;
+  for (const [chunkNo, chunk] of chunks.entries()) {
     for (const user of scanUsers) {
+      stepNo += 1;
+      await progress()?.tick(
+        (stepNo - 1) / totalSteps,
+        `${callsImported.toLocaleString()} calls · days ${chunkNo * 2 + 1}–${Math.min(dayCount, chunkNo * 2 + 2)} of ${dayCount} · agent ${user}`,
+      );
       let callRows: UserStatsCall[];
       try {
         callRows = await fetchUserStatsCalls(conn, user, chunk.from, chunk.to, false);

@@ -6,6 +6,15 @@ import { dispositionMappings } from '../db/schema.js';
 import { companyScope, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, NotFoundError } from '../lib/errors.js';
+import { requestBackfill } from '../services/defaultMappings.js';
+
+/**
+ * Transfers and sales are derived from these meanings: changing one makes
+ * the company's dialers re-read the last 7 days, so the queues reflect it.
+ */
+function affectsQueues(meaning: string): boolean {
+  return meaning === 'transfer' || meaning === 'sale';
+}
 
 const mappingSchema = z.object({
   companyId: z.string().uuid().optional(),
@@ -65,6 +74,7 @@ export async function dispositionRoutes(app: FastifyInstance): Promise<void> {
       })
       .returning();
     await audit(req, { action: 'dispo.create', entityType: 'disposition_mapping', entityId: row.id, after: row, companyId });
+    if (affectsQueues(row.meaning)) await requestBackfill(companyId);
     return reply.status(201).send({ mapping: row });
   });
 
@@ -84,6 +94,9 @@ export async function dispositionRoutes(app: FastifyInstance): Promise<void> {
       .where(eq(dispositionMappings.id, id))
       .returning();
     await audit(req, { action: 'dispo.update', entityType: 'disposition_mapping', entityId: id, before, after: row, companyId: before.companyId });
+    if ((affectsQueues(before.meaning) || affectsQueues(row.meaning)) && (before.meaning !== row.meaning || before.active !== row.active)) {
+      await requestBackfill(before.companyId);
+    }
     return { mapping: row };
   });
 
@@ -94,6 +107,7 @@ export async function dispositionRoutes(app: FastifyInstance): Promise<void> {
     companyScope(req, before.companyId);
     await db.delete(dispositionMappings).where(eq(dispositionMappings.id, id));
     await audit(req, { action: 'dispo.delete', entityType: 'disposition_mapping', entityId: id, before, companyId: before.companyId });
+    if (affectsQueues(before.meaning)) await requestBackfill(before.companyId);
     return { ok: true };
   });
 }

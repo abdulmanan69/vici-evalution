@@ -173,6 +173,10 @@ export const dialerServers = pgTable(
     // set when an admin deletes the dialer: it stops syncing at once and the
     // worker removes its data in batches, then the row itself
     deletingAt: timestamp('deleting_at', { withTimezone: true }),
+    // when the last full import of the retention window (7 days) completed;
+    // null = still needed (a new dialer, or disposition meanings changed) —
+    // the worker runs and resumes it until it completes
+    backfilledAt: timestamp('backfilled_at', { withTimezone: true }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },

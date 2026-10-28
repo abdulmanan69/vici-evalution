@@ -85,6 +85,13 @@
       "when": 1793133092798,
       "tag": "0011_company-memberships",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1793151248501,
+      "tag": "0012_backfill-state",
+      "breakpoints": true
     }
   ]
 }

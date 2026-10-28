@@ -10,6 +10,7 @@ import { toConnection } from './vicidial/credentials.js';
 import { refreshRecording } from './vicidial/recordingUrl.js';
 import { isCallInProgress } from './services/callRecordings.js';
 import { pendingPurges, purgeCompany, purgeDialer } from './services/purge.js';
+import { ensureDefaultMappingsEverywhere } from './services/defaultMappings.js';
 import { enqueueCompanyPurge, enqueueDialerPurge, MAINTENANCE_QUEUE, SYNC_QUEUE } from './lib/queue.js';
 
 /**
@@ -44,6 +45,53 @@ async function enqueueActiveDialers(): Promise<void> {
         backoff: { type: 'exponential', delay: 10_000 },
       },
     );
+  }
+}
+
+/** dialers being synced in this worker, and how */
+const busy = new Map<string, 'full' | 'incremental'>();
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * One sync per dialer at a time. A scheduled sync finds the dialer busy and
+ * steps aside; a full import asked for while a short sync runs waits for it.
+ * A dialer that has not imported its retention window yet (new, or its
+ * disposition meanings changed) gets the full import instead of a short
+ * sync — and after a failed attempt, a fresh one at most every 5 minutes;
+ * the import resumes where it stopped.
+ */
+async function runSyncJob(dialerServerId: string, requestedFull: boolean): Promise<unknown> {
+  const current = busy.get(dialerServerId);
+  if (current) {
+    if (!requestedFull || current === 'full') return { skipped: `a ${current} sync is already running` };
+    const until = Date.now() + 15 * 60_000;
+    while (busy.has(dialerServerId) && Date.now() < until) await sleepMs(2_000);
+    if (busy.has(dialerServerId)) return { skipped: 'dialer still busy' };
+  }
+
+  let full = requestedFull;
+  if (!full) {
+    const [d] = await db
+      .select({ backfilledAt: dialerServers.backfilledAt })
+      .from(dialerServers)
+      .where(eq(dialerServers.id, dialerServerId));
+    if (d && !d.backfilledAt) {
+      // a run cut off by a restart or deploy is not a failure: resume at once
+      const recent = await db.execute(sql`
+        select 1 from sync_jobs
+         where dialer_server_id = ${dialerServerId} and job_type = 'full'
+           and finished_at > now() - interval '5 minutes'
+           and status = 'failed' and coalesce(error, '') not like 'interrupted by worker restart%'
+         limit 1`);
+      full = (recent.rowCount ?? 0) === 0;
+    }
+  }
+
+  busy.set(dialerServerId, full ? 'full' : 'incremental');
+  try {
+    return await runDialerSync(dialerServerId, { full });
+  } finally {
+    busy.delete(dialerServerId);
   }
 }
 
@@ -204,14 +252,17 @@ async function main(): Promise<void> {
   // a restart mid-sync leaves job rows stuck at 'running'; this worker is the
   // only thing that runs syncs, so every such row is stale — close them out
   await db.execute(sql`
-    update sync_jobs set status = 'failed', error = 'interrupted by worker restart', finished_at = now()
+    update sync_jobs set status = 'failed', error = 'interrupted by worker restart — it resumes on its own', finished_at = now()
      where status = 'running'`);
+  // every company can recognise transfers and sales from the start
+  const withDefaults = await ensureDefaultMappingsEverywhere();
+  if (withDefaults > 0) console.log(`[worker] default disposition meanings added for ${withDefaults} company(ies)`);
 
   const worker = new Worker(
     SYNC_QUEUE,
     async (job) => {
       if (job.name === 'sync-dialer') {
-        return runDialerSync(job.data.dialerServerId as string, { full: !!job.data.full });
+        return runSyncJob(job.data.dialerServerId as string, !!job.data.full);
       }
       if (job.name === 'check-recordings') {
         await checkPendingRecordings();

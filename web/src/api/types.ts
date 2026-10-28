@@ -47,6 +47,8 @@ export interface Dialer {
   lastSeenAt: string | null;
   /** set while the dialer and its data are being deleted */
   deletingAt?: string | null;
+  /** when its last 7 days were last fully imported; null = importing */
+  backfilledAt?: string | null;
   hasApiCredentials: boolean;
   hasDbCredentials: boolean;
   hasRecordingAuth: boolean;

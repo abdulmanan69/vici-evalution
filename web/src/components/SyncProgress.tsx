@@ -26,6 +26,10 @@ export function SyncProgressView({
   const p = job.progress;
   const pct = p?.percent ?? 0;
   const title = job.jobType === 'full' ? 'Importing from the dialer' : 'Syncing with the dialer';
+  // alive (heartbeat) but the numbers have not moved: a slow dialer query or
+  // a big step — say so instead of looking stuck
+  const quietSec = p?.updatedAt ? Math.round((Date.now() - Date.parse(p.updatedAt)) / 1000) : 0;
+  const waiting = quietSec >= 60;
   return (
     <div className={compact ? '' : 'rounded-lg border border-brand/30 bg-brand-soft/40 p-3'}>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
@@ -45,7 +49,13 @@ export function SyncProgressView({
           style={{ width: `${Math.max(2, Math.min(100, pct))}%` }}
         />
       </div>
-      {!compact && (
+      {waiting && (
+        <p className="mt-1.5 text-2xs text-amber-line">
+          Still working — waiting on the dialer for {quietSec >= 120 ? `${Math.round(quietSec / 60)} min` : `${quietSec} s`}. Big
+          days take a while; it carries on by itself.
+        </p>
+      )}
+      {!compact && !waiting && (
         <p className="mt-1.5 text-2xs text-ink-3">
           Queues and the dashboard fill in as the import progresses — nothing to do until it reaches 100%.
         </p>

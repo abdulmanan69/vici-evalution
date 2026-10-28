@@ -17,6 +17,8 @@ interface DialerStatus {
   tzOffsetMin: number | null;
   clockDriftSec: number | null;
   timeCheckedAt: string | null;
+  /** when the last 7 days were last fully imported; null = still importing */
+  backfilledAt?: string | null;
   lastJob: SyncJob | null;
   /** the sync in flight right now, with its live progress */
   runningJob: SyncJob | null;
@@ -53,6 +55,42 @@ function slowestStages(job: SyncJob): string | null {
     .slice(0, 3)
     .map(([k, s]) => `${STAGE_LABELS[k] ?? k} ${s.toFixed(1)}s`);
   return top.length ? `slowest: ${top.join(' · ')}` : null;
+}
+
+/**
+ * Whether the dialer's history is in: a new dialer (or one whose disposition
+ * meanings changed) first imports the whole retention window, resuming after
+ * any interruption, then settles into minute-by-minute syncs.
+ */
+function BackfillStatus({ s }: { s: DialerStatus }) {
+  if (!s.active) return null;
+  if (s.backfilledAt) {
+    return (
+      <div className="mt-2 flex items-center gap-2 text-2xs">
+        <span className="chip bg-good-soft text-good">last 7 days imported</span>
+        <span className="text-ink-3">{fmtDateTime(s.backfilledAt)}</span>
+      </div>
+    );
+  }
+  const resume = s.cursors
+    .filter((c) => c.stream.startsWith('backfill:') && c.lastTimestamp)
+    .map((c) => c.lastTimestamp as string)
+    .sort()
+    .pop();
+  const importing = s.runningJob?.jobType === 'full';
+  const failing = !importing && s.lastJob?.status === 'failed';
+  return (
+    <div className="mt-2 rounded-md bg-amber-soft px-2 py-1.5 text-2xs text-amber-line">
+      <span className="font-semibold">{importing ? 'Importing the last 7 days' : 'Last 7 days not imported yet'}</span>
+      {' — '}
+      {importing
+        ? 'queues fill in as it goes; nothing to click.'
+        : failing
+          ? 'it keeps retrying on its own and continues where it stopped; the problem is shown below.'
+          : 'the import starts on its own within a minute and continues where it stopped.'}
+      {resume && <span className="text-ink-3"> Reached {fmtDateTime(resume)}.</span>}
+    </div>
+  );
 }
 
 function fmtOffset(min: number): string {
@@ -135,6 +173,7 @@ export function SyncMonitorPage() {
                     <span className="chip bg-good-soft text-good">clock in sync</span>
                   ))}
               </div>
+              <BackfillStatus s={s} />
               {s.runningJob && (
                 <div className="mt-3">
                   <SyncProgressView job={s.runningJob} />
@@ -148,17 +187,24 @@ export function SyncMonitorPage() {
                   </span>
                 </div>
               )}
-              {s.lastJob?.error && (
-                <div className="mt-2 rounded-md bg-bad-soft px-2 py-1.5 font-mono text-2xs text-bad">{s.lastJob.error}</div>
+              {s.lastJob?.status === 'failed' && s.lastJob.error && !s.runningJob && (
+                <div className="mt-2 rounded-md bg-bad-soft px-2 py-1.5 text-2xs text-bad">
+                  <div className="font-mono">{s.lastJob.error}</div>
+                  <div className="mt-0.5 text-ink-2">
+                    It tries again on its own{s.backfilledAt ? ' within a minute' : ' within a few minutes, continuing where it stopped'}.
+                  </div>
+                </div>
               )}
-              {s.cursors.length > 0 && (
+              {s.cursors.filter((c) => !c.stream.startsWith('backfill:')).length > 0 && (
                 <div className="mt-2 space-y-0.5">
-                  {s.cursors.map((c) => (
-                    <div key={c.stream} className="flex justify-between font-mono text-2xs text-ink-3">
-                      <span>{c.stream}</span>
-                      <span>{fmtDateTime(c.lastTimestamp)}</span>
-                    </div>
-                  ))}
+                  {s.cursors
+                    .filter((c) => !c.stream.startsWith('backfill:'))
+                    .map((c) => (
+                      <div key={c.stream} className="flex justify-between font-mono text-2xs text-ink-3">
+                        <span>{c.stream}</span>
+                        <span>{fmtDateTime(c.lastTimestamp)}</span>
+                      </div>
+                    ))}
                 </div>
               )}
             </div>
