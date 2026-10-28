@@ -88,4 +88,13 @@ describe('request timing', () => {
     // an hour later the minute buckets are gone, the per-route totals stay
     expect(requestSnapshot(15, at + 3600_000).totals.requests).toBe(0);
   });
+  it('does not call audio streams slow pages', () => {
+    const at = Date.parse('2026-10-28T14:00:30.000Z');
+    recordRequest({ method: 'GET', route: '/api/v1/recordings/:id/stream', path: '/api/v1/recordings/x/stream', status: 206, ms: 1800, at });
+    recordRequest({ method: 'GET', route: '/api/v1/qa/tasks', path: '/api/v1/qa/tasks', status: 200, ms: 40, at });
+    const s = requestSnapshot(15, at);
+    expect(s.totals).toMatchObject({ requests: 2, slow: 0, avgMs: 40, maxMs: 40 });
+    expect(s.slow.some((x) => x.route.endsWith('/stream'))).toBe(false);
+    expect(s.routes.find((r) => r.route === 'GET /api/v1/recordings/:id/stream')?.maxMs).toBe(1800);
+  });
 });
