@@ -2,7 +2,31 @@ import { useEffect, useRef, useState } from 'react';
 import { Pause, Play, RotateCcw, RotateCw } from 'lucide-react';
 import { fmtDuration } from './ui';
 
-const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
+const SPEEDS = [1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4, 5];
+const SPEED_KEY = 'qa.playbackSpeed';
+const SPEED_EVENT = 'qa:playback-speed';
+
+/**
+ * The reviewer's chosen speed is shared by every player and remembered for
+ * the next recording, so it is picked once rather than per call.
+ */
+function savedSpeed(): number {
+  try {
+    const v = Number(localStorage.getItem(SPEED_KEY));
+    return SPEEDS.includes(v) ? v : 1;
+  } catch {
+    return 1;
+  }
+}
+
+function saveSpeed(v: number): void {
+  try {
+    localStorage.setItem(SPEED_KEY, String(v));
+  } catch {
+    /* private window: the choice lasts for this page only */
+  }
+  window.dispatchEvent(new CustomEvent(SPEED_EVENT, { detail: v }));
+}
 
 /**
  * Streams through the authenticated proxy (/api/v1/recordings/:id/stream).
@@ -30,7 +54,7 @@ export function AudioPlayer({
   const [loading, setLoading] = useState(false);
   const [time, setTime] = useState(0);
   const [mediaDuration, setMediaDuration] = useState(0);
-  const [speed, setSpeed] = useState(1);
+  const [speed, setSpeed] = useState(savedSpeed);
   const [error, setError] = useState<string | null>(null);
   const duration = mediaDuration > 0 && Number.isFinite(mediaDuration) ? mediaDuration : (lengthSec ?? 0);
 
@@ -57,7 +81,17 @@ export function AudioPlayer({
     a.addEventListener('pause', onPause);
     a.addEventListener('ended', onEnd);
     a.addEventListener('error', onErr);
+    // a speed picked on another player on the page applies here too
+    const onSpeed = (e: Event) => {
+      const v = (e as CustomEvent<number>).detail;
+      setSpeed(v);
+      a.defaultPlaybackRate = v;
+      a.playbackRate = v;
+    };
+    window.addEventListener(SPEED_EVENT, onSpeed);
+    a.defaultPlaybackRate = savedSpeed();
     return () => {
+      window.removeEventListener(SPEED_EVENT, onSpeed);
       a.removeEventListener('timeupdate', onTime);
       a.removeEventListener('loadedmetadata', onMeta);
       a.removeEventListener('durationchange', onMeta);
@@ -90,10 +124,14 @@ export function AudioPlayer({
     a.currentTime = Math.max(0, Math.min(t, duration || t));
   };
 
-  const changeSpeed = () => {
-    const next = SPEEDS[(SPEEDS.indexOf(speed) + 1) % SPEEDS.length];
+  const pickSpeed = (next: number) => {
     setSpeed(next);
-    if (audioRef.current) audioRef.current.playbackRate = next;
+    const a = audioRef.current;
+    if (a) {
+      a.defaultPlaybackRate = next;
+      a.playbackRate = next;
+    }
+    saveSpeed(next);
   };
 
   if (error) {
@@ -114,37 +152,52 @@ export function AudioPlayer({
   }
 
   return (
-    <div className="flex items-center gap-2 rounded-md bg-bg px-3 py-2">
-      <audio ref={audioRef} src={`/api/v1/recordings/${recordingId}/stream`} preload={preload} />
-      <button
-        onClick={toggle}
-        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand text-white hover:bg-brand-dark ${loading ? 'animate-pulse' : ''}`}
-        aria-label={playing ? 'Pause' : 'Play'}
-      >
-        {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
-      </button>
-      <button onClick={() => seek(time - 10)} className="text-ink-2 hover:text-ink" aria-label="Back 10 seconds">
-        <RotateCcw size={14} />
-      </button>
-      <button onClick={() => seek(time + 10)} className="text-ink-2 hover:text-ink" aria-label="Forward 10 seconds">
-        <RotateCw size={14} />
-      </button>
-      <span className="w-12 shrink-0 text-right font-mono text-2xs text-ink-2">{fmtDuration(Math.floor(time))}</span>
-      <input
-        type="range"
-        min={0}
-        max={duration || 0}
-        step={1}
-        value={time}
-        onChange={(e) => seek(Number(e.target.value))}
-        className="h-1 w-full flex-1 accent-brand"
-        aria-label="Seek"
-      />
-      <span className="w-12 shrink-0 font-mono text-2xs text-ink-2">{fmtDuration(Math.floor(duration))}</span>
-      <button onClick={changeSpeed} className="w-10 shrink-0 rounded bg-surface px-1 py-0.5 font-mono text-2xs shadow-card">
-        {speed}×
-      </button>
-      {label && <span className="hidden truncate font-mono text-2xs text-ink-3 md:block">{label}</span>}
+    <div className="rounded-md bg-bg px-3 py-2">
+      <div className="flex items-center gap-2">
+        <audio ref={audioRef} src={`/api/v1/recordings/${recordingId}/stream`} preload={preload} />
+        <button
+          onClick={toggle}
+          className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand text-white hover:bg-brand-dark ${loading ? 'animate-pulse' : ''}`}
+          aria-label={playing ? 'Pause' : 'Play'}
+        >
+          {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
+        </button>
+        <button onClick={() => seek(time - 10)} className="text-ink-2 hover:text-ink" aria-label="Back 10 seconds">
+          <RotateCcw size={14} />
+        </button>
+        <button onClick={() => seek(time + 10)} className="text-ink-2 hover:text-ink" aria-label="Forward 10 seconds">
+          <RotateCw size={14} />
+        </button>
+        <span className="w-12 shrink-0 text-right font-mono text-2xs text-ink-2">{fmtDuration(Math.floor(time))}</span>
+        <input
+          type="range"
+          min={0}
+          max={duration || 0}
+          step={1}
+          value={time}
+          onChange={(e) => seek(Number(e.target.value))}
+          className="h-1 w-full flex-1 accent-brand"
+          aria-label="Seek"
+        />
+        <span className="w-12 shrink-0 font-mono text-2xs text-ink-2">{fmtDuration(Math.floor(duration))}</span>
+        {label && <span className="hidden max-w-[40%] truncate font-mono text-2xs text-ink-3 md:block">{label}</span>}
+      </div>
+      {/* every speed one click away — the choice is kept for the next recording */}
+      <div className="mt-1.5 flex flex-wrap items-center gap-1" role="group" aria-label="Playback speed">
+        <span className="mr-1 text-2xs text-ink-3">Speed</span>
+        {SPEEDS.map((s) => (
+          <button
+            key={s}
+            onClick={() => pickSpeed(s)}
+            aria-pressed={speed === s}
+            className={`rounded px-1.5 py-0.5 font-mono text-2xs tabular-nums transition-colors ${
+              speed === s ? 'bg-brand text-white shadow-sm' : 'bg-surface text-ink-2 shadow-card hover:text-ink'
+            }`}
+          >
+            {s}x
+          </button>
+        ))}
+      </div>
     </div>
   );
 }

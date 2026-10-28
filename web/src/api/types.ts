@@ -260,5 +260,16 @@ export interface DashboardStats {
     evaluationsCompleted: number;
     avgQaScore: number | null;
   };
-  trend: { day: string; total: number; closed: number }[];
+  /**
+   * per dialer day: total = fronter transfers, closed = every sale; the
+   * transfer* fields split the day's transfers by where they are now
+   */
+  trend: {
+    day: string;
+    total: number;
+    closed: number;
+    transferClosed: number;
+    transferUnclosed: number;
+    transferOpen: number;
+  }[];
 }

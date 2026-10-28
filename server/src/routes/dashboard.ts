@@ -112,12 +112,17 @@ export async function dashboardRoutes(app: FastifyInstance): Promise<void> {
       .from(evaluations)
       .where(and(...eWhere));
 
-    // daily trend: fronter transfers vs all sales, bucketed in dialer days
+    // daily trend in dialer days: fronter transfers split by where they are
+    // now (closed / unclosed / no closer yet), plus all sales. Counts are
+    // cast to int — Postgres bigint arrives as text and charts cannot plot it.
     const trend = await db
       .select({
         day: sql<string>`to_char(date_trunc('day', coalesce(${transfers.countedAt}, ${transfers.xferTime}) AT TIME ZONE ${tz}), 'YYYY-MM-DD')`,
-        total: sql<number>`count(*) filter (where ${transfers.kind} = 'transfer')`,
-        closed: sql<number>`count(*) filter (where ${transfers.queueStatus} = 'closed')`,
+        total: sql<number>`(count(*) filter (where ${transfers.kind} = 'transfer'))::int`,
+        closed: sql<number>`(count(*) filter (where ${transfers.queueStatus} = 'closed'))::int`,
+        transferClosed: sql<number>`(count(*) filter (where ${transfers.kind} = 'transfer' and ${transfers.queueStatus} = 'closed'))::int`,
+        transferUnclosed: sql<number>`(count(*) filter (where ${transfers.kind} = 'transfer' and ${transfers.queueStatus} = 'unclosed'))::int`,
+        transferOpen: sql<number>`(count(*) filter (where ${transfers.kind} = 'transfer' and ${transfers.queueStatus} = 'transfer'))::int`,
       })
       .from(transfers)
       .where(and(...tWhere))
