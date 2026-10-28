@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Plus, RefreshCw, Satellite, Trash2 } from 'lucide-react';
+import { ArrowLeftRight, Plus, RefreshCw, Satellite, Trash2 } from 'lucide-react';
 import { api, ApiError } from '../../api/client';
 import type { Dialer } from '../../api/types';
 import { useAuth } from '../../auth/AuthContext';
@@ -103,6 +103,7 @@ export function DialersPage() {
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<Record<string, TestResult>>({});
   const [deleting, setDeleting] = useState<Dialer | null>(null);
+  const [linking, setLinking] = useState<Dialer | null>(null);
 
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ['dialers', companyId, 'admin'],
@@ -240,14 +241,38 @@ export function DialersPage() {
                           </a>
                         ))}
                     </div>
+                    {(d.closerDialers?.length ?? 0) > 0 && (
+                      <div className="mt-1.5 flex items-center gap-1.5 text-2xs text-ink-2">
+                        <ArrowLeftRight size={12} className="shrink-0 text-ink-3" />
+                        <span>
+                          Transfers also find their closer on{' '}
+                          {d.closerDialers!.map((c, i) => (
+                            <span key={c.id}>
+                              {i > 0 && ', '}
+                              <strong className="text-ink">{c.name}</strong>
+                              {c.companyName !== d.companyName && <span className="text-ink-3"> ({c.companyName})</span>}
+                            </span>
+                          ))}
+                        </span>
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button className="btn-secondary" onClick={() => test.mutate(d.id)} disabled={test.isPending}>
                       <Satellite size={14} /> Test connection
                     </button>
                     <button className="btn-secondary" onClick={() => sync.mutate(d.id)} disabled={sync.isPending || !d.active}>
                       <RefreshCw size={14} /> Full sync
                     </button>
+                    {isSuperAdmin && (
+                      <button
+                        className="btn-secondary"
+                        onClick={() => setLinking(d)}
+                        title="Dialers whose closers take this dialer's transfers"
+                      >
+                        <ArrowLeftRight size={14} /> Closer dialers
+                      </button>
+                    )}
                     <button className="btn-primary" onClick={() => openEditor(d)}>
                       Edit
                     </button>
@@ -394,6 +419,106 @@ export function DialersPage() {
           }}
         />
       )}
+
+      {linking && <CloserDialersModal dialer={linking} onClose={() => setLinking(null)} />}
     </div>
+  );
+}
+
+/**
+ * Super admins link a dialer to the dialers whose closers take its
+ * transfers — often another company's. The matcher then finds the closer
+ * leg there too, and this company can play that leg's recording; nothing
+ * else of the other company becomes visible.
+ */
+function CloserDialersModal({ dialer, onClose }: { dialer: Dialer; onClose: () => void }) {
+  const queryClient = useQueryClient();
+  const [picked, setPicked] = useState<Set<string>>(() => new Set((dialer.closerDialers ?? []).map((c) => c.id)));
+  const [rematching, setRematching] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // every dialer of every company (super admins see them all)
+  const { data, isLoading } = useQuery({
+    queryKey: ['dialers', 'all-companies'],
+    queryFn: () => api<{ dialers: Dialer[] }>('/dialers'),
+  });
+  const others = (data?.dialers ?? []).filter((d) => d.id !== dialer.id);
+
+  const save = useMutation({
+    mutationFn: () =>
+      api<{ rematching: number }>(`/dialers/${dialer.id}/closer-dialers`, {
+        method: 'PUT',
+        body: { dialerIds: [...picked] },
+      }),
+    onSuccess: (res) => {
+      setRematching(res.rematching);
+      void queryClient.invalidateQueries({ queryKey: ['dialers'] });
+    },
+    onError: (err) => setError(err instanceof ApiError ? err.message : 'Save failed.'),
+  });
+
+  const toggle = (id: string) =>
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  return (
+    <Modal title={`Closer dialers for ${dialer.name}`} open onClose={onClose}>
+      <p className="text-sm text-ink-2">
+        Tick the dialers whose closers take transfers from <strong className="text-ink">{dialer.name}</strong>. A transfer
+        that has no closer call on its own dialer is then matched to the closer's call there — same phone number, within
+        minutes — and moves to Unclosed or Closed with that call's recording.
+      </p>
+      <p className="mt-2 text-2xs text-ink-3">
+        {dialer.companyName ?? 'This company'} sees only the closer calls that match its own transfers; nothing else from
+        the other dialer.
+      </p>
+
+      {rematching !== null ? (
+        <div className="mt-4 rounded-md bg-good-soft px-3 py-2 text-sm text-good">
+          Saved.{' '}
+          {picked.size === 0
+            ? "Transfers are matched on this company's own dialers only."
+            : rematching > 0
+              ? `${rematching} earlier transfer${rematching === 1 ? ' is' : 's are'} being matched again — they move to Unclosed or Closed within a few minutes.`
+              : 'New transfers are matched this way from now on.'}
+        </div>
+      ) : isLoading ? (
+        <div className="mt-4">
+          <Loading />
+        </div>
+      ) : others.length === 0 ? (
+        <p className="mt-4 text-sm text-ink-2">There are no other dialers yet.</p>
+      ) : (
+        <div className="mt-4 max-h-72 space-y-1 overflow-y-auto">
+          {others.map((d) => (
+            <label key={d.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 hover:bg-bg">
+              <input type="checkbox" checked={picked.has(d.id)} onChange={() => toggle(d.id)} />
+              <span className="font-medium">{d.name}</span>
+              <span className="text-2xs text-ink-3">{d.companyName}</span>
+              {!d.active && <span className="chip bg-bg text-ink-3">inactive</span>}
+            </label>
+          ))}
+        </div>
+      )}
+
+      {error && <div className="mt-3 rounded-md bg-bad-soft px-3 py-2 text-sm text-bad">{error}</div>}
+      {rematching !== null ? (
+        <button className="btn-primary mt-4 w-full justify-center" onClick={onClose}>
+          Done
+        </button>
+      ) : (
+        <button
+          className="btn-primary mt-4 w-full justify-center"
+          onClick={() => save.mutate()}
+          disabled={save.isPending || isLoading}
+        >
+          Save
+        </button>
+      )}
+    </Modal>
   );
 }

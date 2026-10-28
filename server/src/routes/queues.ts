@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
-import { and, count, desc, eq, gte, ilike, lte, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, ilike, inArray, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import {
   calls,
@@ -24,6 +24,7 @@ import { localToUtc } from '../vicidial/timezone.js';
 import { toConnection } from '../vicidial/credentials.js';
 import { loadLeadInfo } from '../services/leadInfo.js';
 import { findFronterOnLead, recordingBundle, toRecordingRows } from '../services/callRecordings.js';
+import { closerDialersOf } from '../services/closerLinks.js';
 
 /** A reviewer limited to certain forms only reaches the matching queues. */
 function assertQueueAllowed(auth: AuthContext, queue: string): void {
@@ -301,6 +302,8 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
 
     const winStart = new Date(t.xferTime.getTime() - 2 * 60 * 1000);
     const winEnd = new Date(t.xferTime.getTime() + 10 * 60 * 1000);
+    // the company's own closers, and those on the dialers its fronters transfer to
+    const linked = (await closerDialersOf([t.dialerServerId])).get(t.dialerServerId) ?? [];
     const rows = await db
       .select({
         call: calls,
@@ -313,7 +316,7 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
       .innerJoin(dialerServers, eq(calls.dialerServerId, dialerServers.id))
       .where(
         and(
-          eq(calls.companyId, t.companyId),
+          linked.length ? or(eq(calls.companyId, t.companyId), inArray(calls.dialerServerId, linked)) : eq(calls.companyId, t.companyId),
           eq(calls.source, 'vicidial_closer_log'),
           gte(calls.callDate, winStart),
           lte(calls.callDate, winEnd),
@@ -360,8 +363,9 @@ export async function queueRoutes(app: FastifyInstance): Promise<void> {
 
     if (body.closerCallId) {
       const [closer] = await db.select().from(calls).where(eq(calls.id, body.closerCallId));
-      if (!closer || closer.companyId !== t.companyId) {
-        throw new ValidationError('Closer call not found in this company');
+      const linked = (await closerDialersOf([t.dialerServerId])).get(t.dialerServerId) ?? [];
+      if (!closer || (closer.companyId !== t.companyId && !linked.includes(closer.dialerServerId))) {
+        throw new ValidationError('Closer call not found in this company or its closer dialers');
       }
       await db
         .update(transfers)

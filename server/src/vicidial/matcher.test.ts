@@ -58,6 +58,24 @@ describe('scoreCandidate', () => {
     expect(s.reasons).toContain('cross-dialer candidate');
   });
 
+  it("linked closer dialer: warm handoff starts before the fronter's XFER and still auto-matches", () => {
+    // closers on a sister company's dialer pick up while the fronter is still
+    // on the line — the closer leg starts 0–2 min before the XFER timestamp
+    const opts = { ...DEFAULT_MATCH_OPTIONS, maxEarlySec: 600 };
+    const xfer = { ...xferSameDialer, phoneNumber: '+1 555-123-0001' };
+    const d = decideMatch(
+      xfer,
+      [
+        candidate({ callId: 'closer', dialerServerId: 'dialer-b', viciLeadId: 777, callDate: sec(-95) }),
+        candidate({ callId: 'other', dialerServerId: 'dialer-b', viciLeadId: 778, phoneNumber: '5559990000', callDate: sec(-60) }),
+      ],
+      opts,
+    );
+    expect(d.outcome).toBe('matched');
+    expect(d.best?.callId).toBe('closer');
+    expect(d.best?.score).toBe(70);
+  });
+
   it('same dialer with conflicting lead id is penalized', () => {
     const s = scoreCandidate(xferSameDialer, candidate({ viciLeadId: 99 }));
     // -20 lead mismatch + 40 phone + 30 time = 50

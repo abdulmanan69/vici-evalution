@@ -184,6 +184,28 @@ export const dialerServers = pgTable(
   (t) => [uniqueIndex('dialers_company_name_uq').on(t.companyId, t.name).where(sql`${t.deletingAt} is null`)],
 );
 
+/**
+ * Fronters on one dialer whose transfers are taken by closers on another
+ * (often another company's): the matcher then looks for the closer leg on
+ * the linked dialers too, and the transfer's company may play that leg's
+ * recording. Set by super admins; removed with either dialer.
+ */
+export const dialerCloserLinks = pgTable(
+  'dialer_closer_links',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    dialerServerId: uuid('dialer_server_id')
+      .notNull()
+      .references(() => dialerServers.id, { onDelete: 'cascade' }),
+    closerDialerServerId: uuid('closer_dialer_server_id')
+      .notNull()
+      .references(() => dialerServers.id, { onDelete: 'cascade' }),
+    createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex('dialer_closer_links_uq').on(t.dialerServerId, t.closerDialerServerId)],
+);
+
 export const viciAgents = pgTable(
   'vici_agents',
   {

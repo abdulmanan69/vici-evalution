@@ -52,6 +52,9 @@ export interface Dialer {
   hasApiCredentials: boolean;
   hasDbCredentials: boolean;
   hasRecordingAuth: boolean;
+  companyName?: string;
+  /** dialers whose closers take this dialer's transfers (often another company's) */
+  closerDialers?: { id: string; name: string; companyName: string }[];
 }
 
 export interface Agent {

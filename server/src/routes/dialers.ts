@@ -1,11 +1,12 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { and, desc, eq, isNull, type SQL } from 'drizzle-orm';
+import { and, desc, eq, inArray, isNull, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { dialerServers, syncJobs } from '../db/schema.js';
-import { companyScope, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
+import { companies, dialerServers, syncJobs } from '../db/schema.js';
+import { companyScope, isSuperAdmin, requiredCompanyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
-import { ConflictError, NotFoundError, ValidationError } from '../lib/errors.js';
+import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
+import { closerLinksForDisplay, setCloserDialers } from '../services/closerLinks.js';
 import { encryptSecret } from '../lib/crypto.js';
 import { testDialerConnection } from '../vicidial/sync.js';
 import { dropQueuedSyncs, enqueueDialerPurge, enqueueDialerSync } from '../lib/queue.js';
@@ -75,11 +76,53 @@ export async function dialerRoutes(app: FastifyInstance): Promise<void> {
     // shows it with its progress
     if (q.includeDeleting !== 'true') where.push(isNull(dialerServers.deletingAt));
     const rows = await db
-      .select()
+      .select({ dialer: dialerServers, companyName: companies.name })
       .from(dialerServers)
+      .innerJoin(companies, eq(companies.id, dialerServers.companyId))
       .where(where.length ? and(...where) : undefined)
       .orderBy(dialerServers.name);
-    return { dialers: rows.map(publicDialer) };
+    const links = await closerLinksForDisplay(rows.map((r) => r.dialer.id));
+    return {
+      dialers: rows.map((r) => ({
+        ...publicDialer(r.dialer),
+        companyName: r.companyName,
+        // where this dialer's fronters' transfers may find their closer leg
+        closerDialers: links.get(r.dialer.id) ?? [],
+      })),
+    };
+  });
+
+  /**
+   * Closer dialers (services/closerLinks.ts): the dialers whose closers take
+   * this dialer's transfers. Often another company's, so super admins only.
+   */
+  app.put('/:id/closer-dialers', { preHandler: [requirePermission('admin.dialers')] }, async (req) => {
+    const { id } = req.params as { id: string };
+    if (!isSuperAdmin(req.auth)) throw new ForbiddenError('Only a super admin can link dialers');
+    const body = z.object({ dialerIds: z.array(z.string().uuid()).max(20) }).parse(req.body);
+    const row = await loadDialer(req, id);
+    assertNotDeleting(row);
+    const ids = [...new Set(body.dialerIds)];
+    if (ids.includes(id)) throw new ValidationError('A dialer cannot be its own closer dialer');
+    if (ids.length) {
+      const found = await db
+        .select({ id: dialerServers.id })
+        .from(dialerServers)
+        .where(and(inArray(dialerServers.id, ids), isNull(dialerServers.deletingAt)));
+      if (found.length !== ids.length) throw new ValidationError('One of those dialers does not exist');
+    }
+    const result = await setCloserDialers(id, ids, req.auth.userId);
+    await audit(req, {
+      action: 'dialer.closer_dialers',
+      entityType: 'dialer',
+      entityId: id,
+      after: { closerDialerIds: ids, added: result.added, removed: result.removed, rematching: result.rematching },
+      companyId: row.companyId,
+    });
+    // match the re-opened transfers now rather than on the next tick
+    if (result.rematching > 0 && row.active) await enqueueDialerSync(id);
+    const links = await closerLinksForDisplay([id]);
+    return { closerDialers: links.get(id) ?? [], rematching: result.rematching };
   });
 
   app.post('/', { preHandler: [requirePermission('admin.dialers')] }, async (req, reply) => {

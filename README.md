@@ -157,6 +157,8 @@ Press **Test connection**: both the API and the MySQL checks must pass.
 
 **First import.** Saving a dialer starts importing its last 7 days (the retention window) straight away — nothing to click. **Sync monitor** shows it day by day with time left; queues fill in as it goes. If it is interrupted (a deploy, a restart, the dialer dropping the connection) it continues where it stopped; if the dialer cannot be reached it says why in plain words and retries every few minutes. After that the dialer syncs every minute. A new company starts with the stock VICIdial meanings (XFER = transfer, SALE = sale, CALLBK = callback, NI = no sale) — adjust them under **Dispositions**; changing what counts as a transfer or sale re-reads the last 7 days automatically.
 
+**Fronters and closers on different dialers.** When one dialer's fronters transfer to closers on another dialer — often a sister company's — those transfers find no closer call on their own dialer and stay in *Transfers* as "Closer leg not found". A super admin opens **Dialer servers → Closer dialers** on the fronters' dialer and ticks the closers' dialer. The closer's call is then found there (same phone number, within minutes), and the transfer moves to Unclosed or Closed with that call's recording; transfers already imported are matched again within a few minutes. The fronters' company sees only the closer calls that belong to its own transfers, and the closers' company keeps its own counts exactly as before.
+
 ---
 
 ## Built-in QA forms

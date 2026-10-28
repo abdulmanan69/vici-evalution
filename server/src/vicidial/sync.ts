@@ -34,6 +34,7 @@ import { isFinalMp3, isHttpUrl, linkRecordingToCall } from './recordingUrl.js';
 import { normalizeRecordingRow } from './apiDerive.js';
 import { fetchUserStatsCalls, type UserStatsCall } from './webReport.js';
 import { sha256 } from '../lib/crypto.js';
+import { closerDialersOf } from '../services/closerLinks.js';
 
 export interface SyncStats {
   [key: string]: number | string[] | Record<string, number> | undefined;
@@ -2104,12 +2105,16 @@ async function matchPendingTransfers(companyId: string, stats: SyncStats): Promi
   let matched = 0;
   let flagged = 0;
   let unmatched = 0;
+  // fronters whose transfers go to closers on other dialers (services/closerLinks.ts)
+  const closerDialers = await closerDialersOf([...new Set(pending.map((t) => t.dialerServerId))]);
 
   for (const [i, t] of pending.entries()) {
     if (i % 20 === 0) await progress()?.tick(i / Math.max(1, pending.length), `${matched} matched`);
     const winStart = new Date(t.xferTime.getTime() - MATCH_WINDOW_BEFORE_MS);
     const winEnd = new Date(t.xferTime.getTime() + MATCH_WINDOW_AFTER_MS);
-    // candidates across ALL of the company's dialers (same- and cross-dialer)
+    const linked = closerDialers.get(t.dialerServerId) ?? [];
+    // candidates across ALL of the company's dialers (same- and cross-dialer),
+    // plus the closer dialers this transfer's dialer is linked to
     const rows = await db
       .select({
         id: calls.id,
@@ -2121,7 +2126,7 @@ async function matchPendingTransfers(companyId: string, stats: SyncStats): Promi
       .from(calls)
       .where(
         and(
-          eq(calls.companyId, companyId),
+          linked.length ? or(eq(calls.companyId, companyId), inArray(calls.dialerServerId, linked)) : eq(calls.companyId, companyId),
           eq(calls.source, 'vicidial_closer_log'),
           eq(calls.isMock, false),
           gte(calls.callDate, winStart),
@@ -2260,7 +2265,10 @@ async function attributeSales(companyId: string, stats: SyncStats): Promise<void
       from calls c
      where c.company_id = ${companyId} and c.is_mock = false and c.call_date >= ${since}
        and upper(c.status) in (${codeList})
-       and not exists (select 1 from transfers t where t.closer_call_id = c.id or t.sale_call_id = c.id)
+       -- this company's own transfers only: a sister company's transfer that
+       -- found its closer leg here (closer dialers) leaves this count alone
+       and not exists (select 1 from transfers t where t.company_id = ${companyId}
+                          and (t.closer_call_id = c.id or t.sale_call_id = c.id))
      order by c.call_date
      limit 5000`);
 

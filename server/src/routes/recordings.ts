@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { request, type Dispatcher } from 'undici';
 import { db } from '../db/client.js';
@@ -6,7 +6,8 @@ import { calls, dialerServers, recordings } from '../db/schema.js';
 import { isCallInProgress } from '../services/callRecordings.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
-import { NotFoundError } from '../lib/errors.js';
+import { ForbiddenError, NotFoundError } from '../lib/errors.js';
+import { isLegOfCompanyTransfer } from '../services/closerLinks.js';
 import { toConnection } from '../vicidial/credentials.js';
 import { isFinalMp3, isHttpUrl, recordingAuthHeader, resolveRecordingUrl } from '../vicidial/recordingUrl.js';
 
@@ -15,12 +16,27 @@ import { isFinalMp3, isHttpUrl, recordingAuthHeader, resolveRecordingUrl } from 
  * talks to this authenticated, company-scoped proxy, which streams from the
  * dialer's recording webserver with Range support (seek/pause/speed work).
  */
+/**
+ * Strict company isolation, with one exception: the closer (or sale) leg of
+ * one of the caller's own transfers, when that closer works on another
+ * company's linked dialer (services/closerLinks.ts).
+ */
+async function assertRecordingAccess(req: FastifyRequest, rec: typeof recordings.$inferSelect): Promise<void> {
+  try {
+    companyScope(req, rec.companyId);
+  } catch (err) {
+    const own = req.auth.companyId;
+    if (!(err instanceof ForbiddenError) || !own || !rec.callId) throw err;
+    if (!(await isLegOfCompanyTransfer(own, rec.callId))) throw err;
+  }
+}
+
 export async function recordingRoutes(app: FastifyInstance): Promise<void> {
   app.get('/:id', { preHandler: [requirePermission('recordings.play')] }, async (req) => {
     const { id } = req.params as { id: string };
     const [rec] = await db.select().from(recordings).where(eq(recordings.id, id));
     if (!rec) throw new NotFoundError('Recording not found');
-    companyScope(req, rec.companyId);
+    await assertRecordingAccess(req, rec);
     const { raw, ...meta } = rec;
     return { recording: meta };
   });
@@ -29,7 +45,7 @@ export async function recordingRoutes(app: FastifyInstance): Promise<void> {
     const { id } = req.params as { id: string };
     const [rec] = await db.select().from(recordings).where(eq(recordings.id, id));
     if (!rec) throw new NotFoundError('Recording not found');
-    companyScope(req, rec.companyId); // strict company isolation
+    await assertRecordingAccess(req, rec);
 
     if (rec.isMock) {
       throw new NotFoundError('Mock recording has no audio');
