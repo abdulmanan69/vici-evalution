@@ -3,7 +3,25 @@ import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
 import { and, count, desc, eq, gte, inArray, lte, sql, sum, type SQL } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { agentDispositions, calls, dialerServers, evaluations, qaFormVersions, qaForms, transfers, users, viciAgents } from '../db/schema.js';
+import {
+  agentDispositions,
+  calls,
+  companies,
+  dialerServers,
+  evaluations,
+  qaFormVersions,
+  qaForms,
+  transfers,
+  users,
+  viciAgents,
+} from '../db/schema.js';
+import {
+  evaluatedAgentId,
+  evaluationAliases,
+  evaluationFilterSchema,
+  evaluationWhere,
+  filterTimezone,
+} from '../services/evaluationFilters.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { NotFoundError, ValidationError } from '../lib/errors.js';
@@ -14,10 +32,81 @@ import { fetchAgentStatusDetail, parseAgentStatusDetail } from '../vicidial/webR
 
 const EXPORT_LIMIT = 50_000;
 
-function csvEscape(v: unknown): string {
+export function csvEscape(v: unknown): string {
   if (v === null || v === undefined) return '';
-  const s = v instanceof Date ? v.toISOString() : String(v);
+  let s = v instanceof Date ? v.toISOString() : String(v);
+  // a comment like "- no rebuttal" or "=..." would run as a formula in Excel
+  // (#NAME?, or worse); a leading space keeps it plain text
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s) && !/^[-+]?\d+(\.\d+)?$/.test(s)) s = ` ${s}`;
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+const numOrNull = (v: unknown): number | null => (v === null || v === undefined || v === '' ? null : Number(v));
+
+type FormQuestionDef = {
+  id: string;
+  text: string;
+  type: string;
+  weight: number;
+  scaleMax?: number;
+  options?: Array<{ value: string; label: string }>;
+};
+
+function questionsOf(schema: unknown): FormQuestionDef[] {
+  const s = schema as { sections?: Array<{ questions?: FormQuestionDef[] }> } | null;
+  return (s?.sections ?? []).flatMap((x) => x.questions ?? []);
+}
+
+/**
+ * Question columns for an evaluations export: one block per form (by id —
+ * never by name, so two companies' forms called alike stay apart), with its
+ * newest version's questions in order and then any question only older
+ * versions asked. A row fills its own form's block from its own version's
+ * definitions and leaves every other block blank. Ratings are plain numbers
+ * with the scale in the header: "4/5" in a cell turns into a date in Excel.
+ */
+export function evaluationQuestionColumns<
+  R extends { formId: string; formName: string; companyName: string; formVersion: number; schema: unknown; evaluation: { answers: unknown } },
+>(rows: R[]): Array<{ header: string; cell: (r: R) => string | number }> {
+  const forms = new Map<string, { name: string; company: string; versions: Map<number, Map<string, FormQuestionDef>> }>();
+  for (const r of rows) {
+    let f = forms.get(r.formId);
+    if (!f) {
+      f = { name: r.formName, company: r.companyName, versions: new Map() };
+      forms.set(r.formId, f);
+    }
+    if (!f.versions.has(r.formVersion)) f.versions.set(r.formVersion, new Map(questionsOf(r.schema).map((q) => [q.id, q])));
+  }
+  const sameName = new Map<string, number>();
+  for (const f of forms.values()) sameName.set(f.name, (sameName.get(f.name) ?? 0) + 1);
+
+  const cols: Array<{ header: string; cell: (r: R) => string | number }> = [];
+  for (const [formId, f] of forms) {
+    const prefix = forms.size > 1 ? `${f.name}${(sameName.get(f.name) ?? 0) > 1 ? ` (${f.company})` : ''}: ` : '';
+    // newest definition of every question any version of this form asked
+    const defs = new Map<string, FormQuestionDef>();
+    for (const v of [...f.versions.keys()].sort((x, y) => y - x)) {
+      for (const [id, q] of f.versions.get(v)!) if (!defs.has(id)) defs.set(id, q);
+    }
+    for (const [qid, def] of defs) {
+      const unit =
+        def.type === 'rating' ? ` (out of ${def.scaleMax ?? 5})` : def.weight > 0 ? ` (${def.weight} pts)` : '';
+      cols.push({
+        header: `${prefix}${def.text}${unit}`,
+        cell: (r) => {
+          if (r.formId !== formId) return '';
+          const own = f.versions.get(r.formVersion)?.get(qid);
+          if (!own) return ''; // not asked on this row's version
+          const v = (r.evaluation.answers as Record<string, unknown> | null)?.[qid];
+          if (v === null || v === undefined || v === '') return '';
+          if (own.type === 'rating') return Number.isFinite(Number(v)) ? Number(v) : String(v);
+          if (own.type === 'dropdown') return own.options?.find((o) => o.value === String(v))?.label ?? String(v);
+          return String(v);
+        },
+      });
+    }
+  }
+  return cols;
 }
 
 function toCsv(headers: string[], rows: unknown[][]): string {
@@ -110,9 +199,11 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     if (q.formId) filters.push(sql`f.id = ${q.formId}`);
     const base = sql`
       select e.id, e.reviewer_id, e.percent, e.passed, e.auto_failed, f.queue as form_queue,
-             case when f.target = 'fronter' then fc.vici_agent_id
+             -- the agent the evaluation is about: the same rule as the
+             -- Evaluations page and its export (services/evaluationFilters.ts)
+             coalesce(e.target_agent_id, case when f.target = 'fronter' then fc.vici_agent_id
                   when f.target = 'closer' then cc.vici_agent_id
-                  else coalesce(cc.vici_agent_id, fc.vici_agent_id) end as agent_id
+                  else coalesce(cc.vici_agent_id, fc.vici_agent_id) end) as agent_id
         from evaluations e
         join qa_form_versions v on v.id = e.form_version_id
         join qa_forms f on f.id = v.form_id
@@ -552,128 +643,97 @@ export async function reportRoutes(app: FastifyInstance): Promise<void> {
     return reply.send(csv);
   });
 
+  /**
+   * The Evaluations page as a spreadsheet: exactly the completed evaluations
+   * the page lists for the same filters (services/evaluationFilters.ts), one
+   * row each, credited to the agent the evaluation is about. Each form gets
+   * its own block of question columns, so marks never land under another
+   * form's question or another company's form of the same name.
+   */
   app.get('/evaluations.csv', { preHandler: [requirePermission('reports.export')] }, async (req, reply) => {
-    const q = z
-      .object({
-        companyId: z.string().uuid().optional(),
-        formId: z.string().uuid().optional(),
-        reviewerId: z.string().uuid().optional(),
-        result: z.enum(['pass', 'fail', 'auto_fail']).optional(),
-        agent: z.string().max(60).optional(),
-        dateFrom: z.string().max(40).optional(),
-        dateTo: z.string().max(40).optional(),
-      })
-      .parse(req.query);
+    const q = evaluationFilterSchema.parse(req.query);
     const scope = companyScope(req, q.companyId);
-    const fc = alias(calls, 'efc');
-    const cc = alias(calls, 'ecc');
-    const fa = alias(viciAgents, 'efa');
-    const ca = alias(viciAgents, 'eca');
-
-    const [dialerRow] = await db
-      .select()
-      .from(dialerServers)
-      .where(scope ? eq(dialerServers.companyId, scope) : eq(dialerServers.active, true))
-      .limit(1);
-    const tz = dialerRow?.timezone ?? 'UTC';
-
-    const where: SQL[] = [eq(evaluations.status, 'completed')];
-    if (scope) where.push(eq(evaluations.companyId, scope));
-    if (q.formId) where.push(eq(qaForms.id, q.formId));
-    if (q.reviewerId) where.push(eq(evaluations.reviewerId, q.reviewerId));
-    if (q.result === 'pass') where.push(eq(evaluations.passed, true));
-    if (q.result === 'fail') where.push(and(eq(evaluations.passed, false), eq(evaluations.autoFailed, false))!);
-    if (q.result === 'auto_fail') where.push(eq(evaluations.autoFailed, true));
-    if (q.agent) {
-      const pat = `%${q.agent}%`;
-      where.push(
-        sql`(${fa.fullName} ilike ${pat} or ${fa.viciUser} ilike ${pat} or ${ca.fullName} ilike ${pat} or ${ca.viciUser} ilike ${pat})`,
-      );
-    }
-    const parseDay = (v: string, end: boolean) =>
-      /^\d{4}-\d{2}-\d{2}$/.test(v) ? localToUtc(`${v} ${end ? '23:59:59' : '00:00:00'}`, tz) : new Date(v);
-    if (q.dateFrom) where.push(gte(evaluations.completedAt, parseDay(q.dateFrom, false)));
-    if (q.dateTo) where.push(lte(evaluations.completedAt, parseDay(q.dateTo, true)));
+    const a = evaluationAliases();
+    const { fc, cc, fa, ca, ea } = a;
+    const tz = await filterTimezone(scope);
+    // drafts have no result yet — the export is the finished evaluations
+    const where = [...evaluationWhere(req, q, a, scope, tz), eq(evaluations.status, 'completed')];
 
     const rows = await db
       .select({
         evaluation: evaluations,
         reviewer: users.name,
+        companyName: companies.name,
+        formId: qaForms.id,
         formName: qaForms.name,
-        formTarget: qaForms.target,
         formVersion: qaFormVersions.version,
-        formVersionId: qaFormVersions.id,
         schema: qaFormVersions.schema,
         phone: transfers.phoneNumber,
-        fronterAgent: fa.fullName,
+        leadId: transfers.viciLeadId,
+        xferTime: transfers.xferTime,
+        queueStatus: transfers.queueStatus,
+        fronterName: fa.fullName,
         fronterUser: fa.viciUser,
-        closerAgent: ca.fullName,
+        closerName: ca.fullName,
         closerUser: ca.viciUser,
+        closerDispo: cc.status,
+        agentId: ea.id,
+        agentName: ea.fullName,
+        agentUser: ea.viciUser,
+        fronterAgentId: fc.viciAgentId,
       })
       .from(evaluations)
       .innerJoin(users, eq(evaluations.reviewerId, users.id))
       .innerJoin(qaFormVersions, eq(evaluations.formVersionId, qaFormVersions.id))
       .innerJoin(qaForms, eq(qaFormVersions.formId, qaForms.id))
+      .innerJoin(companies, eq(evaluations.companyId, companies.id))
       .leftJoin(transfers, eq(evaluations.transferId, transfers.id))
       .leftJoin(fc, eq(transfers.fronterCallId, fc.id))
       .leftJoin(fa, eq(fc.viciAgentId, fa.id))
       .leftJoin(cc, eq(transfers.closerCallId, cc.id))
       .leftJoin(ca, eq(cc.viciAgentId, ca.id))
+      .leftJoin(ea, eq(ea.id, evaluatedAgentId(a)))
       .where(and(...where))
       .orderBy(desc(evaluations.completedAt))
       .limit(EXPORT_LIMIT);
 
-    // one column per scored AND informational question for EVERY form in the
-    // export, grouped per form — rows fill their own form's columns and leave
-    // the others blank, so a mixed export still carries all parameters
-    type Q = { id: string; text: string; type: string; weight: number; scaleMax?: number; options?: Array<{ value: string; label: string; scorePct: number }> };
-    const newestByForm = new Map<string, { formName: string; formVersion: number; schema: unknown; formId: string }>();
-    for (const r of rows) {
-      const key = `${r.formName}`;
-      const prev = newestByForm.get(key);
-      if (!prev || r.formVersion > prev.formVersion) {
-        newestByForm.set(key, { formName: r.formName, formVersion: r.formVersion, schema: r.schema, formId: key });
-      }
-    }
-    const questionCols: Array<{ formName: string; q: Q }> = [];
-    for (const f of newestByForm.values()) {
-      const schema = f.schema as { sections: Array<{ questions: Q[] }> };
-      for (const qq of schema.sections.flatMap((s) => s.questions)) {
-        questionCols.push({ formName: f.formName, q: qq });
-      }
-    }
-    const prefix = newestByForm.size > 1 ? (c: { formName: string; q: Q }) => `${c.formName.split(' ')[0]}: ` : () => '';
-
+    const cols = evaluationQuestionColumns(rows);
+    const withCompany = !scope && new Set(rows.map((r) => r.companyName)).size > 1;
     const header = [
-      'date', 'time', 'number', 'agent', 'evaluator', 'method', 'result', 'score_percent',
-      ...questionCols.map((c) => `${prefix(c)}${c.q.text}${c.q.weight > 0 ? ` (/${c.q.weight})` : ''}`),
-      'comments',
+      'Evaluated on', 'Time', ...(withCompany ? ['Company'] : []),
+      'Number', 'Lead ID', 'Call date', 'Call time',
+      'Agent', 'Agent ID', 'Agent role', 'Fronter', 'Closer', 'Closer dispo', 'Queue',
+      'Evaluator', 'Form', 'Form version', 'Result', 'Score %', 'Points', 'Out of',
+      ...cols.map((c) => c.header),
+      // not "Comments": forms often have a question of that name
+      'Overall comments', 'Evaluation ID',
     ];
+    const local = (d: Date | null) => (d ? utcToLocalString(d, tz) : '');
     const body = rows.map((r) => {
-      const local = r.evaluation.completedAt ? utcToLocalString(r.evaluation.completedAt, tz) : '';
-      const agent = r.formTarget === 'fronter' ? (r.fronterAgent ?? r.fronterUser) : (r.closerAgent ?? r.closerUser);
-      const answers = (r.evaluation.answers ?? {}) as Record<string, unknown>;
-      const qCells = questionCols.map((c) => {
-        if (c.formName !== r.formName) return '';
-        const v = answers[c.q.id];
-        if (v === null || v === undefined || v === '') return '';
-        if (c.q.type === 'rating') return `${v}/${c.q.scaleMax ?? 5}`;
-        if (c.q.type === 'dropdown') return c.q.options?.find((o) => o.value === String(v))?.label ?? String(v);
-        return String(v);
-      });
+      const done = local(r.evaluation.completedAt);
+      const call = local(r.xferTime);
+      const role = r.agentId == null ? '' : r.agentId === r.fronterAgentId ? 'fronter' : 'closer';
       return [
-        local.slice(0, 10), local.slice(11, 16), r.phone, agent, r.reviewer, `${r.formName} v${r.formVersion}`,
+        done.slice(0, 10), done.slice(11, 16), ...(withCompany ? [r.companyName] : []),
+        r.phone, r.leadId, call.slice(0, 10), call.slice(11, 16),
+        r.agentName ?? r.agentUser, r.agentUser, role,
+        r.fronterName ?? r.fronterUser, r.closerName ?? r.closerUser, r.closerDispo, r.queueStatus,
+        r.reviewer, r.formName, r.formVersion,
         r.evaluation.autoFailed ? 'auto-fail' : r.evaluation.passed ? 'pass' : 'fail',
-        r.evaluation.percent,
-        ...qCells,
-        r.evaluation.comments,
+        numOrNull(r.evaluation.percent), numOrNull(r.evaluation.score), numOrNull(r.evaluation.maxScore),
+        ...cols.map((c) => c.cell(r)),
+        r.evaluation.comments, r.evaluation.id,
       ];
     });
 
-    await audit(req, { action: 'report.export_evaluations', after: { rows: rows.length, formId: q.formId ?? null } });
-    const csv = toCsv(header, body);
+    await audit(req, {
+      action: 'report.export_evaluations',
+      after: { rows: rows.length, filters: { ...q, companyId: scope ?? null } },
+    });
+    const range = [q.dateFrom, q.dateTo].filter(Boolean).join('_to_') || 'all';
     reply.header('content-type', 'text/csv; charset=utf-8');
-    reply.header('content-disposition', 'attachment; filename="evaluations.csv"');
-    return reply.send(csv);
+    reply.header('content-disposition', `attachment; filename="evaluations_${range.replace(/[^\w-]/g, '')}.csv"`);
+    // the byte-order mark makes Excel read the file as UTF-8 (names, dashes)
+    return reply.send(`﻿${toCsv(header, body)}`);
   });
 }

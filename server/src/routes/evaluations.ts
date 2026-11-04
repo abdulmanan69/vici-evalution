@@ -1,9 +1,9 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { alias } from 'drizzle-orm/pg-core';
-import { and, count, desc, eq, gte, inArray, lte, or, sql, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, inArray, lte, or, sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
-import { calls, dialerServers, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
+import { calls, evaluations, qaFormVersions, qaForms, recordings, transfers, users, viciAgents } from '../db/schema.js';
 import { isFinalMp3 } from '../vicidial/recordingUrl.js';
 
 type Method = 'transfer' | 'unclosed' | 'closed';
@@ -13,7 +13,6 @@ function formMethod(form: { queue: Method | null; target: string }, callStatus: 
   if (form.queue) return form.queue;
   return form.target === 'fronter' ? 'transfer' : callStatus;
 }
-import { localToUtc } from '../vicidial/timezone.js';
 import { companyScope, requirePermission } from '../auth/plugin.js';
 import { audit } from '../lib/audit.js';
 import { ConflictError, ForbiddenError, NotFoundError, ValidationError } from '../lib/errors.js';
@@ -22,6 +21,13 @@ import { canReviewTransfer } from '../lib/reviewScope.js';
 import { offsetOf, pageMeta, paginationSchema } from '../lib/pagination.js';
 import { answersSchema, formDefinitionSchema } from '../services/formSchema.js';
 import { scoreEvaluation } from '../services/scoring.js';
+import {
+  evaluatedAgentId,
+  evaluationAliases,
+  evaluationFilterSchema,
+  evaluationWhere,
+  filterTimezone,
+} from '../services/evaluationFilters.js';
 import { editableUntil, getQaSettings } from '../services/qaSettings.js';
 
 const createSchema = z.object({
@@ -31,65 +37,17 @@ const createSchema = z.object({
   callId: z.string().uuid().optional(),
 });
 
-const listQuery = paginationSchema.extend({
-  companyId: z.string().uuid().optional(),
-  status: z.enum(['draft', 'completed']).optional(),
-  reviewerId: z.string().uuid().optional(),
-  transferId: z.string().uuid().optional(),
-  formId: z.string().uuid().optional(),
-  result: z.enum(['pass', 'fail', 'auto_fail']).optional(),
-  /** matches the evaluated agent's name or user id */
-  agent: z.string().max(60).optional(),
-  /** YYYY-MM-DD = dialer-local day */
-  dateFrom: z.string().max(40).optional(),
-  dateTo: z.string().max(40).optional(),
-  /** reviewers: only my own evaluations */
-  mine: z.coerce.boolean().optional(),
-});
+const listQuery = paginationSchema.merge(evaluationFilterSchema);
 
 export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
   app.get('/', { preHandler: [requirePermission('qa.view')] }, async (req) => {
     const q = listQuery.parse(req.query);
     const scope = companyScope(req, q.companyId);
-    const fc = alias(calls, 'fc');
-    const cc = alias(calls, 'cc');
-    const fa = alias(viciAgents, 'fa');
-    const ca = alias(viciAgents, 'ca');
-
-    const where: SQL[] = [];
-    if (scope) where.push(eq(evaluations.companyId, scope));
-    if (q.status) where.push(eq(evaluations.status, q.status));
-    if (q.mine) where.push(eq(evaluations.reviewerId, req.auth.userId));
-    else if (q.reviewerId) where.push(eq(evaluations.reviewerId, q.reviewerId));
-    if (q.transferId) where.push(eq(evaluations.transferId, q.transferId));
-    if (q.formId) where.push(eq(qaForms.id, q.formId));
-    if (q.result === 'pass') where.push(eq(evaluations.passed, true));
-    if (q.result === 'fail') where.push(and(eq(evaluations.passed, false), eq(evaluations.autoFailed, false))!);
-    if (q.result === 'auto_fail') where.push(eq(evaluations.autoFailed, true));
-    // a restricted reviewer only ever sees their assigned methods
-    if (req.auth.allowedFormIds && !hasPermission(req.auth.permissions, 'qa.forms.manage')) {
-      where.push(inArray(qaForms.id, req.auth.allowedFormIds));
-    }
-    if (q.agent) {
-      const pat = `%${q.agent}%`;
-      where.push(
-        sql`(${fa.fullName} ilike ${pat} or ${fa.viciUser} ilike ${pat} or ${ca.fullName} ilike ${pat} or ${ca.viciUser} ilike ${pat})`,
-      );
-    }
-    if (q.dateFrom || q.dateTo) {
-      // plain dates mean the dialer's day, like everywhere else
-      const [dialerRow] = await db
-        .select()
-        .from(dialerServers)
-        .where(scope ? eq(dialerServers.companyId, scope) : eq(dialerServers.active, true))
-        .limit(1);
-      const tz = dialerRow?.timezone ?? 'UTC';
-      const evDate = sql`coalesce(${evaluations.completedAt}, ${evaluations.createdAt})`;
-      const parseDay = (v: string, end: boolean): Date =>
-        /^\d{4}-\d{2}-\d{2}$/.test(v) ? localToUtc(`${v} ${end ? '23:59:59' : '00:00:00'}`, tz) : new Date(v);
-      if (q.dateFrom) where.push(sql`${evDate} >= ${parseDay(q.dateFrom, false)}`);
-      if (q.dateTo) where.push(sql`${evDate} <= ${parseDay(q.dateTo, true)}`);
-    }
+    const a = evaluationAliases();
+    const { fc, cc, fa, ca, ea } = a;
+    const tz = q.dateFrom || q.dateTo ? await filterTimezone(scope) : 'UTC';
+    // the same filters as the CSV export (services/evaluationFilters.ts)
+    const where = evaluationWhere(req, q, a, scope, tz);
     const whereAll = where.length ? and(...where) : undefined;
 
     const [total] = await db
@@ -103,6 +61,7 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       .leftJoin(fa, eq(fc.viciAgentId, fa.id))
       .leftJoin(cc, eq(transfers.closerCallId, cc.id))
       .leftJoin(ca, eq(cc.viciAgentId, ca.id))
+      .leftJoin(ea, eq(ea.id, evaluatedAgentId(a)))
       .where(whereAll);
 
     const rows = await db
@@ -121,6 +80,10 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
         fronterUser: fa.viciUser,
         closerAgent: ca.fullName,
         closerUser: ca.viciUser,
+        // whose evaluation this is — the same agent the report counts it for
+        agentId: ea.id,
+        agentName: ea.fullName,
+        agentUser: ea.viciUser,
         hasRecording: sql<boolean>`exists(select 1 from recordings r where r.call_id in (${fc.id}, ${cc.id}) and r.status = 'available')`,
       })
       .from(evaluations)
@@ -132,6 +95,7 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       .leftJoin(fa, eq(fc.viciAgentId, fa.id))
       .leftJoin(cc, eq(transfers.closerCallId, cc.id))
       .leftJoin(ca, eq(cc.viciAgentId, ca.id))
+      .leftJoin(ea, eq(ea.id, evaluatedAgentId(a)))
       .where(whereAll)
       .orderBy(desc(sql`coalesce(${evaluations.completedAt}, ${evaluations.createdAt})`))
       .limit(q.pageSize)
@@ -331,7 +295,12 @@ export async function evaluationRoutes(app: FastifyInstance): Promise<void> {
       .values({
         companyId: transfer.companyId,
         transferId: transfer.id,
-        callId: body.callId ?? transfer.closerCallId ?? transfer.fronterCallId,
+        // the leg the form reviews: a fronter form scores the fronter's call
+        callId:
+          body.callId ??
+          (form.target === 'fronter'
+            ? (transfer.fronterCallId ?? transfer.closerCallId)
+            : (transfer.closerCallId ?? transfer.saleCallId ?? transfer.fronterCallId)),
         formVersionId: version.id,
         targetAgentId: body.targetAgentId ?? null,
         reviewerId: req.auth.userId,

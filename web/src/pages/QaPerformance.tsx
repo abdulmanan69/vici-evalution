@@ -119,9 +119,12 @@ export function QaPerformancePage() {
     </th>
   );
 
+  // opens exactly the evaluations this row counts: that agent (by id — a
+  // name or user-id search also caught other agents), the same form, days
   const drill = (r: PerfRow) => {
-    if (groupBy !== 'agent' || !r.user) return;
-    const qs = new URLSearchParams({ agent: r.user, dateFrom: range.dateFrom, dateTo: range.dateTo });
+    if (groupBy !== 'agent' || !r.id) return;
+    const qs = new URLSearchParams({ agentId: r.id, agentName: r.name, dateFrom: range.dateFrom, dateTo: range.dateTo });
+    if (formId) qs.set('formId', formId);
     navigate(`/qa/evaluations?${qs.toString()}`);
   };
 

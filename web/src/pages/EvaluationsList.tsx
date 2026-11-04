@@ -25,6 +25,10 @@ interface Row {
   fronterUser: string | null;
   closerAgent: string | null;
   closerUser: string | null;
+  /** the agent the evaluation is about (the one reports credit it to) */
+  agentId: string | null;
+  agentName: string | null;
+  agentUser: string | null;
   hasRecording: boolean;
 }
 
@@ -59,6 +63,8 @@ interface QaFormLite {
 
 function agentOf(r: Row): string {
   return (
+    r.agentName ??
+    r.agentUser ??
     (r.formTarget === 'fronter' ? (r.fronterAgent ?? r.fronterUser) : (r.closerAgent ?? r.closerUser)) ??
     r.fronterAgent ??
     r.closerAgent ??
@@ -187,16 +193,21 @@ export function EvaluationsListPage() {
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState('');
   const [mine, setMine] = useState(false);
-  // reports drill into this page with ?agent=&dateFrom=&dateTo=
+  // reports drill into this page with ?agentId=&agentName=&formId=&dateFrom=&dateTo=
+  // — exactly that agent's evaluations, the ones the report counted
   const [searchParams] = useSearchParams();
   const [agent, setAgent] = useState(searchParams.get('agent') ?? '');
-  const [formId, setFormId] = useState('');
+  const [exactAgent, setExactAgent] = useState<{ id: string; name: string } | null>(() => {
+    const id = searchParams.get('agentId');
+    return id ? { id, name: searchParams.get('agentName') || 'Selected agent' } : null;
+  });
+  const [formId, setFormId] = useState(searchParams.get('formId') ?? '');
   const [result, setResult] = useState('');
   const [dateFrom, setDateFrom] = useState(searchParams.get('dateFrom') ?? '');
   const [dateTo, setDateTo] = useState(searchParams.get('dateTo') ?? '');
   const [drawerId, setDrawerId] = useState<string | null>(null);
 
-  useEffect(() => setPage(1), [companyId, status, mine, agent, formId, result, dateFrom, dateTo]);
+  useEffect(() => setPage(1), [companyId, status, mine, agent, exactAgent, formId, result, dateFrom, dateTo]);
 
   const { data: formsList } = useQuery({
     queryKey: ['forms', companyId],
@@ -208,7 +219,8 @@ export function EvaluationsListPage() {
     companyId: companyId || undefined,
     status: status || undefined,
     mine: mine || undefined,
-    agent: agent || undefined,
+    agent: agent.trim() || undefined,
+    agentId: exactAgent?.id,
     formId: formId || undefined,
     result: result || undefined,
     dateFrom: dateFrom || undefined,
@@ -237,10 +249,13 @@ export function EvaluationsListPage() {
     }
   }
 
+  // the export carries every filter on screen — it holds exactly these rows
+  // (completed ones: a draft has no result yet)
   const csvQs = Object.entries(filters)
-    .filter(([k, v]) => v !== undefined && k !== 'status' && k !== 'mine')
+    .filter(([k, v]) => v !== undefined && k !== 'status')
     .map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`)
     .join('&');
+  const draftsOnly = status === 'draft';
 
   return (
     <div>
@@ -248,13 +263,35 @@ export function EvaluationsListPage() {
         title="Evaluations"
         subtitle="Every scored call with its per-question marks — click a row for the full record and audio"
         actions={
-          hasPerm('reports.export') && (
-            <a href={`/api/v1/reports/evaluations.csv${csvQs ? `?${csvQs}` : ''}`} className="btn-secondary" download>
+          hasPerm('reports.export') &&
+          (draftsOnly ? (
+            <span className="btn-secondary cursor-not-allowed opacity-50" title="Drafts have no result yet — the export lists completed evaluations">
+              <Download size={14} /> Export CSV
+            </span>
+          ) : (
+            <a
+              href={`/api/v1/reports/evaluations.csv${csvQs ? `?${csvQs}` : ''}`}
+              className="btn-secondary"
+              download
+              title="The completed evaluations matching these filters, one row each"
+            >
               <Download size={14} /> Export CSV
             </a>
-          )
+          ))
         }
       />
+
+      {exactAgent && (
+        <div className="mb-2 flex items-center gap-2 text-sm">
+          <span className="text-ink-2">Showing evaluations of</span>
+          <span className="chip flex items-center gap-1 bg-brand-soft text-brand">
+            {exactAgent.name}
+            <button onClick={() => setExactAgent(null)} aria-label="Show all agents" className="hover:text-brand-dark">
+              <X size={12} />
+            </button>
+          </span>
+        </div>
+      )}
 
       <div className="card mb-3 flex flex-wrap items-end gap-3 p-3">
         <input
