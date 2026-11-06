@@ -218,8 +218,10 @@ async function relinkRecentRecordings(): Promise<void> {
 /**
  * Daily retention: delete un-reviewed call data older than RETENTION_DAYS,
  * counted from each row's LAST change, so late disposition corrections are
- * never cut off mid-flight. Evaluated and flagged transfers are kept forever
- * together with their calls and recordings. Mock/demo rows are untouched.
+ * never cut off mid-flight. Evaluated, flagged and closed (sold) transfers are
+ * kept forever together with their calls and recordings: closed ones are sales
+ * of record, and the HRMS sales push voids any sale that disappears from here.
+ * Mock/demo rows are untouched.
  */
 async function applyRetention(): Promise<void> {
   if (config.RETENTION_DAYS <= 0) return;
@@ -229,12 +231,13 @@ async function applyRetention(): Promise<void> {
      where tr.is_mock = false
        and tr.updated_at < ${cutoff}
        and tr.match_status <> 'flagged'
+       and tr.queue_status <> 'closed'
        and not exists (select 1 from evaluations e where e.transfer_id = tr.id)`);
   const c = await db.execute(sql`
     delete from calls c
      where c.is_mock = false
        and c.call_date < ${cutoff}
-       and not exists (select 1 from transfers tr where tr.fronter_call_id = c.id or tr.closer_call_id = c.id)
+       and not exists (select 1 from transfers tr where tr.fronter_call_id = c.id or tr.closer_call_id = c.id or tr.sale_call_id = c.id)
        and not exists (select 1 from evaluations e where e.call_id = c.id)`);
   const r = await db.execute(sql`
     delete from recordings r
@@ -242,7 +245,7 @@ async function applyRetention(): Promise<void> {
        and r.call_id is null
        and coalesce(r.start_time, r.created_at) < ${cutoff}`);
   console.log(
-    `[worker] retention: removed ${t.rowCount ?? 0} transfers, ${c.rowCount ?? 0} calls, ${r.rowCount ?? 0} recordings older than ${config.RETENTION_DAYS}d (evaluated/flagged kept)`,
+    `[worker] retention: removed ${t.rowCount ?? 0} transfers, ${c.rowCount ?? 0} calls, ${r.rowCount ?? 0} recordings older than ${config.RETENTION_DAYS}d (evaluated/flagged/closed kept)`,
   );
 }
 

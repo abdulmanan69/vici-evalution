@@ -195,7 +195,7 @@ They are ordinary forms: edit them, add questions, re-publish (each publish is a
 
 **Deleting.** The dialog first counts what goes with the item (calls, recordings, transfers, evaluations, users …) and asks for its exact name. A deleted dialer stops syncing at once and leaves every list and filter; a deleted company's users are signed out and disabled at once. The data is then removed by the worker in small batches, so a big dialer never locks the database, and the row disappears from the admin page when it is done. Names and slugs are free for re-use straight away. QA forms stay when only a dialer is deleted. Every delete is in the audit log.
 
-**Retention.** Un-reviewed calls, transfers and recordings older than `RETENTION_DAYS` (default 7) are deleted nightly. Anything with an evaluation, or flagged, is kept forever — nothing a reviewer touched is ever lost. Recordings are never copied; they stay on the dialer and stream through the API on demand.
+**Retention.** Un-reviewed calls, transfers and recordings older than `RETENTION_DAYS` (default 7) are deleted nightly. Anything with an evaluation, flagged, or closed as a sale is kept forever, with its calls — nothing a reviewer touched is lost, and sales stay on record for the HRMS sales push. Recordings are never copied; they stay on the dialer and stream through the API on demand.
 
 **Health.** `GET /healthz` on the API (and through the web container) answers `200` when the database and Redis are reachable; `Dialer servers` shows the last sync, its duration and any warnings (time-zone mismatch, unmapped dispositions, archive access).
 
