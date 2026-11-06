@@ -7,20 +7,16 @@
  *
  * Both are read-only on the QA side: nothing in the QA database is changed.
  */
-import { and, eq, gte, inArray, isNotNull, lt, sql } from 'drizzle-orm';
+import { and, eq, gte, inArray, sql } from 'drizzle-orm';
 import { db } from '../../db/client.js';
 import { alias } from 'drizzle-orm/pg-core';
-import { agentDispositions, calls, companies, dialerServers, evaluations, transfers, viciAgents } from '../../db/schema.js';
+import { agentDispositions, calls, companies, dialerServers, transfers, viciAgents } from '../../db/schema.js';
+import { agentScores, monthStart, ym } from '../../services/agentScores.js';
 import { hrmsFor, type HrmsPerson, type MetricItem, type SaleItem, type SalesResult } from './client.js';
 
 /** 'dialer' = HRMS links tell apart equal user names by dialer name (HRMS_CONTEXT=dialer). */
 const useDialerContext = () => process.env.HRMS_CONTEXT === 'dialer';
 
-function monthStart(offset: number): Date {
-  const d = new Date();
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + offset, 1));
-}
-const ym = (d: Date) => d.toISOString().slice(0, 7);
 
 /**
  * Sends each agent's average QA score for the current and previous month to
@@ -37,37 +33,17 @@ export async function pushQaScores(months = 2): Promise<Array<{ company: string;
     for (let m = 0; m < months; m++) {
       const from = monthStart(-m);
       const to = monthStart(-m + 1);
-      const rows = await db
-        .select({
-          viciUser: viciAgents.viciUser,
-          dialer: dialerServers.name,
-          avg: sql<string>`avg(${evaluations.percent})`,
-          n: sql<number>`count(*)::int`,
-          min: sql<string>`min(${evaluations.percent})`,
-          max: sql<string>`max(${evaluations.percent})`,
-        })
-        .from(evaluations)
-        .innerJoin(viciAgents, eq(evaluations.targetAgentId, viciAgents.id))
-        .innerJoin(dialerServers, eq(viciAgents.dialerServerId, dialerServers.id))
-        .where(
-          and(
-            eq(evaluations.companyId, c.id),
-            eq(evaluations.status, 'completed'),
-            isNotNull(evaluations.percent),
-            gte(evaluations.completedAt, from),
-            lt(evaluations.completedAt, to),
-          ),
-        )
-        .groupBy(viciAgents.viciUser, dialerServers.name);
-      for (const r of rows) {
+      // each evaluation counts for the agent it is about, as in the QA
+      // performance report (also when it has no explicit target agent)
+      for (const r of await agentScores(c.id, from, to)) {
         items.push({
           externalId: r.viciUser,
           context: useDialerContext() ? r.dialer : '',
           metric: 'qa_score',
           period: ym(from),
-          value: Math.round(Number(r.avg) * 10) / 10,
+          value: Math.round(r.avg * 10) / 10,
           unit: '%',
-          details: { evaluations: r.n, lowest: Number(r.min), highest: Number(r.max), dialer: r.dialer },
+          details: { evaluations: r.n, lowest: r.min, highest: r.max, dialer: r.dialer },
         });
       }
     }

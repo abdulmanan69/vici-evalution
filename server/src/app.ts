@@ -28,6 +28,8 @@ import { dashboardRoutes } from './routes/dashboard.js';
 import { reportRoutes } from './routes/reports.js';
 import { hrmsWebhookRoutes, hrmsRoutes } from './integrations/hrms/routes.js';
 import { opsRoutes } from './routes/ops.js';
+import { extRoutes } from './integrations/connections/extRoutes.js';
+import { connectionRoutes } from './integrations/connections/adminRoutes.js';
 import { opsLogStream } from './lib/opsLog.js';
 import { recordRequest } from './lib/requestStats.js';
 
@@ -55,6 +57,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(rateLimit, {
     timeWindow: '1 minute',
     keyGenerator: (req) => {
+      // machine API keys (Connections) get their own budget per key
+      const auth = req.headers.authorization;
+      if (auth?.startsWith('Bearer qa_')) return `k:${sha256(auth.slice(7)).slice(0, 32)}`;
       const token = req.cookies?.[SESSION_COOKIE];
       return token ? `s:${sha256(token).slice(0, 32)}` : `ip:${req.ip}`;
     },
@@ -110,6 +115,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(hrmsWebhookRoutes, { prefix: '/api/v1/hrms' });
   // remote diagnostics: its own token instead of a session; absent unless OPS_TOKEN is set
   await app.register(opsRoutes, { prefix: '/api/v1/ops' });
+  // machine API for other apps: API keys (Bearer qa_…) instead of a session
+  await app.register(extRoutes, { prefix: '/api/v1/ext' });
 
   await app.register(
     async (api) => {
@@ -132,6 +139,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       await api.register(dashboardRoutes, { prefix: '/dashboard' });
       await api.register(reportRoutes, { prefix: '/reports' });
       await api.register(hrmsRoutes, { prefix: '/hrms' });
+      await api.register(connectionRoutes, { prefix: '/connections' });
     },
     { prefix: '/api/v1' },
   );

@@ -80,6 +80,28 @@ export interface SalesResult {
   unknown: string[];
 }
 
+export interface AttendanceItem {
+  /** the VICIdial agent user */
+  account: string;
+  /** 'YYYY-MM-DD', the shift day (dated the day the shift began) */
+  day: string;
+  /** ISO time the first call started */
+  firstAt: string;
+  /** ISO time the last call ended (start + length) */
+  lastAt: string;
+  calls: number;
+  talkSec: number;
+}
+
+export interface AttendanceResult {
+  received: number;
+  saved: number;
+  unchanged: number;
+  removed: number;
+  locked: number;
+  unknown: string[];
+}
+
 export class HrmsError extends Error {
   constructor(
     public status: number,
@@ -166,6 +188,21 @@ export class HrmsClient {
    */
   pushSales(items: SaleItem[], window?: { from: string; to: string }, context = '') {
     return this.call<SalesResult>('POST', `/connect/${SYSTEM}/sales`, { context, window, items });
+  }
+
+  /** How HRMS cuts the dialer's day into shift days: { timeZone: 'Asia/Karachi', dayStartsAt: '12:00' }. */
+  attendanceSettings() {
+    return this.call<{ timeZone: string; dayStartsAt: string }>('GET', `/connect/${SYSTEM}/attendance/settings`);
+  }
+
+  /**
+   * Dialer attendance per agent and shift day (needs attendance.write). HRMS
+   * replaces this source's rows for the whole window: agents and days not in
+   * `items` are removed, so send every agent's days of the window. At most
+   * 5,000 items and 62 days per call.
+   */
+  pushAttendance(items: AttendanceItem[], window: { from: string; to: string }, context = '') {
+    return this.call<AttendanceResult>('POST', `/connect/${SYSTEM}/attendance`, { context, window, items });
   }
 
   /** Changes since a cursor, for polling instead of a webhook. */

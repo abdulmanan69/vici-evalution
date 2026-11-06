@@ -17,10 +17,11 @@ Built for fronter → closer operations: every XFER a fronter makes is tracked t
 5. [Built-in QA forms](#built-in-qa-forms)
 6. [Day-to-day operations](#day-to-day-operations)
 7. [Remote diagnostics](#remote-diagnostics)
-8. [Configuration](#configuration)
-9. [Security](#security)
-10. [Troubleshooting](#troubleshooting)
-11. [Project layout & development](#project-layout--development)
+8. [Connections (other apps, HRMS, CRM)](#connections-other-apps-hrms-crm)
+9. [Configuration](#configuration)
+10. [Security](#security)
+11. [Troubleshooting](#troubleshooting)
+12. [Project layout & development](#project-layout--development)
 
 ---
 
@@ -226,6 +227,23 @@ Add `--json` to any command for the raw answer. Every API and worker warning, er
 
 ---
 
+## Connections (other apps, HRMS, CRM)
+
+**Admin → Connections** (permission *Users & roles*) lets other apps use QA data. Full reference with curl examples and the webhook signature check: [docs/CONNECTIONS.md](docs/CONNECTIONS.md).
+
+- **API keys** for a read-only machine API at `/api/v1/ext/…` (agents, transfers and sales, completed evaluations, monthly scores, agent activity). Each key has scopes and belongs to one company (super admins can make all-company keys). The key is shown once.
+- **Webhooks**: signed POSTs when an evaluation is completed or a sale closes or reopens, retried for about 24 hours.
+- **Outgoing links**: the last run of each push below.
+
+The platform also pushes, every hour:
+
+| To | What | On when |
+|---|---|---|
+| WaveTech HRMS | QA scores, dialer attendance per shift day, (optionally) closed sales | `HRMS_URL` and a key ([server/src/integrations/hrms](server/src/integrations/hrms/README.md)) |
+| CRM | QA score per agent and month | `CRM_URL` and `CRM_API_KEY` ([server/src/integrations/crm](server/src/integrations/crm/README.md)) |
+
+---
+
 ## Configuration
 
 All settings live in `.env` (template: [`.env.example`](.env.example)). The installer fills the secrets.
@@ -253,6 +271,9 @@ All settings live in `.env` (template: [`.env.example`](.env.example)). The inst
 | `SEED_DEMO` | `false` | creates a clearly flagged demo company with synthetic data |
 | `OPS_TOKEN` | *(empty)* | a random secret of 32+ characters turns on [remote diagnostics](#remote-diagnostics); empty = off |
 | `OPS_ALLOWED_IPS` | *(empty)* | optional comma-separated IPs / CIDR ranges allowed to use remote diagnostics |
+| `HRMS_URL` / `HRMS_API_KEY` / `HRMS_API_KEYS` | *(empty)* | WaveTech HRMS link; see [the HRMS kit](server/src/integrations/hrms/README.md) for the other `HRMS_*` settings |
+| `HRMS_PUSH_ATTENDANCE` | `true` | dialer attendance per shift day to the HRMS every hour (needs `HRMS_URL`); `false` = off |
+| `CRM_URL` / `CRM_API_KEY` | *(empty)* | QA scores to the CRM every hour; empty = off |
 
 ---
 
@@ -296,7 +317,8 @@ server/
   src/routes/            REST API (queues, recordings, QA forms, tasks, reports, admin…)
   src/services/          default forms · form schema & scoring · live recordings
   src/vicidial/          API + MySQL adapters, sync, matcher, recording URL repair
-  src/worker.ts          BullMQ schedulers (sync, recording repair, retention)
+  src/integrations/      hrms/ (WaveTech HRMS) · crm/ · connections/ (API keys, machine API, webhooks)
+  src/worker.ts          BullMQ schedulers (sync, recording repair, retention, pushes, webhooks)
 web/src/                 React app (queues, call pages, evaluation, forms, reports, admin)
 docs/                    architecture and VICIdial integration notes
 scripts/ops.mjs          remote diagnostics client (no dependencies; see Remote diagnostics)

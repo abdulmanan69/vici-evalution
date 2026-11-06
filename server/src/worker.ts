@@ -15,6 +15,10 @@ import { enqueueCompanyPurge, enqueueDialerPurge, MAINTENANCE_QUEUE, SYNC_QUEUE 
 import { captureConsole, captureCrashes, flushOpsLog, recordBoot, setOpsSource, startHeartbeat } from './lib/opsLog.js';
 import { buildInfo, processStats } from './lib/runtime.js';
 import { pushQaScores, pushSales } from './integrations/hrms/sync.js';
+import { pushAttendance } from './integrations/hrms/attendance.js';
+import { pushCrmQaScores } from './integrations/crm/sync.js';
+import { dispatchWebhooks } from './integrations/connections/dispatcher.js';
+import { trackJob } from './integrations/connections/jobStatus.js';
 
 /**
  * Background worker: schedules and runs per-dialer synchronization and
@@ -284,6 +288,9 @@ async function main(): Promise<void> {
         return { ok: true };
       }
       if (job.name === 'retention') return { ok: true, movedTo: MAINTENANCE_QUEUE }; // pre-upgrade schedule
+      // Connections: outbound webhooks (integrations/connections/dispatcher.ts).
+      // Light and frequent, so it runs here rather than behind long purges.
+      if (job.name === 'webhooks') return trackJob('webhooks', dispatchWebhooks);
       throw new Error(`Unknown job: ${job.name}`);
     },
     {
@@ -304,8 +311,11 @@ async function main(): Promise<void> {
         return { ok: true };
       }
       // WaveTech HRMS: QA scores and closed sales, every hour
-      if (job.name === 'hrms-qa-scores') return { sent: await pushQaScores() };
-      if (job.name === 'hrms-sales') return { sent: await pushSales() };
+      if (job.name === 'hrms-qa-scores') return { sent: await trackJob(job.name, () => pushQaScores()) };
+      if (job.name === 'hrms-sales') return { sent: await trackJob(job.name, () => pushSales()) };
+      // HRMS attendance from dialer calls, and QA scores to the CRM: every hour
+      if (job.name === 'hrms-attendance') return { sent: await trackJob(job.name, () => pushAttendance()) };
+      if (job.name === 'crm-qa-scores') return { sent: await trackJob(job.name, () => pushCrmQaScores()) };
       throw new Error(`Unknown maintenance job: ${job.name}`);
     },
     {
@@ -344,11 +354,17 @@ async function main(): Promise<void> {
   const hrmsJobs: Record<string, boolean> = {
     'hrms-qa-scores': !!process.env.HRMS_URL,
     'hrms-sales': !!process.env.HRMS_URL && process.env.HRMS_PUSH_SALES === 'true',
+    // dialer attendance per shift day; on with HRMS unless HRMS_PUSH_ATTENDANCE=false
+    'hrms-attendance': !!process.env.HRMS_URL && process.env.HRMS_PUSH_ATTENDANCE !== 'false',
+    // QA scores to the CRM (integrations/crm/): only when CRM_URL and CRM_API_KEY are set
+    'crm-qa-scores': !!process.env.CRM_URL?.trim() && !!process.env.CRM_API_KEY?.trim(),
   };
   for (const [name, on] of Object.entries(hrmsJobs)) {
     if (on) await maintenanceQueue.upsertJobScheduler(name, { every: 3600 * 1000 }, { name, opts: keep });
     else await maintenanceQueue.removeJobScheduler(name).catch(() => false);
   }
+  // Connections: webhook dispatcher every 30 s (does nothing without webhooks)
+  await syncQueue.upsertJobScheduler('webhooks', { every: 30 * 1000 }, { name: 'webhooks', opts: keep });
   await resumePendingPurges();
 
   console.log(

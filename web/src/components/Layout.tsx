@@ -17,6 +17,7 @@ import {
   ListChecks,
   LogOut,
   PhoneForwarded,
+  Plug,
   Server,
   Settings2,
   TrendingUp,
@@ -85,6 +86,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
       { to: '/admin/users', label: 'Users & roles', icon: <Users size={16} />, perm: 'admin.users' },
       { to: '/admin/sync', label: 'Sync monitor', icon: <Activity size={16} />, perm: 'admin.sync' },
       { to: '/admin/audit', label: 'Audit log', icon: <History size={16} />, perm: 'admin.audit' },
+      { to: '/admin/connections', label: 'Connections', icon: <Plug size={16} />, perm: 'admin.users' },
     ],
   },
 ];

@@ -43,7 +43,12 @@ x-app-env: &app-env
   HRMS_WEBHOOK_SECRETS: ${HRMS_WEBHOOK_SECRETS:-}
   HRMS_CONTEXT: ${HRMS_CONTEXT:-}
   HRMS_PUSH_SALES: ${HRMS_PUSH_SALES:-false}
+  # dialer attendance per shift day → HRMS, hourly while HRMS_URL is set; 'false' = off
+  HRMS_PUSH_ATTENDANCE: ${HRMS_PUSH_ATTENDANCE:-true}
   HRMS_TZ: ${HRMS_TZ:-Asia/Karachi}
+  # CRM link (server/src/integrations/crm): QA scores every hour. Empty = off
+  CRM_URL: ${CRM_URL:-}
+  CRM_API_KEY: ${CRM_API_KEY:-}
 
 services:
   postgres:

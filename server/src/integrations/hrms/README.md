@@ -10,6 +10,7 @@ This kit adds the HRMS link to the QA platform in about ten minutes. It only add
 | --- | --- |
 | Agent `agent1043` | the real person: name, SIP ID, department, designation, team lead, active or left, on leave today or soon |
 | QA scores | sent back to HRMS each month and shown on the employee's profile ("QA score 85%, VICIdial, November 2026") |
+| Dialer attendance | per agent and shift day: first call, last call end, calls, talk time; sent every hour |
 | Closed sales | off by default: the CRM sends compliance-approved sales to HRMS. `HRMS_PUSH_SALES=true` sends the dialer's closed sales every hour instead |
 | Changes in HRMS | a signed webhook as soon as someone joins, changes, leaves or goes on leave, naming the agent user directly |
 
@@ -33,6 +34,7 @@ Copy `server/src/integrations/hrms/` from this folder into the QA platform's `se
 ```
 client.ts   HRMS API client (no new dependencies), webhook signature check, per-company keys
 sync.ts     pushQaScores(), pushSales(), employeesFor(), unavailableAgents()
+attendance.ts  pushAttendance(): dialer attendance per shift day
 routes.ts   webhook receiver + /api/v1/hrms/agents lookup + manual "push now"
 ```
 
@@ -46,6 +48,7 @@ HRMS_API_KEY=hrms_xxxxxxxx_…            # one HRMS company for every QA compan
 HRMS_WEBHOOK_SECRET=whsec_…              # or HRMS_WEBHOOK_SECRETS=acme=whsec_…,beta=whsec_…
 # HRMS_CONTEXT=dialer                    # only if HRMS links use dialer names
 # HRMS_TZ=Asia/Karachi                   # the day a sale counts on (HR's calendar)
+# HRMS_PUSH_ATTENDANCE=false             # attendance push is on with HRMS_URL; this turns it off
 ```
 
 The kit reads these directly, so `config.ts` doesn't change. In Docker they reach the `api` and `worker` containers through the existing `env_file: .env`.
@@ -59,6 +62,7 @@ On Coolify there is no `.env` file. Set the values in the app's Environment Vari
   HRMS_WEBHOOK_SECRET: ${HRMS_WEBHOOK_SECRET:-}
   HRMS_WEBHOOK_SECRETS: ${HRMS_WEBHOOK_SECRETS:-}
   HRMS_CONTEXT: ${HRMS_CONTEXT:-}
+  HRMS_PUSH_ATTENDANCE: ${HRMS_PUSH_ATTENDANCE:-true}
   HRMS_TZ: ${HRMS_TZ:-Asia/Karachi}
 ```
 
@@ -99,6 +103,31 @@ if (job.name === 'hrms-sales') return pushSales();
 
 The run covers the whole period, so a sale that is no longer closed in QA is voided in HRMS. Once HRMS approves a month's payroll, it keeps that month as paid.
 
+**QA scores count for the agent the evaluation is about.** That is the explicit target agent if one is set, otherwise the leg the form reviews (fronter forms: the fronter; closer forms: the closer). The QA performance report uses the same rule. Before this, evaluations with no target agent were left out.
+
+**Attendance** (`hrms-attendance`, every hour while `HRMS_URL` is set, unless `HRMS_PUSH_ATTENDANCE=false`). Each run asks HRMS how it cuts days, with `GET /api/v1/connect/vicidial/attendance/settings` → `{ "timeZone": "Asia/Karachi", "dayStartsAt": "12:00" }`. A shift day runs from `dayStartsAt` to the same time the next day, and is dated the day it began, so a 20:00 → 05:00 night shift is one day. For each agent and shift day, the run sends:
+
+- `firstAt`: the start of the first call
+- `lastAt`: the end of the last call (start + length)
+- `calls`: the number of calls
+- `talkSec`: the total talk time
+
+These come from both outbound (`vicidial_log`) and closer (`vicidial_closer_log`) calls. Demo data and system users (`VDAD`, `VDCL`, `VDAC`, empty) are left out.
+
+```
+POST /api/v1/connect/vicidial/attendance     (key scope attendance.write)
+{ "context": "", "window": { "from": "2026-11-01", "to": "2026-11-06" },
+  "items": [ { "account": "agent1043", "day": "2026-11-05", "firstAt": "2026-11-05T15:00:00.000Z",
+               "lastAt": "2026-11-06T00:03:00.000Z", "calls": 41, "talkSec": 5230 } ] }
+→ { "received", "saved", "unchanged", "removed", "locked", "unknown": [] }
+```
+
+HRMS replaces this dialer's rows for the whole window, so every request carries every agent's days of its window. A request holds at most 5,000 items. A bigger window is split into requests of whole days, and together they cover every day.
+
+The window is the current shift day plus the completed ones before it: `min(8, RETENTION_DAYS − 1)` days in all (8 when `RETENTION_DAYS=0`). Un-reviewed calls are deleted after `RETENTION_DAYS`, and a day reaching back past that would look like an absence.
+
+A company with no calls at all in the window is skipped, not sent empty. That way a stalled dialer sync cannot wipe days that HRMS already has. With `HRMS_CONTEXT=dialer`, each dialer is sent as its own context. The keys are routed per company as for QA scores (`HRMS_API_KEYS`, by QA company slug).
+
 **Agents not linked yet** are returned in `unknown` and skipped. They are picked up by the first run after they are linked.
 
 ## 3. Use it
@@ -119,7 +148,7 @@ const { left, onLeave } = await unavailableAgents(companyId);   // vici_agents i
 
 **On a webhook** (`routes.ts`), the signature is checked and cached HRMS details are dropped, so screens show the change at once. `event.data.links.vicidial` lists the agent users concerned. Heavier reactions, like moving an agent's open QA tasks when they leave, belong in a queued job started from there.
 
-**Push now:** `POST /api/v1/hrms/push-qa-scores` and `POST /api/v1/hrms/push-sales` (permission `admin.agents`) send right away.
+**Push now:** `POST /api/v1/hrms/push-qa-scores` and `POST /api/v1/hrms/push-sales` (permission `admin.agents`) send right away. The last result of each hourly job is shown in **Admin → Connections → Outgoing links**.
 
 ## Checked
 
@@ -130,6 +159,6 @@ const { left, onLeave } = await unavailableAgents(companyId);   // vici_agents i
 
 ## Reference
 
-- HRMS connector API (`/api/v1/connect/vicidial/…`): `people`, `roster`, `suggest`, `links`, `metrics`. Full details in the HRMS repo's `docs/INTEGRATIONS.md`.
+- HRMS connector API (`/api/v1/connect/vicidial/…`): `people`, `roster`, `suggest`, `links`, `metrics`, `sales`, `attendance/settings`, `attendance`. Full details in the HRMS repo's `docs/INTEGRATIONS.md`.
 - **Webhook payloads** never contain CNIC, bank details or date of birth.
 - **API key limits:** 600 requests per minute. It can be revoked at any time in HRMS, and stops working at once.

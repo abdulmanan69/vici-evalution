@@ -66,6 +66,7 @@ const DispositionsPage = page(() => import('./pages/admin/Dispositions'), 'Dispo
 const UsersPage = page(() => import('./pages/admin/Users'), 'UsersPage');
 const SyncMonitorPage = page(() => import('./pages/admin/SyncMonitor'), 'SyncMonitorPage');
 const AuditLogsPage = page(() => import('./pages/admin/AuditLogs'), 'AuditLogsPage');
+const ConnectionsPage = page(() => import('./pages/admin/Connections'), 'ConnectionsPage');
 
 function usePrefetchWorkPages(enabled: boolean): void {
   useEffect(() => {
@@ -127,6 +128,7 @@ export default function App() {
                   <Route path="/admin/users" element={<UsersPage />} />
                   <Route path="/admin/sync" element={<SyncMonitorPage />} />
                   <Route path="/admin/audit" element={<AuditLogsPage />} />
+                  <Route path="/admin/connections" element={<ConnectionsPage />} />
                   <Route path="*" element={<Navigate to="/" replace />} />
                 </Routes>
               </Suspense>

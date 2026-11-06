@@ -455,7 +455,11 @@ export const transferEvents = pgTable(
     meta: jsonb('meta'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (t) => [index('transfer_events_transfer_idx').on(t.transferId)],
+  (t) => [
+    index('transfer_events_transfer_idx').on(t.transferId),
+    // the webhook dispatcher reads new events in order (integrations/connections)
+    index('transfer_events_created_idx').on(t.createdAt, t.id),
+  ],
 );
 
 export const recordings = pgTable(
@@ -574,6 +578,8 @@ export const evaluations = pgTable(
     index('evaluations_transfer_idx').on(t.transferId),
     index('evaluations_agent_idx').on(t.targetAgentId),
     index('evaluations_call_idx').on(t.callId),
+    // the webhook dispatcher and the machine API read completions in order
+    index('evaluations_completed_idx').on(t.completedAt, t.id).where(sql`${t.completedAt} is not null`),
   ],
 );
 
@@ -698,3 +704,99 @@ export const syncCursors = pgTable(
   },
   (t) => [uniqueIndex('sync_cursors_uq').on(t.dialerServerId, t.stream)],
 );
+
+// ---------------------------------------------------------------------------
+// Connections: other apps reading QA data (API keys) and receiving its
+// events (webhooks). See docs/CONNECTIONS.md.
+// ---------------------------------------------------------------------------
+
+/**
+ * API keys for the machine API (/api/v1/ext). Only the SHA-256 of a key is
+ * stored; the key itself is shown once when it is made.
+ */
+export const integrationKeys = pgTable(
+  'integration_keys',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    // null = every company (super admins only)
+    companyId: uuid('company_id').references(() => companies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    // the first characters of the key, to recognise it in lists
+    keyPrefix: varchar('key_prefix', { length: 16 }).notNull(),
+    keyHash: varchar('key_hash', { length: 64 }).notNull().unique(),
+    scopes: text('scopes').array().notNull().default(sql`'{}'::text[]`),
+    createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (t) => [index('integration_keys_company_idx').on(t.companyId)],
+);
+
+/** Outbound webhooks: signed POSTs to another app when something happens here. */
+export const integrationWebhooks = pgTable(
+  'integration_webhooks',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    // null = events of every company (super admins only)
+    companyId: uuid('company_id').references(() => companies.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    url: text('url').notNull(),
+    // signing secret, encrypted at rest (lib/crypto encryptSecret)
+    secret: text('secret').notNull(),
+    // event names; '*' = all, 'transfer.*' = every transfer event
+    events: text('events').array().notNull().default(sql`'{}'::text[]`),
+    active: boolean('active').notNull().default(true),
+    lastStatus: integer('last_status'),
+    lastError: text('last_error'),
+    lastDeliveryAt: timestamp('last_delivery_at', { withTimezone: true }),
+    // first failed delivery since the last success; null = healthy
+    failingSince: timestamp('failing_since', { withTimezone: true }),
+    createdBy: uuid('created_by').references(() => users.id, { onDelete: 'set null' }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('integration_webhooks_company_idx').on(t.companyId)],
+);
+
+/**
+ * Webhook outbox: one row per event and webhook, retried with backoff until
+ * delivered or about 24 hours have passed. Delivered rows are pruned after
+ * 14 days.
+ */
+export const integrationDeliveries = pgTable(
+  'integration_deliveries',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    webhookId: uuid('webhook_id')
+      .notNull()
+      .references(() => integrationWebhooks.id, { onDelete: 'cascade' }),
+    event: varchar('event', { length: 64 }).notNull(),
+    // what the event is about, e.g. 'transfer_event:<id>'; one delivery per webhook
+    eventKey: text('event_key').notNull(),
+    payload: jsonb('payload').notNull(),
+    attempts: integer('attempts').notNull().default(0),
+    // null = nothing more to do (delivered, or given up)
+    nextAttemptAt: timestamp('next_attempt_at', { withTimezone: true }).defaultNow(),
+    deliveredAt: timestamp('delivered_at', { withTimezone: true }),
+    lastStatus: integer('last_status'),
+    lastError: text('last_error'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex('integration_deliveries_webhook_event_uq').on(t.webhookId, t.eventKey),
+    index('integration_deliveries_due_idx').on(t.nextAttemptAt).where(sql`${t.nextAttemptAt} is not null`),
+    index('integration_deliveries_webhook_idx').on(t.webhookId, t.createdAt),
+  ],
+);
+
+/**
+ * Where the webhook dispatcher has read up to in each event stream, and the
+ * last result of each outgoing job ('job:<name>', in state).
+ */
+export const integrationCursors = pgTable('integration_cursors', {
+  name: varchar('name', { length: 64 }).primaryKey(),
+  lastAt: timestamp('last_at', { withTimezone: true }),
+  lastId: text('last_id'),
+  state: jsonb('state'),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
