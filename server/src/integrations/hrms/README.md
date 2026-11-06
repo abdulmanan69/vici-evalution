@@ -10,7 +10,7 @@ This kit adds the HRMS link to the QA platform in about ten minutes. It only add
 | --- | --- |
 | Agent `agent1043` | the real person: name, SIP ID, department, designation, team lead, active or left, on leave today or soon |
 | QA scores | sent back to HRMS each month and shown on the employee's profile ("QA score 85%, VICIdial, November 2026") |
-| Closed sales | sent to HRMS every hour, credited to the closer and the fronter; HRMS pays the monthly sales incentive in payroll |
+| Closed sales | off by default: the CRM sends compliance-approved sales to HRMS. `HRMS_PUSH_SALES=true` sends the dialer's closed sales every hour instead |
 | Changes in HRMS | a signed webhook as soon as someone joins, changes, leaves or goes on leave, naming the agent user directly |
 
 The QA platform and HRMS keep their own databases. They only meet through the HRMS API, with a key that can read people and leave and write QA figures and sales, nothing else.

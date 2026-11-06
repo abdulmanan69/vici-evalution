@@ -338,9 +338,15 @@ async function main(): Promise<void> {
   // retention moved to the maintenance queue — drop the old schedule
   await syncQueue.removeJobScheduler('retention').catch(() => false);
   await maintenanceQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention', opts: keep });
-  // WaveTech HRMS link: only when HRMS_URL is set (see integrations/hrms/)
-  for (const name of ['hrms-qa-scores', 'hrms-sales']) {
-    if (process.env.HRMS_URL) await maintenanceQueue.upsertJobScheduler(name, { every: 3600 * 1000 }, { name, opts: keep });
+  // WaveTech HRMS link: only when HRMS_URL is set (see integrations/hrms/).
+  // Sales go to the HRMS from the CRM (compliance-approved sales are the sales
+  // of record), so the dialer sales push is off unless HRMS_PUSH_SALES=true.
+  const hrmsJobs: Record<string, boolean> = {
+    'hrms-qa-scores': !!process.env.HRMS_URL,
+    'hrms-sales': !!process.env.HRMS_URL && process.env.HRMS_PUSH_SALES === 'true',
+  };
+  for (const [name, on] of Object.entries(hrmsJobs)) {
+    if (on) await maintenanceQueue.upsertJobScheduler(name, { every: 3600 * 1000 }, { name, opts: keep });
     else await maintenanceQueue.removeJobScheduler(name).catch(() => false);
   }
   await resumePendingPurges();
