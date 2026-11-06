@@ -14,6 +14,7 @@ import { ensureDefaultMappingsEverywhere } from './services/defaultMappings.js';
 import { enqueueCompanyPurge, enqueueDialerPurge, MAINTENANCE_QUEUE, SYNC_QUEUE } from './lib/queue.js';
 import { captureConsole, captureCrashes, flushOpsLog, recordBoot, setOpsSource, startHeartbeat } from './lib/opsLog.js';
 import { buildInfo, processStats } from './lib/runtime.js';
+import { pushQaScores, pushSales } from './integrations/hrms/sync.js';
 
 /**
  * Background worker: schedules and runs per-dialer synchronization and
@@ -299,6 +300,9 @@ async function main(): Promise<void> {
         await applyRetention();
         return { ok: true };
       }
+      // WaveTech HRMS: QA scores and closed sales, every hour
+      if (job.name === 'hrms-qa-scores') return { sent: await pushQaScores() };
+      if (job.name === 'hrms-sales') return { sent: await pushSales() };
       throw new Error(`Unknown maintenance job: ${job.name}`);
     },
     {
@@ -331,6 +335,11 @@ async function main(): Promise<void> {
   // retention moved to the maintenance queue — drop the old schedule
   await syncQueue.removeJobScheduler('retention').catch(() => false);
   await maintenanceQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention', opts: keep });
+  // WaveTech HRMS link: only when HRMS_URL is set (see integrations/hrms/)
+  for (const name of ['hrms-qa-scores', 'hrms-sales']) {
+    if (process.env.HRMS_URL) await maintenanceQueue.upsertJobScheduler(name, { every: 3600 * 1000 }, { name, opts: keep });
+    else await maintenanceQueue.removeJobScheduler(name).catch(() => false);
+  }
   await resumePendingPurges();
 
   console.log(

@@ -26,6 +26,7 @@ import { auditRoutes } from './routes/audit.js';
 import { syncRoutes } from './routes/sync.js';
 import { dashboardRoutes } from './routes/dashboard.js';
 import { reportRoutes } from './routes/reports.js';
+import { hrmsWebhookRoutes, hrmsRoutes } from './integrations/hrms/routes.js';
 import { opsRoutes } from './routes/ops.js';
 import { opsLogStream } from './lib/opsLog.js';
 import { recordRequest } from './lib/requestStats.js';
@@ -105,6 +106,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   app.get('/healthz', async () => ({ ok: true, ts: new Date().toISOString() }));
 
   await app.register(authRoutes, { prefix: '/api/v1/auth' });
+  // WaveTech HRMS webhooks: signed, no session
+  await app.register(hrmsWebhookRoutes, { prefix: '/api/v1/hrms' });
   // remote diagnostics: its own token instead of a session; absent unless OPS_TOKEN is set
   await app.register(opsRoutes, { prefix: '/api/v1/ops' });
 
@@ -128,6 +131,7 @@ export async function buildApp(): Promise<FastifyInstance> {
       await api.register(syncRoutes, { prefix: '/sync' });
       await api.register(dashboardRoutes, { prefix: '/dashboard' });
       await api.register(reportRoutes, { prefix: '/reports' });
+      await api.register(hrmsRoutes, { prefix: '/hrms' });
     },
     { prefix: '/api/v1' },
   );

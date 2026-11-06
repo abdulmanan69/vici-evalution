@@ -34,6 +34,15 @@ x-app-env: &app-env
   OPS_TOKEN: ${OPS_TOKEN:-}
   # optional: only these IPs / CIDR ranges may use them (comma-separated)
   OPS_ALLOWED_IPS: ${OPS_ALLOWED_IPS:-}
+  # WaveTech HRMS link (server/src/integrations/hrms): people, leave, QA scores
+  # and sales. Empty HRMS_URL = off. Keys come from HRMS → Integrations → VICIdial
+  HRMS_URL: ${HRMS_URL:-}
+  HRMS_API_KEY: ${HRMS_API_KEY:-}
+  HRMS_API_KEYS: ${HRMS_API_KEYS:-}
+  HRMS_WEBHOOK_SECRET: ${HRMS_WEBHOOK_SECRET:-}
+  HRMS_WEBHOOK_SECRETS: ${HRMS_WEBHOOK_SECRETS:-}
+  HRMS_CONTEXT: ${HRMS_CONTEXT:-}
+  HRMS_TZ: ${HRMS_TZ:-Asia/Karachi}
 
 services:
   postgres:
