@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Copy, KeyRound, Plus, RefreshCw, Send, Trash2, Webhook } from 'lucide-react';
+import { Copy, KeyRound, Plus, RefreshCw, Save, Send, Trash2, Upload, Webhook } from 'lucide-react';
 import { api, ApiError } from '../../api/client';
 import type { Company } from '../../api/types';
 import { useAuth } from '../../auth/AuthContext';
@@ -72,10 +72,12 @@ interface Links {
   hrms: {
     url: string | null;
     companies: Array<{ slug: string; name: string; configured: boolean }>;
+    /** some company has a link set up from the web */
+    web?: boolean;
     jobs: Record<string, JobState | null>;
     enabled: Record<string, boolean>;
   };
-  crm: { url: string | null; configured: boolean; jobs: Record<string, JobState | null>; enabled: Record<string, boolean> };
+  crm: { url: string | null; configured: boolean; web?: boolean; jobs: Record<string, JobState | null>; enabled: Record<string, boolean> };
   webhooks: { jobs: Record<string, JobState | null> };
 }
 
@@ -174,6 +176,7 @@ function summarize(result: unknown): string {
           .filter((k) => typeof x[k] === 'number' && (x[k] as number) > 0)
           .map((k) => `${x[k]} ${k}`);
         const unknown = Array.isArray(x.unknown) && x.unknown.length ? `${x.unknown.length} not linked` : '';
+        if (x.error) return `${x.company}: failed: ${x.error}`;
         return `${x.company}: ${x.skipped ?? ([...parts, unknown].filter(Boolean).join(', ') || 'no changes')}`;
       })
       .join(' · ');
@@ -235,8 +238,8 @@ function OutgoingLinks() {
         <tbody className="divide-y divide-ink/5">
           <tr>
             <td className="td bg-bg/60 text-2xs font-semibold uppercase tracking-wider text-ink-2" colSpan={5}>
-              HRMS {data.hrms.url ? <span className="ml-1 font-mono normal-case tracking-normal text-ink-3">{data.hrms.url}</span> : <span className="ml-1 normal-case tracking-normal text-ink-3">not set up (HRMS_URL)</span>}
-              {data.hrms.url && (
+              HRMS {data.hrms.url ? <span className="ml-1 font-mono normal-case tracking-normal text-ink-3">{data.hrms.url}</span> : <span className="ml-1 normal-case tracking-normal text-ink-3">{data.hrms.web ? 'set up per company below' : 'not set up'}</span>}
+              {(data.hrms.url || data.hrms.web) && (
                 <span className="ml-2 inline-flex flex-wrap gap-1 align-middle normal-case tracking-normal">
                   {data.hrms.companies.map((c) => (
                     <Chip key={c.slug} value={c.configured ? 'active' : 'disabled'} label={`${c.name}${c.configured ? '' : ': no key'}`} />
@@ -248,7 +251,7 @@ function OutgoingLinks() {
           <JobRows jobs={data.hrms.jobs} enabled={data.hrms.enabled} />
           <tr>
             <td className="td bg-bg/60 text-2xs font-semibold uppercase tracking-wider text-ink-2" colSpan={5}>
-              CRM {data.crm.url ? <span className="ml-1 font-mono normal-case tracking-normal text-ink-3">{data.crm.url}</span> : <span className="ml-1 normal-case tracking-normal text-ink-3">not set up (CRM_URL, CRM_API_KEY)</span>}
+              CRM {data.crm.url ? <span className="ml-1 font-mono normal-case tracking-normal text-ink-3">{data.crm.url}</span> : <span className="ml-1 normal-case tracking-normal text-ink-3">{data.crm.web ? 'set up per company below' : 'not set up'}</span>}
             </td>
           </tr>
           <JobRows jobs={data.crm.jobs} enabled={data.crm.enabled} />
@@ -260,6 +263,299 @@ function OutgoingLinks() {
           <JobRows jobs={data.webhooks.jobs} />
         </tbody>
       </table>
+    </div>
+  );
+}
+
+/* ------------------------------------------------ one company's links */
+
+type LinkKind = 'hrms' | 'crm';
+type LinkSource = 'web' | 'env' | 'off' | 'none';
+
+interface LinkRun {
+  job: string;
+  switchedOn: boolean;
+  run: { ok: boolean; finishedAt: string; manual: boolean; result: unknown; error?: string | null; lastOkAt?: string | null } | null;
+}
+
+interface LinkView {
+  source: LinkSource;
+  url: string | null;
+  defaultUrl: string;
+  enabled: boolean | null;
+  hasKey: boolean;
+  keyLast4: string | null;
+  error: string | null;
+  updatedAt: string | null;
+  env: { url: string | null; hasKey: boolean };
+  jobs: LinkRun[];
+  hasWebhookSecret?: boolean;
+  webhookSecretFromEnv?: boolean;
+  webhookPath?: string;
+}
+
+interface CompanyLinksView {
+  company: { id: string; name: string; slug: string };
+  hrms: LinkView;
+  crm: LinkView;
+}
+
+interface LinkTest {
+  ok: boolean;
+  status: number | null;
+  message: string;
+}
+
+const SOURCE_CHIP: Record<LinkSource, { value: string; label: string }> = {
+  web: { value: 'active', label: 'Set here' },
+  env: { value: 'transfer', label: 'From server settings' },
+  off: { value: 'disabled', label: 'Switched off' },
+  none: { value: 'unknown', label: 'Not connected' },
+};
+
+const LINK_TEXT: Record<LinkKind, { title: string; keyHelp: string; what: string }> = {
+  hrms: {
+    title: 'HR system (hr.vertexpakistan.com)',
+    keyHelp: 'Get the key in the HR system: Admin → Integrations → VICIdial → Create key. Give it metrics.write and attendance.write.',
+    what: 'Sends QA scores and dialer attendance for this company every hour.',
+  },
+  crm: {
+    title: 'CRM (crm.vertexpakistan.com)',
+    keyHelp: 'Get the key in the CRM: Admin → Connections → Keys → New key, with the scope metrics.write.',
+    what: "Sends this company's QA scores every hour.",
+  },
+};
+
+function LinkCard({ kind, companyId, view, onSaved }: { kind: LinkKind; companyId: string; view: LinkView; onSaved: (v: CompanyLinksView) => void }) {
+  const text = LINK_TEXT[kind];
+  const [url, setUrl] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [webhookSecret, setWebhookSecret] = useState('');
+  const [enabled, setEnabled] = useState(true);
+  const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pushedAt, setPushedAt] = useState<number | null>(null);
+  const queryClient = useQueryClient();
+
+  // the form starts from what is saved whenever the company or the saved link changes
+  useEffect(() => {
+    setUrl(view.source === 'web' || view.source === 'off' ? (view.url ?? view.defaultUrl) : view.defaultUrl);
+    setApiKey('');
+    setWebhookSecret('');
+    setEnabled(view.enabled ?? true);
+    setStatus(null);
+  }, [companyId, view.updatedAt, view.source, view.url, view.defaultUrl, view.enabled]);
+
+  const savedHere = view.source === 'web' || view.source === 'off';
+  const body = { companyId: companyId || undefined };
+
+  const test = useMutation({
+    mutationFn: () => api<{ result: LinkTest }>(`/connections/links/${kind}/test`, { method: 'POST', body: { ...body, url, apiKey: apiKey || undefined } }),
+    onSuccess: (r) => setStatus({ ok: r.result.ok, text: r.result.message }),
+    onError: (err) => setStatus({ ok: false, text: errMsg(err, 'The test could not run.') }),
+  });
+  const save = useMutation({
+    mutationFn: () =>
+      api<CompanyLinksView>(`/connections/links/${kind}`, {
+        method: 'PUT',
+        body: { ...body, url, apiKey: apiKey || undefined, enabled, ...(kind === 'hrms' ? { webhookSecret: webhookSecret || undefined } : {}) },
+      }),
+    onSuccess: (v) => {
+      onSaved(v);
+      setStatus({ ok: true, text: enabled ? 'Saved. The next hourly run uses this link; press Push now to send at once.' : 'Saved. This link is switched off for the company.' });
+      void queryClient.invalidateQueries({ queryKey: ['connections', 'links'] });
+    },
+    onError: (err) => setStatus({ ok: false, text: errMsg(err, 'The link could not be saved.') }),
+  });
+  const remove = useMutation({
+    mutationFn: () => api<CompanyLinksView>(`/connections/links/${kind}`, { method: 'DELETE', query: body }),
+    onSuccess: (v) => {
+      onSaved(v);
+      setStatus({ ok: true, text: v[kind].source === 'env' ? 'Removed. The server settings apply again.' : 'Removed. This link is not connected now.' });
+      void queryClient.invalidateQueries({ queryKey: ['connections', 'links'] });
+    },
+    onError: (err) => setStatus({ ok: false, text: errMsg(err, 'The link could not be removed.') }),
+  });
+  const push = useMutation({
+    mutationFn: () => api<{ queued: string[] }>(`/connections/links/${kind}/push`, { method: 'POST', body }),
+    onSuccess: (r) => {
+      setPushedAt(Date.now());
+      setStatus({ ok: true, text: `Queued: ${r.queued.map((n) => JOB_LABELS[n] ?? n).join(', ')}. Results appear below in a moment.` });
+    },
+    onError: (err) => setStatus({ ok: false, text: errMsg(err, 'Could not queue the push.') }),
+  });
+
+  // poll while a push just queued is running
+  useEffect(() => {
+    if (!pushedAt) return;
+    const t = setInterval(() => {
+      if (Date.now() - pushedAt > 120_000) {
+        setPushedAt(null);
+        return;
+      }
+      void queryClient.invalidateQueries({ queryKey: ['connections', 'links'] });
+    }, 4000);
+    return () => clearInterval(t);
+  }, [pushedAt, queryClient]);
+
+  const chip = SOURCE_CHIP[view.source];
+  const busy = test.isPending || save.isPending || remove.isPending || push.isPending;
+  const canSave = url.trim().length > 0 && (apiKey.length > 0 || (savedHere && view.hasKey));
+
+  return (
+    <div className="card space-y-3 p-4">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h3 className="font-display text-sm font-bold">{text.title}</h3>
+          <p className="text-2xs text-ink-3">{text.what}</p>
+        </div>
+        <Chip value={chip.value} label={chip.label} />
+      </div>
+
+      {view.source === 'env' && (
+        <p className="rounded-md bg-bg px-3 py-2 text-2xs text-ink-2">
+          Now using the server settings: <span className="font-mono">{view.url}</span>, key …{view.keyLast4}. Saving here replaces them for this company only.
+        </p>
+      )}
+      {view.error && <div className="rounded-md bg-bad-soft px-3 py-2 text-sm text-bad">{view.error}</div>}
+
+      <Field label="Address">
+        <input className="input font-mono text-2xs" value={url} placeholder={view.defaultUrl} onChange={(e) => setUrl(e.target.value)} />
+      </Field>
+      <Field label="API key" hint={text.keyHelp}>
+        <input
+          className="input font-mono text-2xs"
+          type="password"
+          autoComplete="new-password"
+          value={apiKey}
+          placeholder={savedHere && view.hasKey ? `Saved (…${view.keyLast4 ?? ''}). Leave empty to keep it.` : 'Paste the key'}
+          onChange={(e) => setApiKey(e.target.value)}
+        />
+      </Field>
+      {kind === 'hrms' && (
+        <Field
+          label="Webhook secret (optional)"
+          hint={`Only if the HR system sends changes to this platform, to ${window.location.origin}${view.webhookPath ?? ''}. ${
+            view.hasWebhookSecret ? 'A secret is saved; leave empty to keep it.' : view.webhookSecretFromEnv ? 'The server settings have one for this company.' : ''
+          }`}
+        >
+          <input
+            className="input font-mono text-2xs"
+            type="password"
+            autoComplete="new-password"
+            value={webhookSecret}
+            placeholder={view.hasWebhookSecret ? 'Saved. Leave empty to keep it.' : ''}
+            onChange={(e) => setWebhookSecret(e.target.value)}
+          />
+        </Field>
+      )}
+      <label className="flex items-center gap-2 text-sm">
+        <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+        Enabled
+        <span className="text-2xs text-ink-3">(off = nothing is sent for this company, not even with the server settings)</span>
+      </label>
+
+      {status && <div className={`rounded-md px-3 py-2 text-sm ${status.ok ? 'bg-good-soft text-good' : 'bg-bad-soft text-bad'}`}>{status.text}</div>}
+
+      <div className="flex flex-wrap gap-2">
+        <button className="btn-secondary" disabled={busy || !url.trim()} onClick={() => test.mutate()}>
+          <RefreshCw size={14} className={test.isPending ? 'animate-spin' : ''} /> Test
+        </button>
+        <button className="btn-primary" disabled={busy || !canSave} onClick={() => save.mutate()}>
+          <Save size={14} /> Save
+        </button>
+        <button className="btn-secondary" disabled={busy || view.source === 'none' || view.source === 'off'} onClick={() => push.mutate()}>
+          <Upload size={14} /> Push now
+        </button>
+        {savedHere && (
+          <button
+            className="btn-secondary text-bad hover:bg-bad-soft"
+            disabled={busy}
+            onClick={() => {
+              if (window.confirm('Remove the link set here? The server settings apply again, if they cover this company.')) remove.mutate();
+            }}
+          >
+            <Trash2 size={14} /> Remove
+          </button>
+        )}
+      </div>
+
+      <div className="border-t border-ink/5 pt-2">
+        <div className="mb-1 text-2xs font-semibold text-ink-2">Last pushes</div>
+        <ul className="space-y-1 text-2xs">
+          {view.jobs.map((j) => (
+            <li key={j.job} className="flex flex-wrap items-baseline gap-x-2">
+              <span className="font-medium">{JOB_LABELS[j.job] ?? j.job}</span>
+              {!j.switchedOn ? (
+                <span className="text-ink-3">switched off in server settings</span>
+              ) : !j.run ? (
+                <span className="text-ink-3">not run yet</span>
+              ) : (
+                <>
+                  <span className="font-mono text-ink-3">
+                    {relative(j.run.finishedAt)}
+                    {j.run.manual ? ' (push now)' : ''}
+                  </span>
+                  {j.run.ok ? <Chip value="success" label="ok" /> : <Chip value="failed" />}
+                  <span className={j.run.ok ? 'text-ink-2' : 'text-bad'}>
+                    {j.run.ok ? (j.run.result == null ? 'nothing sent for this company' : summarize(j.run.result) || 'no changes') : j.run.error}
+                  </span>
+                </>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+function CompanyLinks() {
+  const { isSuperAdmin } = useAuth();
+  const { companyId: scopeId } = useCompanyScope();
+  const [picked, setPicked] = useState('');
+  const queryClient = useQueryClient();
+  const companies = useQuery({
+    queryKey: ['companies'],
+    queryFn: () => api<{ companies: Company[] }>('/companies'),
+    enabled: isSuperAdmin,
+  });
+  const active = companies.data?.companies.filter((c) => c.status === 'active') ?? [];
+  const companyId = isSuperAdmin ? picked || scopeId || active[0]?.id || '' : '';
+
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['connections', 'links', 'company', companyId],
+    queryFn: () => api<CompanyLinksView>('/connections/links/company', { query: { companyId: companyId || undefined } }),
+    enabled: !isSuperAdmin || !!companyId,
+    refetchInterval: 30_000,
+  });
+  const onSaved = (v: CompanyLinksView) => queryClient.setQueryData(['connections', 'links', 'company', companyId], v);
+
+  return (
+    <div className="mb-2">
+      {isSuperAdmin && (
+        <div className="mb-3 max-w-sm">
+          <Field label="Company">
+            <select className="input" value={companyId} onChange={(e) => setPicked(e.target.value)}>
+              {active.length === 0 && <option value="">No companies</option>}
+              {active.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </Field>
+        </div>
+      )}
+      {isSuperAdmin && !companyId ? null : isLoading ? (
+        <Loading />
+      ) : isError || !data ? (
+        <ErrorState message="The links could not load." onRetry={() => void refetch()} />
+      ) : (
+        <div className="grid gap-4 lg:grid-cols-2">
+          <LinkCard kind="hrms" companyId={companyId} view={data.hrms} onSaved={onSaved} />
+          <LinkCard kind="crm" companyId={companyId} view={data.crm} onSaved={onSaved} />
+        </div>
+      )}
     </div>
   );
 }
@@ -729,7 +1025,12 @@ export function ConnectionsPage() {
       )}
       <section>
         <h2 className="mb-2 font-display text-base font-bold">Outgoing links</h2>
-        <p className="mb-3 text-sm text-ink-2">What this platform sends to the HRMS and the CRM every hour, and how the last run went. Set up through server settings.</p>
+        <p className="mb-3 text-sm text-ink-2">
+          What this platform sends to the HR system and the CRM every hour. Connect them for a company here; a link set here wins over the server settings, which still cover every
+          company without one.
+        </p>
+        <CompanyLinks />
+        <h3 className="mb-2 mt-6 text-sm font-semibold text-ink-2">All companies: last runs</h3>
         <OutgoingLinks />
       </section>
     </div>

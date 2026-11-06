@@ -18,9 +18,10 @@
 import { and, eq, gte, inArray, lt, sql } from 'drizzle-orm';
 import { config } from '../../config.js';
 import { db } from '../../db/client.js';
-import { calls, companies, dialerServers, viciAgents } from '../../db/schema.js';
+import { calls, dialerServers, viciAgents } from '../../db/schema.js';
 import { localToUtc } from '../../vicidial/timezone.js';
-import { hrmsFor, type AttendanceItem, type AttendanceResult, type HrmsClient } from './client.js';
+import { type AttendanceItem, type AttendanceResult, type HrmsClient } from './client.js';
+import { forEachHrmsCompany, type PushScope } from './sync.js';
 
 /** VICIdial's own users, never a person: auto-dial and drop placeholders. */
 const SYSTEM_USERS = new Set(['', 'VDAD', 'VDCL', 'VDAC']);
@@ -182,30 +183,24 @@ async function callRows(companyId: string, from: Date, to: Date): Promise<CallRo
   return rows;
 }
 
-export type AttendanceRun = { company: string; window?: { from: string; to: string }; skipped?: string } & Partial<AttendanceResult>;
+export type AttendanceRun = { company: string; window?: { from: string; to: string }; skipped?: string; error?: string } & Partial<AttendanceResult>;
 
 /**
- * Sends the attendance window of every active company that has an HRMS key.
- * A company with no calls at all in the window is skipped rather than sent
- * empty, so a stalled dialer sync cannot wipe days already in HRMS.
+ * Sends the attendance window of every active company that has an HRMS link
+ * (or only the one in `scope`, for "Push now"). A company with no calls at
+ * all in the window is skipped rather than sent empty, so a stalled dialer
+ * sync cannot wipe days already in HRMS.
  */
-export async function pushAttendance(now = new Date()): Promise<AttendanceRun[]> {
-  const result: AttendanceRun[] = [];
-  const list = await db.select({ id: companies.id, slug: companies.slug }).from(companies).where(eq(companies.status, 'active'));
+export async function pushAttendance(now = new Date(), scope: PushScope = {}): Promise<AttendanceRun[]> {
   const settingsFor = new Map<HrmsClient, { timeZone: string; dayStartsAt: string }>();
-  for (const c of list) {
-    const hrms = hrmsFor(c.slug);
-    if (!hrms) continue;
+  return forEachHrmsCompany(scope, async (c, hrms): Promise<Omit<AttendanceRun, 'company'>> => {
     if (!settingsFor.has(hrms)) settingsFor.set(hrms, await hrms.attendanceSettings());
     const settings = settingsFor.get(hrms)!;
     const tz = settings.timeZone || 'Asia/Karachi';
     const startMin = parseDayStart(settings.dayStartsAt);
     const window = attendanceWindow(now, tz, startMin, config.RETENTION_DAYS);
     const rows = await callRows(c.id, shiftDayStart(window.from, tz, startMin), shiftDayStart(addDays(window.to, 1), tz, startMin));
-    if (rows.length === 0) {
-      result.push({ company: c.slug, window: { from: window.from, to: window.to }, skipped: 'no calls in the window' });
-      continue;
-    }
+    if (rows.length === 0) return { window: { from: window.from, to: window.to }, skipped: 'no calls in the window' };
 
     // one HRMS context per dialer when equal user names exist on several dialers
     const byContext = new Map<string, CallRow[]>();
@@ -226,7 +221,6 @@ export async function pushAttendance(now = new Date()): Promise<AttendanceRun[]>
       }
     }
     total.unknown = [...new Set(total.unknown)];
-    result.push({ company: c.slug, window: { from: window.from, to: window.to }, ...total });
-  }
-  return result;
+    return { window: { from: window.from, to: window.to }, ...total };
+  });
 }

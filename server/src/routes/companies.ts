@@ -13,6 +13,7 @@ import { companyUsage, rehomeSharedPeople } from '../services/purge.js';
 import { dropQueuedSyncs, enqueueCompanyPurge } from '../lib/queue.js';
 import { closePooledDbClient } from '../vicidial/dbPool.js';
 import { invalidateAuthCache } from '../auth/session.js';
+import { withoutLinks } from '../integrations/links/store.js';
 
 /** Deleting a whole company is a platform decision: super admins only. */
 function assertSuperAdmin(req: FastifyRequest): void {
@@ -41,11 +42,11 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
   app.get('/', async (req) => {
     if (isSuperAdmin(req.auth)) {
       const rows = await db.select().from(companies).orderBy(companies.name);
-      return { companies: rows };
+      return { companies: rows.map(withoutLinks) };
     }
     if (!req.auth.companyId) return { companies: [] };
     const rows = await db.select().from(companies).where(eq(companies.id, req.auth.companyId));
-    return { companies: rows };
+    return { companies: rows.map(withoutLinks) };
   });
 
   app.get('/:id', async (req) => {
@@ -60,7 +61,7 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
       .from(dialerServers)
       .where(eq(dialerServers.companyId, id));
     const [userCount] = await db.select({ n: count() }).from(users).where(eq(users.companyId, id));
-    return { company: row, stats: { dialers: dialerCount.n, users: userCount.n } };
+    return { company: withoutLinks(row), stats: { dialers: dialerCount.n, users: userCount.n } };
   });
 
   app.post('/', { preHandler: [requirePermission('admin.companies')] }, async (req, reply) => {
@@ -103,8 +104,8 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
       .set({ ...body, updatedAt: new Date() })
       .where(eq(companies.id, id))
       .returning();
-    await audit(req, { action: 'company.update', entityType: 'company', entityId: id, before, after: row, companyId: id });
-    return { company: row };
+    await audit(req, { action: 'company.update', entityType: 'company', entityId: id, before: withoutLinks(before), after: withoutLinks(row), companyId: id });
+    return { company: withoutLinks(row) };
   });
 
   // What deleting the company would remove — shown before confirming.
@@ -163,7 +164,7 @@ export async function companyRoutes(app: FastifyInstance): Promise<void> {
       action: 'company.delete',
       entityType: 'company',
       entityId: id,
-      before,
+      before: withoutLinks(before),
       after: { usage },
       // the company row goes away; keep the record on the platform log
       companyId: null,

@@ -19,6 +19,28 @@ import { pushAttendance } from './integrations/hrms/attendance.js';
 import { pushCrmQaScores } from './integrations/crm/sync.js';
 import { dispatchWebhooks } from './integrations/connections/dispatcher.js';
 import { trackJob } from './integrations/connections/jobStatus.js';
+import { companyJobName, envSetsUp, jobSwitchedOn, kindOf, LINK_JOBS } from './integrations/links/jobs.js';
+import { anyWebLink } from './integrations/links/store.js';
+
+/**
+ * HRMS / CRM push jobs. Scheduled hourly for every company; "Push now" queues
+ * one with { companyId } and its result is kept apart (job:<name>@<companyId>).
+ * A scheduled run with no link anywhere (neither the environment nor any web
+ * link) does nothing and records nothing, as when the job was not scheduled.
+ */
+async function runLinkJob(name: string, companyId: string | undefined): Promise<unknown> {
+  const scope = companyId ? { companyId } : {};
+  const run = (): Promise<unknown> => {
+    if (name === 'hrms-qa-scores') return pushQaScores(2, scope);
+    if (name === 'hrms-sales') return pushSales(scope);
+    if (name === 'hrms-attendance') return pushAttendance(new Date(), scope);
+    return pushCrmQaScores(2, scope);
+  };
+  if (companyId) return { sent: await trackJob(companyJobName(name, companyId), run) };
+  const kind = kindOf(name);
+  if (!envSetsUp(kind) && !(await anyWebLink(kind, true))) return { skipped: 'no link set up' };
+  return { sent: await trackJob(name, run) };
+}
 
 /**
  * Background worker: schedules and runs per-dialer synchronization and
@@ -310,12 +332,12 @@ async function main(): Promise<void> {
         await applyRetention();
         return { ok: true };
       }
-      // WaveTech HRMS: QA scores and closed sales, every hour
-      if (job.name === 'hrms-qa-scores') return { sent: await trackJob(job.name, () => pushQaScores()) };
-      if (job.name === 'hrms-sales') return { sent: await trackJob(job.name, () => pushSales()) };
-      // HRMS attendance from dialer calls, and QA scores to the CRM: every hour
-      if (job.name === 'hrms-attendance') return { sent: await trackJob(job.name, () => pushAttendance()) };
-      if (job.name === 'crm-qa-scores') return { sent: await trackJob(job.name, () => pushCrmQaScores()) };
+      // WaveTech HRMS (QA scores, attendance, closed sales) and QA scores to
+      // the CRM: every hour, or now for one company ("Push now")
+      if ([...LINK_JOBS.hrms, ...LINK_JOBS.crm].includes(job.name)) {
+        if (!jobSwitchedOn(job.name)) return { skipped: 'switched off in server settings' };
+        return runLinkJob(job.name, typeof job.data?.companyId === 'string' ? job.data.companyId : undefined);
+      }
       throw new Error(`Unknown maintenance job: ${job.name}`);
     },
     {
@@ -348,17 +370,14 @@ async function main(): Promise<void> {
   // retention moved to the maintenance queue — drop the old schedule
   await syncQueue.removeJobScheduler('retention').catch(() => false);
   await maintenanceQueue.upsertJobScheduler('retention', { every: 24 * 3600 * 1000 }, { name: 'retention', opts: keep });
-  // WaveTech HRMS link: only when HRMS_URL is set (see integrations/hrms/).
-  // Sales go to the HRMS from the CRM (compliance-approved sales are the sales
-  // of record), so the dialer sales push is off unless HRMS_PUSH_SALES=true.
-  const hrmsJobs: Record<string, boolean> = {
-    'hrms-qa-scores': !!process.env.HRMS_URL,
-    'hrms-sales': !!process.env.HRMS_URL && process.env.HRMS_PUSH_SALES === 'true',
-    // dialer attendance per shift day; on with HRMS unless HRMS_PUSH_ATTENDANCE=false
-    'hrms-attendance': !!process.env.HRMS_URL && process.env.HRMS_PUSH_ATTENDANCE !== 'false',
-    // QA scores to the CRM (integrations/crm/): only when CRM_URL and CRM_API_KEY are set
-    'crm-qa-scores': !!process.env.CRM_URL?.trim() && !!process.env.CRM_API_KEY?.trim(),
-  };
+  // WaveTech HRMS and CRM links. A link can be set per company from the web
+  // (Admin → Connections → Outgoing links) or for all through the environment
+  // (HRMS_URL…, CRM_URL…), so the jobs are always scheduled; a run with no
+  // link anywhere does nothing (runLinkJob). Sales go to the HRMS from the CRM
+  // (compliance-approved sales are the sales of record), so the dialer sales
+  // push is off unless HRMS_PUSH_SALES=true; attendance is on unless
+  // HRMS_PUSH_ATTENDANCE=false.
+  const hrmsJobs: Record<string, boolean> = Object.fromEntries([...LINK_JOBS.hrms, ...LINK_JOBS.crm].map((n) => [n, jobSwitchedOn(n)]));
   for (const [name, on] of Object.entries(hrmsJobs)) {
     if (on) await maintenanceQueue.upsertJobScheduler(name, { every: 3600 * 1000 }, { name, opts: keep });
     else await maintenanceQueue.removeJobScheduler(name).catch(() => false);

@@ -3,7 +3,8 @@
  * Node 20+ (fetch, crypto). Copy this folder to server/src/integrations/hrms.
  *
  * One HRMS API key belongs to one HRMS company. Which key a VICIdial QA
- * company uses comes from the environment (see hrmsFor below).
+ * company uses: the link saved from the web for that company, else the
+ * environment (see hrmsEnvLink below and integrations/links/store.ts).
  */
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
@@ -236,7 +237,7 @@ export function verifyHrmsWebhook(rawBody: string, headers: Record<string, unkno
  *   HRMS_API_KEYS=acme=hrms_…,beta=hrms_…   per QA company slug
  *   HRMS_WEBHOOK_SECRET=whsec_…        or HRMS_WEBHOOK_SECRETS=acme=whsec_…,beta=whsec_…
  */
-function perCompany(list: string | undefined, single: string | undefined, slug: string): string | null {
+export function perCompany(list: string | undefined, single: string | undefined, slug: string): string | null {
   if (list) {
     for (const pair of list.split(',')) {
       const [k, v] = pair.split('=').map((s) => s.trim());
@@ -248,16 +249,27 @@ function perCompany(list: string | undefined, single: string | undefined, slug: 
 
 const clients = new Map<string, HrmsClient>();
 
-/** The HRMS client for a QA company, or null when HRMS is not set up for it. */
-export function hrmsFor(companySlug: string): HrmsClient | null {
-  const url = process.env.HRMS_URL?.trim();
-  const key = perCompany(process.env.HRMS_API_KEYS, process.env.HRMS_API_KEY, companySlug);
-  if (!url || !key) return null;
-  const id = `${url}|${key}`;
-  if (!clients.has(id)) clients.set(id, new HrmsClient(url, key));
+/** One client per URL + key, reused across calls. */
+export function hrmsClient(url: string, apiKey: string): HrmsClient {
+  const id = `${url}|${apiKey}`;
+  if (!clients.has(id)) clients.set(id, new HrmsClient(url, apiKey));
   return clients.get(id)!;
 }
 
-export function hrmsWebhookSecret(companySlug: string): string | null {
-  return perCompany(process.env.HRMS_WEBHOOK_SECRETS, process.env.HRMS_WEBHOOK_SECRET, companySlug);
+/**
+ * The HRMS URL and key for a QA company from the environment, or null when
+ * the environment does not set them up for it. This is the fallback: a link
+ * saved from the web (Admin → Connections → Outgoing links) wins, see
+ * integrations/links/store.ts (hrmsForCompany).
+ */
+export function hrmsEnvLink(companySlug: string, env: NodeJS.ProcessEnv = process.env): { url: string; apiKey: string } | null {
+  const url = env.HRMS_URL?.trim();
+  const key = perCompany(env.HRMS_API_KEYS, env.HRMS_API_KEY, companySlug);
+  if (!url || !key) return null;
+  return { url, apiKey: key };
+}
+
+/** The HRMS webhook secret for a QA company from the environment (fallback, as above). */
+export function hrmsEnvWebhookSecret(companySlug: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  return perCompany(env.HRMS_WEBHOOK_SECRETS, env.HRMS_WEBHOOK_SECRET, companySlug);
 }

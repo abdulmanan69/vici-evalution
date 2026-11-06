@@ -6,7 +6,9 @@
  *   CRM_URL=https://crm.example.com
  *   CRM_API_KEY=…            one key; the CRM may limit it to some companies
  *
- * Empty CRM_URL or CRM_API_KEY = off.
+ * Empty CRM_URL or CRM_API_KEY = off. A company can also have its own CRM
+ * link saved from the web (Admin → Connections → Outgoing links); that one
+ * wins for the company, the environment covers every other company.
  */
 
 export interface CrmMetricItem {
@@ -78,14 +80,29 @@ export class CrmClient {
   }
 }
 
-let client: { id: string; c: CrmClient } | null = null;
+const clients = new Map<string, CrmClient>();
 
-/** The CRM client, or null when CRM_URL / CRM_API_KEY are not set. */
-export function crmClient(): CrmClient | null {
-  const url = process.env.CRM_URL?.trim();
-  const key = process.env.CRM_API_KEY?.trim();
+/** One client per URL + key, reused across calls. */
+export function crmClientFor(url: string, apiKey: string): CrmClient {
+  const id = `${url}|${apiKey}`;
+  if (!clients.has(id)) clients.set(id, new CrmClient(url, apiKey));
+  return clients.get(id)!;
+}
+
+/**
+ * The CRM URL and key from the environment, or null when CRM_URL / CRM_API_KEY
+ * are not set. One key for every company without a link of its own saved from
+ * the web (see integrations/links/store.ts).
+ */
+export function crmEnvLink(env: NodeJS.ProcessEnv = process.env): { url: string; apiKey: string } | null {
+  const url = env.CRM_URL?.trim();
+  const key = env.CRM_API_KEY?.trim();
   if (!url || !key) return null;
-  const id = `${url}|${key}`;
-  if (client?.id !== id) client = { id, c: new CrmClient(url, key) };
-  return client.c;
+  return { url, apiKey: key };
+}
+
+/** The environment's CRM client, or null when CRM_URL / CRM_API_KEY are not set. */
+export function crmClient(): CrmClient | null {
+  const env = crmEnvLink();
+  return env ? crmClientFor(env.url, env.apiKey) : null;
 }

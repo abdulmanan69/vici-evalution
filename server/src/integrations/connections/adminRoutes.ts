@@ -16,6 +16,7 @@
  *   POST   /deliveries/:id/retry       try a failed delivery again now
  *   DELETE /webhooks/:id
  *   GET    /links                      HRMS and CRM links: set up or not, last run of each job
+ *   …/links/company, /links/:kind…      set up one company's links from the web (../links/routes.ts)
  */
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { and, desc, eq, isNull, or, type SQL } from 'drizzle-orm';
@@ -26,7 +27,9 @@ import { companyScope, isSuperAdmin, requirePermission } from '../../auth/plugin
 import { audit } from '../../lib/audit.js';
 import { encryptSecret } from '../../lib/crypto.js';
 import { ForbiddenError, NotFoundError, ValidationError } from '../../lib/errors.js';
-import { hrmsFor } from '../hrms/client.js';
+import { linkRoutes } from '../links/routes.js';
+import { anyWebLink, hrmsLinkFor } from '../links/store.js';
+import { usable } from '../links/resolve.js';
 import { EVENTS, SCOPES, SCOPE_IDS, isInternalHost, isValidEventPattern, newApiKey, newWebhookSecret } from './catalog.js';
 import { sendPing } from './dispatcher.js';
 import { forgetKeyCache } from './keyAuth.js';
@@ -288,27 +291,39 @@ export async function connectionRoutes(app: FastifyInstance): Promise<void> {
       .where(scope ? and(eq(companies.id, scope), eq(companies.status, 'active')) : eq(companies.status, 'active'));
     const hrmsUrl = process.env.HRMS_URL?.trim() || null;
     const crmUrl = process.env.CRM_URL?.trim() || null;
+    const crmEnv = !!crmUrl && !!process.env.CRM_API_KEY?.trim();
     const jobs = await jobStates();
+    // a link saved from the web for some company counts as set up too
+    const hrmsWeb = await anyWebLink('hrms');
+    const crmWeb = await anyWebLink('crm');
+    const hrmsOn = !!hrmsUrl || hrmsWeb;
+    const configured = new Map<string, boolean>();
+    for (const c of list) configured.set(c.slug, usable(await hrmsLinkFor(c.slug)));
     const pick = (names: string[]) => Object.fromEntries(names.map((n) => [n, jobs[n] ?? null]));
     return {
       hrms: {
         url: hrmsUrl,
         // which companies have an HRMS key (never the key)
-        companies: list.map((c) => ({ slug: c.slug, name: c.name, configured: !!hrmsFor(c.slug) })),
+        companies: list.map((c) => ({ slug: c.slug, name: c.name, configured: configured.get(c.slug) ?? false })),
+        web: hrmsWeb,
         jobs: pick(['hrms-qa-scores', 'hrms-attendance', 'hrms-sales']),
         enabled: {
-          'hrms-qa-scores': !!hrmsUrl,
-          'hrms-attendance': !!hrmsUrl && process.env.HRMS_PUSH_ATTENDANCE !== 'false',
-          'hrms-sales': !!hrmsUrl && process.env.HRMS_PUSH_SALES === 'true',
+          'hrms-qa-scores': hrmsOn,
+          'hrms-attendance': hrmsOn && process.env.HRMS_PUSH_ATTENDANCE !== 'false',
+          'hrms-sales': hrmsOn && process.env.HRMS_PUSH_SALES === 'true',
         },
       },
       crm: {
         url: crmUrl,
-        configured: !!crmUrl && !!process.env.CRM_API_KEY?.trim(),
+        configured: crmEnv,
+        web: crmWeb,
         jobs: pick(['crm-qa-scores']),
-        enabled: { 'crm-qa-scores': !!crmUrl && !!process.env.CRM_API_KEY?.trim() },
+        enabled: { 'crm-qa-scores': crmEnv || crmWeb },
       },
       webhooks: { jobs: pick(['webhooks']) },
     };
   });
+
+  // one company's HRMS and CRM links, set up from the web
+  await linkRoutes(app);
 }

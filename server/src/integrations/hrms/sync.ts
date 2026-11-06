@@ -12,23 +12,75 @@ import { db } from '../../db/client.js';
 import { alias } from 'drizzle-orm/pg-core';
 import { agentDispositions, calls, companies, dialerServers, transfers, viciAgents } from '../../db/schema.js';
 import { agentScores, monthStart, ym } from '../../services/agentScores.js';
-import { hrmsFor, type HrmsPerson, type MetricItem, type SaleItem, type SalesResult } from './client.js';
+import { type HrmsClient, type HrmsPerson, type MetricItem, type SaleItem, type SalesResult } from './client.js';
+import { hrmsClientOf, hrmsForCompany, hrmsLinkFor } from '../links/store.js';
 
 /** 'dialer' = HRMS links tell apart equal user names by dialer name (HRMS_CONTEXT=dialer). */
 const useDialerContext = () => process.env.HRMS_CONTEXT === 'dialer';
 
+/** Which companies a push covers: every active one, or the one asked for ("Push now"). */
+export interface PushScope {
+  companyId?: string;
+}
+
+export async function activeCompanies(scope: PushScope = {}): Promise<Array<{ id: string; slug: string }>> {
+  const list = await db.select({ id: companies.id, slug: companies.slug }).from(companies).where(eq(companies.status, 'active'));
+  return scope.companyId ? list.filter((c) => c.id === scope.companyId) : list;
+}
+
+export const errText = (err: unknown) => ((err as Error)?.message ?? String(err)).slice(0, 300);
+
+/**
+ * Runs `run` for each active company (or the one in `scope`) that has a
+ * usable HRMS link, web or environment (integrations/links). Links are read
+ * fresh, so a link saved a moment ago is used.
+ *
+ * One company's failure (e.g. a wrong key saved for it) does not stop the
+ * others: it is reported as { company, error }. When every company that was
+ * tried failed, the first error is thrown so the job shows as failed, as it
+ * did before links could be set per company. `run` returns null to report
+ * nothing for a company.
+ */
+export async function forEachHrmsCompany<R extends object>(
+  scope: PushScope,
+  run: (c: { id: string; slug: string }, hrms: HrmsClient) => Promise<R | null>,
+): Promise<Array<({ company: string } & R) | { company: string; error: string }>> {
+  const result: Array<({ company: string } & R) | { company: string; error: string }> = [];
+  const errors: unknown[] = [];
+  let tried = 0;
+  const list = await activeCompanies(scope);
+  let fresh = true;
+  for (const c of list) {
+    const link = await hrmsLinkFor(c.slug, fresh);
+    fresh = false;
+    if (link.source === 'web' && link.error) {
+      tried++;
+      errors.push(new Error(`${c.slug}: ${link.error}`));
+      result.push({ company: c.slug, error: link.error });
+      continue;
+    }
+    const hrms = hrmsClientOf(link);
+    if (!hrms) continue;
+    tried++;
+    try {
+      const r = await run(c, hrms);
+      if (r) result.push({ company: c.slug, ...r });
+    } catch (err) {
+      errors.push(err);
+      result.push({ company: c.slug, error: errText(err) });
+    }
+  }
+  if (tried > 0 && errors.length === tried) throw errors[0];
+  return result;
+}
 
 /**
  * Sends each agent's average QA score for the current and previous month to
  * the HRMS. Safe to run as often as you like: HRMS replaces the value for the
  * same agent and month. Returns what was sent per company.
  */
-export async function pushQaScores(months = 2): Promise<Array<{ company: string; saved: number; unknown: string[] }>> {
-  const result: Array<{ company: string; saved: number; unknown: string[] }> = [];
-  const list = await db.select({ id: companies.id, slug: companies.slug }).from(companies).where(eq(companies.status, 'active'));
-  for (const c of list) {
-    const hrms = hrmsFor(c.slug);
-    if (!hrms) continue;
+export async function pushQaScores(months = 2, scope: PushScope = {}) {
+  return forEachHrmsCompany(scope, async (c, hrms) => {
     const items: MetricItem[] = [];
     for (let m = 0; m < months; m++) {
       const from = monthStart(-m);
@@ -47,11 +99,9 @@ export async function pushQaScores(months = 2): Promise<Array<{ company: string;
         });
       }
     }
-    if (items.length === 0) continue;
-    const r = await hrms.pushMetrics(items);
-    result.push({ company: c.slug, ...r });
-  }
-  return result;
+    if (items.length === 0) return null;
+    return hrms.pushMetrics(items);
+  });
 }
 
 /** The HR calendar: a sale counts on its date in this time zone (HRMS_TZ, default Asia/Karachi). */
@@ -67,18 +117,14 @@ const addDays = (iso: string, n: number) => new Date(Date.parse(`${iso}T00:00:00
  * sale that is no longer closed here is voided in HRMS. Months whose HRMS
  * payroll is approved are left alone by HRMS.
  */
-export async function pushSales(): Promise<Array<{ company: string } & SalesResult>> {
-  const result: Array<{ company: string } & SalesResult> = [];
+export async function pushSales(scope: PushScope = {}) {
   const today = localDate(new Date());
   const from = `${addDays(`${today.slice(0, 7)}-01`, -1).slice(0, 7)}-01`;
   // a day's margin either side in UTC; the exact HR date is filtered below
   const fromUtc = new Date(Date.parse(`${from}T00:00:00Z`) - 86_400_000);
-  const list = await db.select({ id: companies.id, slug: companies.slug }).from(companies).where(eq(companies.status, 'active'));
   const closerCall = alias(calls, 'hrms_cc');
   const fronterCall = alias(calls, 'hrms_fc');
-  for (const c of list) {
-    const hrms = hrmsFor(c.slug);
-    if (!hrms) continue;
+  return forEachHrmsCompany(scope, async (c, hrms): Promise<SalesResult> => {
     const saleDay = sql<string>`to_char(${closerCall.callDate} at time zone ${hrTz()}, 'YYYY-MM-DD')`;
     const rows = await db
       .select({
@@ -136,9 +182,8 @@ export async function pushSales(): Promise<Array<{ company: string } & SalesResu
       await flush(today);
     }
     total.unknown = [...new Set(total.unknown)];
-    result.push({ company: c.slug, ...total });
-  }
-  return result;
+    return total;
+  });
 }
 
 const cache = new Map<string, { at: number; people: Map<string, HrmsPerson> }>();
@@ -157,7 +202,7 @@ export function forgetHrmsCache(companyId?: string): void {
  */
 export async function employeesFor(companyId: string, agentUsers?: string[]): Promise<Map<string, HrmsPerson>> {
   const [c] = await db.select({ slug: companies.slug }).from(companies).where(eq(companies.id, companyId));
-  const hrms = c ? hrmsFor(c.slug) : null;
+  const hrms = c ? await hrmsForCompany(c.slug) : null;
   if (!hrms) return new Map();
   const hit = cache.get(companyId);
   if (hit && Date.now() - hit.at < CACHE_MS && (!agentUsers || agentUsers.every((u) => hit.people.has(u)))) return hit.people;

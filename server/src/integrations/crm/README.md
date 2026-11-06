@@ -9,6 +9,8 @@ CRM_API_KEY=…          # one key from the CRM; the CRM may limit it to some co
 
 On Coolify, both are already passed through by `docker-compose.coolify.yml` (`x-app-env`).
 
+Link from the web instead: **Admin → Connections → Outgoing links → CRM**, per company, with a key from the CRM (**Admin → Connections → Keys → New key**, scope `metrics.write`). A company with a link set there sends its own agents with its own key; the settings above still cover every other company. See `docs/CONNECTIONS.md`.
+
 ## What is sent
 
 The worker job `crm-qa-scores` runs every hour while both settings are set. It covers the current and the previous month (UTC months), from completed evaluations only:

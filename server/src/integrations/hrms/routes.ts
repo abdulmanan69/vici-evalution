@@ -17,7 +17,8 @@ import { z } from 'zod';
 import { db } from '../../db/client.js';
 import { companies } from '../../db/schema.js';
 import { companyScope, requirePermission } from '../../auth/plugin.js';
-import { hrmsWebhookSecret, verifyHrmsWebhook, type HrmsEvent } from './client.js';
+import { verifyHrmsWebhook, type HrmsEvent } from './client.js';
+import { hrmsWebhookSecretFor } from '../links/store.js';
 import { employeesFor, forgetHrmsCache, pushQaScores, pushSales } from './sync.js';
 
 /** Webhooks from HRMS. Public route; trusted only after the signature checks out. */
@@ -27,7 +28,8 @@ export async function hrmsWebhookRoutes(app: FastifyInstance): Promise<void> {
 
   app.post('/webhook/:company', { config: { rateLimit: { max: 300, timeWindow: '1 minute' } } }, async (req, reply) => {
     const { company } = z.object({ company: z.string().min(1).max(64) }).parse(req.params);
-    const secret = hrmsWebhookSecret(company);
+    // the company's web link secret, else HRMS_WEBHOOK_SECRET(S) (integrations/links)
+    const secret = await hrmsWebhookSecretFor(company);
     const raw = typeof req.body === 'string' ? req.body : '';
     if (!secret || !verifyHrmsWebhook(raw, req.headers as Record<string, unknown>, secret)) {
       return reply.status(401).send({ error: 'bad_signature', message: 'Signature check failed' });

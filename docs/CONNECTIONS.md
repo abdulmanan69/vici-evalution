@@ -206,11 +206,35 @@ export function verifyQaWebhook(rawBody, headers, secret, toleranceSec = 300) {
 
 These run hourly in the worker. Their last results are shown on the Connections page.
 
+### Link from the web: Admin → Connections → Outgoing links
+
+Each company can connect its own HR system and CRM there, with no server settings and no redeploy. A super admin picks the company first; a company admin (permission `admin.users`) sets up their own company.
+
+- **HR system (hr.vertexpakistan.com)**: address, API key, optional webhook secret, Enabled. Get the key in the HR system: **Admin → Integrations → VICIdial → Create key** (it needs `metrics.write` and `attendance.write`).
+- **CRM (crm.vertexpakistan.com)**: address, API key, Enabled. Get the key in the CRM: **Admin → Connections → Keys → New key**, scope `metrics.write`.
+- **Test** calls the other side with the key: HR `GET {url}/api/v1/connect/vicidial/attendance/settings` (200 = connected; 401 = wrong key; 403 = the key lacks `attendance.write`), CRM `GET {url}/api/ext/v1/me` (shows the key's name and scopes).
+- **Push now** queues this link's jobs for the company at once; the result shows on the card within a minute.
+- **Remove** forgets the link set here; the server settings apply again.
+
+Keys and secrets are stored encrypted (AES-256-GCM with `APP_ENCRYPTION_KEY`, as for dialer passwords) in `companies.settings.links`. No API ever returns them: only whether one is saved and its last 4 characters. Every change is in the audit log (`connections.link_save`, `connections.link_delete`, `connections.link_push`), without the values. Addresses must be `https://` (super admins may also use `http://localhost`); company admins cannot use internal addresses. Changing the address requires typing the key again, so a saved key is never sent to a different server.
+
+### Which link a company uses
+
+1. A link set from the web and **enabled**: that link.
+2. A link set from the web and **switched off**: nothing is sent for that company, and HR webhooks for it are refused. The server settings are **not** used instead.
+3. No link set from the web: the server settings exactly as before (`HRMS_URL` + `HRMS_API_KEY` / `HRMS_API_KEYS`, `CRM_URL` + `CRM_API_KEY`), or nothing.
+
+The HR webhook secret follows the same rules; a web link without its own secret uses `HRMS_WEBHOOK_SECRET(S)` for the company. The CRM key from the server settings covers every company without a web link of its own (sent together, as before); a company with a web CRM link sends its own agents with its own key. One company's failure (say, a wrong key) no longer stops the others: it shows as an error for that company, and the run only fails when every company failed.
+
+### Jobs
+
 | Job | Sends | On when |
 |---|---|---|
-| `hrms-qa-scores` | monthly QA score per agent → HRMS | `HRMS_URL` and a key |
-| `hrms-attendance` | dialer attendance per shift day → HRMS | `HRMS_URL`, a key, and `HRMS_PUSH_ATTENDANCE` is not `false` |
-| `hrms-sales` | closed sales → HRMS | `HRMS_URL` and `HRMS_PUSH_SALES=true` |
-| `crm-qa-scores` | monthly QA score per agent → CRM | `CRM_URL` and `CRM_API_KEY` |
+| `hrms-qa-scores` | monthly QA score per agent → HRMS | the company has an HR link (web, or `HRMS_URL` and a key) |
+| `hrms-attendance` | dialer attendance per shift day → HRMS | as above, and `HRMS_PUSH_ATTENDANCE` is not `false` (server-wide) |
+| `hrms-sales` | closed sales → HRMS | as above, and `HRMS_PUSH_SALES=true` (server-wide) |
+| `crm-qa-scores` | monthly QA score per agent → CRM | the company has a CRM link (web, or `CRM_URL` and `CRM_API_KEY`) |
+
+The jobs are scheduled every hour; a run with no link anywhere does nothing and records nothing. `HRMS_CONTEXT` and `HRMS_TZ` stay server settings.
 
 Details: `server/src/integrations/hrms/README.md` and `server/src/integrations/crm/README.md`.

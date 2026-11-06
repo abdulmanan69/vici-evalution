@@ -27,6 +27,15 @@ If the same agent user exists on two dialers with different people behind it, pu
 
 ## 2. In the QA platform
 
+### Link from the web: Admin → Connections → Outgoing links
+
+The quickest way, with no `.env` change and no redeploy: open **Admin → Connections → Outgoing links**, pick the company (super admins), and fill in the **HR system** card: the address (`https://hr.vertexpakistan.com`), the key from step 1, and optionally the webhook secret. Press **Test**, then **Save**, then **Push now** to send QA scores and attendance at once. Each company can have its own key; the key is stored encrypted and never shown again (only its last 4 characters).
+
+A link set there wins for its company. The `.env` settings below remain a fallback for every company without one, and work exactly as before. A link set from the web but switched off means no HRMS for that company (the `.env` settings are not used for it). Details: `docs/CONNECTIONS.md`, "Outgoing links".
+
+In code, ask `integrations/links/store.ts` for the client: `await hrmsForCompany(slug)` (web link, else `.env`), and `await hrmsWebhookSecretFor(slug)` for webhooks. `hrmsEnvLink()` / `hrmsEnvWebhookSecret()` in `client.ts` read only the `.env` settings.
+
+
 ### Copy the files
 
 Copy `server/src/integrations/hrms/` from this folder into the QA platform's `server/src/integrations/hrms/`:
@@ -38,7 +47,7 @@ attendance.ts  pushAttendance(): dialer attendance per shift day
 routes.ts   webhook receiver + /api/v1/hrms/agents lookup + manual "push now"
 ```
 
-### Add the settings to `.env`
+### Or add the settings to `.env` (fallback for all companies)
 
 ```bash
 HRMS_URL=https://hrms.example.com
@@ -79,6 +88,8 @@ await api.register(hrmsRoutes, { prefix: '/hrms' });
 ```
 
 ### Send QA scores and sales every hour, from `server/src/worker.ts`
+
+In this repository the worker already does this, and schedules the jobs even without `HRMS_URL` so links set from the web work: see `runLinkJob` in `worker.ts` and `integrations/links/jobs.ts`. The snippet below is the minimal, `.env`-only version.
 
 ```ts
 import { pushQaScores, pushSales } from './integrations/hrms/sync.js';
